@@ -216,6 +216,8 @@ PC 钉钉本机调试时，不配置 `DINGTALK_DEV_PUBLIC_HOST`，保持
 
 - 前端提交 npm v3 `package-lock.json`，本地安装与容器构建统一使用 `npm ci`，不允许在构建阶段改写锁文件；当前锁已通过全新 `npm ci`、测试、类型检查、Lint 和构建验证。
 - 前端使用 TypeScript 官方的 7/6 并行过渡方案：`@typescript/native` 提供 TypeScript 7 原生 `tsc`，`typescript` 别名指向 TypeScript 6 API，供尚未兼容原生编译器 API 的 `vue-tsc` 和 `typescript-eslint` 使用。`npm run typecheck` 会同时运行两条检查链，不能删除其中任一依赖后只验证另一条。
+- 容器构建使用 Node 24 LTS，后端运行时使用 Python 3.13.15；uv 固定为 0.12.9，入口使用 Nginx 1.30.4 stable。Python 3.14 尚无当前 PaddlePaddle 版本的 wheel，Node 26 仍为 Current，因此暂不采用。
+- 后端业务调用钉钉和 PaddlePaddle 依赖继续使用 `httpx` 0.28.1；测试环境另外锁定 `httpx2` 2.12.0，专供新版 Starlette `TestClient` 使用，不混用两套客户端处理业务请求。
 - 当前 npm 11 标准生成结果并未为全部依赖条目写入 `resolved`/`integrity`。这里不手工拼接 URL 或哈希，也不宣称具备完整的锁文件校验和覆盖；若上线环境把完整哈希作为供应链硬性要求，应在干净 npm 环境中重新生成并单独复核后再发布。
 - 后端已使用 uv 生成并提交 `uv.lock`；本地安装、检查与容器构建统一使用 `--frozen`，确保声明与锁文件不一致时立即失败。
 

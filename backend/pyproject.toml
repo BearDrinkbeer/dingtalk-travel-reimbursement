@@ -8,24 +8,25 @@ version = "0.1.0"
 description = "DingTalk expense Excel generator backend"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-  "alembic==1.16.1",
+  "alembic==1.19.1",
   "fastapi==0.141.1",
   "httpx==0.28.1",
   "openpyxl==3.1.5",
   "Pillow==12.3.0",
-  "pydantic==2.11.5",
-  "pydantic-settings==2.9.1",
+  "pydantic==2.13.5",
+  "pydantic-settings==2.15.0",
   "pypdf==6.16.2",
   "python-multipart==0.0.32",
-  "sqlalchemy==2.0.41",
-  "uvicorn[standard]==0.34.3",
+  "sqlalchemy==2.0.52",
+  "uvicorn[standard]==0.52.4",
 ]
 
 [project.optional-dependencies]
 dev = [
+  "httpx2==2.12.0",
   "pytest==9.1.1",
   "pytest-asyncio==1.4.0",
-  "ruff==0.11.12",
+  "ruff==0.16.5",
 ]
 ocr = [
   "opencv-contrib-python==4.10.0.84; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'darwin' and platform_machine == 'arm64')",

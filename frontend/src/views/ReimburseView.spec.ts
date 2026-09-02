@@ -150,7 +150,9 @@ describe('ReimburseView manual item editor', () => {
   })
 
   it('previews the original selected receipt with a short-lived object URL', async () => {
-    const createObjectUrl = vi.fn(() => 'blob:receipt-preview')
+    // Keep the iframe same-origin in jsdom 30. The assertion still verifies that
+    // production code obtains and later revokes the browser-managed object URL.
+    const createObjectUrl = vi.fn(() => 'http://localhost/receipt-preview')
     const revokeObjectUrl = vi.fn()
     Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectUrl })
     Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectUrl })
@@ -213,9 +215,9 @@ describe('ReimburseView manual item editor', () => {
     expect(createObjectUrl).toHaveBeenCalledWith(receipt)
     expect(document.body.textContent).toContain('票据预览：测试票据.pdf')
     expect(document.querySelector('iframe[title="测试票据.pdf 预览"]')?.getAttribute('src'))
-      .toBe('blob:receipt-preview')
+      .toBe('http://localhost/receipt-preview')
 
     wrapper.unmount()
-    expect(revokeObjectUrl).toHaveBeenCalledWith('blob:receipt-preview')
+    expect(revokeObjectUrl).toHaveBeenCalledWith('http://localhost/receipt-preview')
   })
 })

@@ -1,4 +1,4 @@
-FROM node:22-alpine AS build
+FROM node:24.20.0-alpine AS build
 
 WORKDIR /app
 COPY package.json package-lock.json ./
@@ -6,7 +6,7 @@ RUN npm ci --no-audit --no-fund
 COPY . .
 RUN npm run build
 
-FROM nginx:1.27-alpine AS runtime
+FROM nginx:1.30.4-alpine AS runtime
 COPY --from=build /app/dist /usr/share/nginx/html
 
 # The application Nginx does not need root or a privileged port. Compose adds
