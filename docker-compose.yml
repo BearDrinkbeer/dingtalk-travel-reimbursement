@@ -1,0 +1,133 @@
+name: dingtalk-expense
+
+services:
+  backend:
+    platform: ${BACKEND_PLATFORM:-linux/amd64}
+    build:
+      context: ./backend
+      args:
+        INSTALL_OCR: ${INSTALL_OCR:-true}
+    environment:
+      APP_ENV: ${APP_ENV:?Set APP_ENV explicitly to development or production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/app.db}
+      TEMP_DIR: ${TEMP_DIR:-/tmp/expense}
+      EXCEL_TEMPLATE_PATH: ${EXCEL_TEMPLATE_PATH:-/app/app/templates/expense_template.xlsx}
+      DINGTALK_CLIENT_ID: ${DINGTALK_CLIENT_ID:-}
+      DINGTALK_CLIENT_SECRET: ${DINGTALK_CLIENT_SECRET:-}
+      DINGTALK_CORP_ID: ${DINGTALK_CORP_ID:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      ADMIN_USER_IDS: ${ADMIN_USER_IDS:-}
+      SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME:-expense_session}
+      SESSION_TTL_MINUTES: ${SESSION_TTL_MINUTES:-480}
+      SESSION_CLEANUP_INTERVAL_SECONDS: ${SESSION_CLEANUP_INTERVAL_SECONDS:-300}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      AUTH_MOCK_ENABLED: ${AUTH_MOCK_ENABLED:-false}
+      AUTH_MOCK_USER_ID: ${AUTH_MOCK_USER_ID:-mock-user}
+      AUTH_MOCK_USER_NAME: ${AUTH_MOCK_USER_NAME:-开发测试用户}
+      AUTH_MOCK_DEPARTMENTS: ${AUTH_MOCK_DEPARTMENTS:-100:测试部门}
+      OCR_MODE: local
+      UPLOAD_TTL_MINUTES: ${UPLOAD_TTL_MINUTES:-30}
+      TEMP_CLEANUP_INTERVAL_SECONDS: ${TEMP_CLEANUP_INTERVAL_SECONDS:-600}
+      UPLOAD_MAX_FILE_BYTES: ${UPLOAD_MAX_FILE_BYTES:-20971520}
+      UPLOAD_MAX_REQUEST_BYTES: ${UPLOAD_MAX_REQUEST_BYTES:-26214400}
+      UPLOAD_SPOOL_MEMORY_BYTES: ${UPLOAD_SPOOL_MEMORY_BYTES:-262144}
+      SESSION_MAX_FILES: ${SESSION_MAX_FILES:-200}
+      SESSION_MAX_BYTES: ${SESSION_MAX_BYTES:-104857600}
+      EXPENSE_MAX_ITEMS: ${EXPENSE_MAX_ITEMS:-200}
+      TEMP_STORAGE_MAX_BYTES: ${TEMP_STORAGE_MAX_BYTES:-805306368}
+      TEMP_STORAGE_RESERVE_BYTES: ${TEMP_STORAGE_RESERVE_BYTES:-209715200}
+      IMAGE_MAX_PIXELS: ${IMAGE_MAX_PIXELS:-50000000}
+      IMAGE_MAX_DIMENSION: ${IMAGE_MAX_DIMENSION:-20000}
+      PDF_RENDER_DPI: ${PDF_RENDER_DPI:-200}
+      PDF_MAX_XOBJECTS: ${PDF_MAX_XOBJECTS:-100}
+      PDF_MAX_CONTENT_STREAMS: ${PDF_MAX_CONTENT_STREAMS:-512}
+      PDF_MAX_EMBEDDED_PIXELS: ${PDF_MAX_EMBEDDED_PIXELS:-100000000}
+      PDF_MAX_RESOURCE_DEPTH: ${PDF_MAX_RESOURCE_DEPTH:-8}
+      PDF_MAX_DECODED_PAGE_BYTES: ${PDF_MAX_DECODED_PAGE_BYTES:-33554432}
+      PDF_PREFLIGHT_TIMEOUT_SECONDS: ${PDF_PREFLIGHT_TIMEOUT_SECONDS:-30}
+      IMAGE_VALIDATION_TIMEOUT_SECONDS: ${IMAGE_VALIDATION_TIMEOUT_SECONDS:-30}
+      FILE_OPERATION_WAIT_SECONDS: ${FILE_OPERATION_WAIT_SECONDS:-5}
+      UPLOAD_ADMISSION_WAIT_SECONDS: ${UPLOAD_ADMISSION_WAIT_SECONDS:-1}
+      PROCESS_JOB_ADMISSION_WAIT_SECONDS: ${PROCESS_JOB_ADMISSION_WAIT_SECONDS:-1}
+      LOGOUT_FILE_WAIT_SECONDS: ${LOGOUT_FILE_WAIT_SECONDS:-130}
+      FILE_WORKER_MEMORY_LIMIT_BYTES: ${FILE_WORKER_MEMORY_LIMIT_BYTES:-536870912}
+      OCR_WORKER_MEMORY_LIMIT_BYTES: ${OCR_WORKER_MEMORY_LIMIT_BYTES:-2147483648}
+      WORKER_FILE_SIZE_LIMIT_BYTES: ${WORKER_FILE_SIZE_LIMIT_BYTES:-67108864}
+      WORKER_OPEN_FILES_LIMIT: ${WORKER_OPEN_FILES_LIMIT:-128}
+      WORKER_CPU_SECONDS: ${WORKER_CPU_SECONDS:-180}
+      OCR_ENABLED: ${OCR_ENABLED:-true}
+      OCR_FAKE_ENABLED: ${OCR_FAKE_ENABLED:-false}
+      OCR_CONCURRENCY: ${OCR_CONCURRENCY:-1}
+      OCR_TIMEOUT_SECONDS: ${OCR_TIMEOUT_SECONDS:-120}
+      OCR_CPU_THREADS: ${OCR_CPU_THREADS:-4}
+      OCR_ENGINE: paddle_static
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "1"
+      OCR_DETECTION_MODEL_DIR: ${OCR_DETECTION_MODEL_DIR:-/opt/expense/models/PP-OCRv6_small_det}
+      OCR_RECOGNITION_MODEL_DIR: ${OCR_RECOGNITION_MODEL_DIR:-/opt/expense/models/PP-OCRv6_small_rec}
+    volumes:
+      - sqlite_data:/app/data
+      - ./backend/app/templates/expense_template.xlsx:/app/app/templates/expense_template.xlsx:ro
+      # Production OCR models are externally verified deployment inputs and mounted read-only.
+      - ${OCR_MODEL_HOST_DIR:-./backend/models}:/opt/expense/models:ro
+    read_only: true
+    mem_limit: ${BACKEND_MEMORY_LIMIT:-3g}
+    pids_limit: ${BACKEND_PIDS_LIMIT:-128}
+    tmpfs:
+      - /tmp/expense:uid=10001,gid=10001,mode=0700,size=1073741824
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/ready', timeout=5).read()
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      # Loopback is the safe default. Production HTTPS terminates at the
+      # organization's reverse proxy, which forwards to this private port.
+      - "${APP_BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-8080}:8080"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/expense-proxy.conf:/etc/nginx/conf.d/expense-proxy.inc:ro
+    user: "101:101"
+    read_only: true
+    mem_limit: ${WEB_MEMORY_LIMIT:-128m}
+    pids_limit: ${WEB_PIDS_LIMIT:-64}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /var/cache/nginx:uid=101,gid=101,mode=0700,size=33554432
+      - /var/run:uid=101,gid=101,mode=0700,size=1048576
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+volumes:
+  sqlite_data:

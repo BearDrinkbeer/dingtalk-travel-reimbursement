@@ -1,0 +1,82 @@
+.PHONY: backend-install backend-test backend-lint backend-format frontend-install frontend-test frontend-typecheck frontend-lint frontend-build compose-config compose-config-development nginx-policy-check ocr-models-check ocr-runtime-check verify deploy-check dev dev-backend dev-frontend dev-dingtalk dev-dingtalk-backend dev-dingtalk-frontend deploy up logs down
+
+backend-install:
+	cd backend && uv sync --frozen --extra dev --extra ocr
+
+backend-test:
+	cd backend && uv run --frozen --extra dev pytest
+
+backend-lint:
+	cd backend && uv run --frozen --extra dev ruff check app tests migrations
+
+backend-format:
+	cd backend && uv run --frozen --extra dev ruff format app tests
+
+frontend-install:
+	cd frontend && npm ci --ignore-scripts --no-audit --no-fund
+
+frontend-test:
+	cd frontend && npm run test
+
+frontend-typecheck:
+	cd frontend && npm run typecheck
+
+frontend-lint:
+	cd frontend && npm run lint
+
+frontend-build:
+	cd frontend && npm run build
+
+compose-config:
+	docker compose config --quiet
+
+compose-config-development:
+	APP_ENV=development docker compose config --quiet
+
+nginx-policy-check:
+	sh scripts/check-nginx-policy.sh
+
+ocr-models-check:
+	python3 scripts/check-ocr-models.py \
+		--detection backend/models/PP-OCRv6_small_det \
+		--recognition backend/models/PP-OCRv6_small_rec
+
+ocr-runtime-check:
+	cd backend && PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=1 \
+		uv run --frozen --extra dev --extra ocr python ../scripts/check-ocr-runtime.py \
+			--detection models/PP-OCRv6_small_det \
+			--recognition models/PP-OCRv6_small_rec
+
+verify: backend-test backend-lint frontend-test frontend-typecheck frontend-lint frontend-build compose-config-development nginx-policy-check ocr-models-check
+
+deploy-check: compose-config nginx-policy-check ocr-models-check
+
+dev:
+	$(MAKE) -j2 dev-backend dev-frontend
+
+dev-backend:
+	sh scripts/dev-backend.sh
+
+dev-frontend:
+	cd frontend && npm run dev
+
+dev-dingtalk-backend:
+	sh scripts/dev-dingtalk-backend.sh
+
+dev-dingtalk-frontend:
+	sh scripts/dev-dingtalk-frontend.sh
+
+dev-dingtalk:
+	$(MAKE) -j2 dev-dingtalk-backend dev-dingtalk-frontend
+
+up:
+	docker compose up --build
+
+deploy: deploy-check
+	docker compose up --build --detach --wait
+
+logs:
+	docker compose logs --follow --tail=200
+
+down:
+	docker compose down

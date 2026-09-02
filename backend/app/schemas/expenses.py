@@ -1,0 +1,126 @@
+from __future__ import annotations
+
+from decimal import Decimal
+from enum import StrEnum
+from typing import Literal
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
+
+from app.domain.categories import ExpenseCategory
+from app.domain.money import MAX_REIMBURSEMENT_AMOUNT, quantize_money
+from app.domain.subsidy import TripPeriod, TripType
+from app.schemas.primitives import DecimalString, MinuteTime, StrictCalendarDate
+
+MAX_CONFIRMED_EFFECTIVE_DAYS = Decimal("366.0")
+MAX_EXPENSE_ITEMS_HARD_LIMIT = 1_000
+
+
+class TripPurpose(StrEnum):
+    BUSINESS = "business"
+    PROJECT = "project"
+    SAME_CITY_PROJECT = "same_city_project"
+    INTERNAL = "internal"
+
+
+class TripInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    trip_type: TripPurpose = Field(alias="tripType")
+    start_date: StrictCalendarDate = Field(alias="startDate")
+    start_time: MinuteTime = Field(alias="startTime")
+    end_date: StrictCalendarDate = Field(alias="endDate")
+    end_time: MinuteTime = Field(alias="endTime")
+    policy_confirmed: bool = Field(default=False, alias="policyConfirmed")
+    confirmed_effective_days: DecimalString | None = Field(
+        default=None,
+        alias="confirmedEffectiveDays",
+        ge=0,
+        le=MAX_CONFIRMED_EFFECTIVE_DAYS,
+    )
+    no_subsidy_exception: bool = Field(default=False, alias="noSubsidyException")
+
+    def as_period(self) -> TripPeriod:
+        return TripPeriod(
+            start_date=self.start_date,
+            start_time=self.start_time,
+            end_date=self.end_date,
+            end_time=self.end_time,
+        )
+
+    def subsidy_trip_type(self) -> TripType:
+        if self.trip_type is TripPurpose.PROJECT:
+            calendar_days = (self.end_date - self.start_date).days + 1
+            return TripType.LONG_TERM_PROJECT if calendar_days > 30 else TripType.SHORT_TERM_PROJECT
+        return TripType(self.trip_type.value)
+
+
+class ExpenseLineBase(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    category: ExpenseCategory
+    date: StrictCalendarDate | None = None
+    display_date: str = Field(alias="displayDate", min_length=1, max_length=100)
+    description: str = Field(min_length=1, max_length=500)
+    amount: DecimalString = Field(ge=0, le=MAX_REIMBURSEMENT_AMOUNT)
+    receipt_count: int = Field(alias="receiptCount", ge=0, le=10_000)
+
+    @field_validator("display_date", "description")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("text must not be blank")
+        return stripped
+
+    @field_validator("amount")
+    @classmethod
+    def normalize_amount(cls, value: Decimal) -> Decimal:
+        if value.as_tuple().exponent < -2:
+            raise ValueError("amount supports at most two decimal places")
+        return quantize_money(value)
+
+
+class ExpenseItem(ExpenseLineBase):
+    id: str = Field(min_length=1, max_length=128)
+    source: Literal["ocr", "manual", "system"]
+    confidence: DecimalString | None = Field(default=None, ge=0, le=1)
+    warnings: list[str] = Field(default_factory=list, max_length=10)
+
+    @field_validator("warnings")
+    @classmethod
+    def validate_warnings(cls, values: list[str]) -> list[str]:
+        if any(not value.strip() or len(value) > 200 for value in values):
+            raise ValueError("warnings must be non-blank and at most 200 characters")
+        return [value.strip() for value in values]
+
+    @model_validator(mode="after")
+    def validate_system_line(self) -> ExpenseItem:
+        if self.category is ExpenseCategory.SUBSIDY:
+            if self.source != "system" or self.receipt_count != 0:
+                raise ValueError("subsidy must be a system line with zero receipts")
+        elif self.source == "system":
+            raise ValueError("only subsidy may be a system line")
+        elif self.receipt_count == 0:
+            raise ValueError("non-subsidy lines require at least one receipt")
+        return self
+
+
+class TotalsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # A missing trip means this reimbursement does not claim travel subsidy.
+    trip: TripInput | None = None
+    items: list[ExpenseItem] = Field(max_length=MAX_EXPENSE_ITEMS_HARD_LIMIT)
+
+    @field_validator("items")
+    @classmethod
+    def reject_client_subsidy(cls, values: list[ExpenseItem]) -> list[ExpenseItem]:
+        if any(item.category is ExpenseCategory.SUBSIDY for item in values):
+            raise ValueError("subsidy is calculated by the server")
+        return values

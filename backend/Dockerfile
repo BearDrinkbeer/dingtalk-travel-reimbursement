@@ -1,0 +1,43 @@
+FROM ghcr.io/astral-sh/uv:0.11.21 AS uv
+
+FROM python:3.11-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=1 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    TMPDIR=/tmp/expense/.spool \
+    PATH="/app/.venv/bin:$PATH"
+
+WORKDIR /app
+
+COPY --from=uv /uv /usr/local/bin/uv
+COPY pyproject.toml uv.lock ./
+ARG INSTALL_OCR=true
+RUN if [ "$INSTALL_OCR" = "true" ]; then \
+        uv sync --frozen --no-dev --no-install-project --extra ocr; \
+    else \
+        uv sync --frozen --no-dev --no-install-project; \
+    fi
+
+COPY app ./app
+
+COPY alembic.ini ./
+COPY migrations ./migrations
+COPY docker-entrypoint.sh ./docker-entrypoint.sh
+
+RUN groupadd --gid 10001 expense \
+    && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin expense \
+    && chmod 0755 /app/docker-entrypoint.sh \
+    && mkdir -p /app/data /tmp/expense/.spool /opt/expense/models \
+    && chown expense:expense /app/data /tmp/expense /tmp/expense/.spool \
+    && chmod 0700 /app/data /tmp/expense /tmp/expense/.spool \
+    && chmod -R a-w /app/app /app/migrations /app/alembic.ini /app/docker-entrypoint.sh
+
+USER 10001:10001
+
+EXPOSE 8000
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]

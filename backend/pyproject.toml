@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dingtalk-expense-backend"
+version = "0.1.0"
+description = "DingTalk expense Excel generator backend"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "alembic==1.16.1",
+  "fastapi==0.141.1",
+  "httpx==0.28.1",
+  "openpyxl==3.1.5",
+  "Pillow==12.3.0",
+  "pydantic==2.11.5",
+  "pydantic-settings==2.9.1",
+  "pypdf==6.16.2",
+  "python-multipart==0.0.32",
+  "sqlalchemy==2.0.41",
+  "uvicorn[standard]==0.34.3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+  "ruff==0.11.12",
+]
+ocr = [
+  "opencv-contrib-python==4.10.0.84; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'darwin' and platform_machine == 'arm64')",
+  "paddleocr==3.7.0; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'darwin' and platform_machine == 'arm64')",
+  "paddlepaddle==3.3.1; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'darwin' and platform_machine == 'arm64')",
+  "pypdfium2==5.13.0; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'darwin' and platform_machine == 'arm64')",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
