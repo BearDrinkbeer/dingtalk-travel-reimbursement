@@ -165,3 +165,26 @@ Python、Paddle、openpyxl 或容器基础镜像变化时，还要运行真实�
 - 部署：Docker Engine 29 / Compose 5 + Nginx 1.30 stable。
 
 这个组合比追 Node 26、Python 3.14 或 Nginx mainline 更适合当前项目：核心依赖有正式支持，变化可以由现有测试、真实 OCR 样本和 Excel 模板回归覆盖。
+
+## 升级后快速复核
+
+复核日期：2026-09-02。再次以 `frontend/package.json`、`backend/pyproject.toml`、两个 Dockerfile 和锁文件为准，对 npm/PyPI 官方索引及各项目官方发布页复核。结论是：**运行依赖没有新的常规升级项；唯一遗漏的直接依赖是构建后端 Hatchling 1.27.0 → 1.32.0。**
+
+| 分类 | 组件 | 当前 → 最新稳定版 | 复核结论 |
+|---|---|---|---|
+| **建议现在升级** | [Hatchling](https://pypi.org/project/hatchling/) | 1.27.0 → **1.32.0** | 这是本轮唯一落后的直接依赖。它只用于构建 wheel，建议单独升级、检查 `uv.lock`，再执行 `uv build`/frozen sync；不必与运行时升级混在一起。 |
+| **因上游兼容应锁定** | [TypeScript 7 原生编译器 / TS6 桥接](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/) | `typescript` 7.0.2 / `@typescript/typescript6` 6.0.2，均为最新 | 当前别名布局正是 TypeScript 官方推荐的并行方案：`@typescript/native: npm:typescript@7.0.2` 提供原生 `tsc`，`typescript: npm:@typescript/typescript6@6.0.2` 为依赖编译器 API 的工具保留 TS6。实测 `tsc` 为 7.0.2，`tsc6` 为 6.0.3（桥接包内部允许的 TS6 补丁版）。[typescript-eslint 官方支持范围](https://typescript-eslint.io/users/dependency-versions/)仍是 TypeScript `>=4.8.4 <6.1.0`，所以桥接暂不能删除。 |
+| **因上游兼容应锁定** | [OpenCV](https://pypi.org/project/opencv-contrib-python/) | 4.10.0.84 → 全局最新 **5.0.0.93** | 不升级。PaddleOCR 3.7.0 带入的 PaddleX 3.7.2 精确要求 `opencv-contrib-python==4.10.0.84`，当前锁文件也解析到该版本；绕过它升级 4.14/5.0 只能作为隔离 A/B 实验，不能进入主环境。上游精确约束见 [PaddleX 官方源码](https://github.com/PaddlePaddle/PaddleX/blob/v3.7.2/setup.py)。 |
+| **因上游兼容应锁定** | [Python](https://www.python.org/downloads/release/python-3147/) | 镜像 3.13.15；全局最新 **3.14.7** | 继续保留 `>=3.11,<3.14`。PaddlePaddle 3.3.1 的 [PyPI 官方文件](https://pypi.org/project/paddlepaddle/3.3.1/#files)没有 CPython 3.14 wheel；3.13.15 已是当前 OCR 组合能采用的最新 Python。 |
+| **因运行时匹配应锁定** | [Node.js](https://nodejs.org/en/about/previous-releases)、[@types/node](https://registry.npmjs.org/%40types%2Fnode/latest) | 镜像/LTS 24.20.0，类型 24.13.3；全局最新 Node **26.8.1 Current**、类型 **26.4.1** | 生产构建继续使用 Node 24 LTS，`@types/node` 继续留在 24.x；不应为了 npm 的全局 `latest` 引入 Node 26 API。Node 官方仍建议生产只用 Active/Maintenance LTS。 |
+| **可升级但收益低** | [Nginx](https://nginx.org/en/download.html) | stable **1.30.4**；mainline **1.31.4** | 当前已是 stable 最新版，并包含官方列出的相关安全修复；项目没有依赖 mainline 新功能，暂不上 1.31.4。 |
+| **可升级但收益低** | Docker 镜像固定方式 | 完整 tag，未固定 digest | Node/Python/Nginx/uv 均已固定完整 tag。再固定 digest 可增强可复现性，但必须配套定期安全刷新；当前小项目收益有限。Docker Engine [29.7.2 官方发布说明](https://docs.docker.com/engine/release-notes/29/)与 Compose [v5.5.0 官方发布](https://github.com/docker/compose/releases/tag/v5.5.0)显示本机工具也已是当前稳定版。 |
+| **已最新** | Vue / Vite / Router / UI 与前端工具 | Vue 3.5.42、Vite 8.2.2、Router 5.3.0、Element Plus 2.14.5、ESLint 10.9.1、`@eslint/js` 10.0.1、eslint-plugin-vue 10.10.0、typescript-eslint 8.69.0、globals 17.12.0 | `npm outdated --json` 只报告跨运行时大版本的 `@types/node@26`；其余直接依赖均未报告更新。还包括 Pinia 4.0.3、Axios 1.20.0、plugin-vue 6.0.8、Vitest 4.1.11、vue-tsc 3.3.11、Vue Test Utils 2.5.0、jsdom 30.0.1 及两个 unplugin。版本来源为各包 [npm 官方注册表](https://registry.npmjs.org/)。 |
+| **已最新** | FastAPI / Starlette / HTTP 客户端 | FastAPI 0.141.1、Starlette 1.6.0、HTTPX 0.28.1、HTTPX2 2.12.0 | 均为 PyPI 最新稳定版；保留 HTTPX2 专供 Starlette `TestClient` 的现有兼容路径。来源：[FastAPI](https://pypi.org/project/fastapi/)、[Starlette](https://pypi.org/project/starlette/)、[HTTPX](https://pypi.org/project/httpx/)、[HTTPX2](https://pypi.org/project/httpx2/)。 |
+| **已最新** | 数据模型、数据库与服务端 | Pydantic 2.13.5、pydantic-settings 2.15.0、SQLAlchemy 2.0.52、Alembic 1.19.1、Uvicorn 0.52.4 | 均为 PyPI 最新稳定版，不采用 SQLAlchemy 2.1 预发布版。来源：[Pydantic](https://pypi.org/project/pydantic/)、[SQLAlchemy](https://pypi.org/project/SQLAlchemy/)、[Alembic](https://pypi.org/project/alembic/)、[Uvicorn](https://pypi.org/project/uvicorn/)。 |
+| **已最新** | OCR、文件与测试工具 | PaddleOCR 3.7.0、PaddlePaddle 3.3.1、pypdf 6.16.2、openpyxl 3.1.5、Pillow 12.3.0、pytest 9.1.1、Ruff 0.16.5 | 除上表有意锁定的 OpenCV 外，直接依赖均为 PyPI 最新稳定版。来源：[PaddleOCR](https://pypi.org/project/paddleocr/)、[PaddlePaddle](https://pypi.org/project/paddlepaddle/)、[pypdf](https://pypi.org/project/pypdf/)、[openpyxl](https://pypi.org/project/openpyxl/)、[Pillow](https://pypi.org/project/pillow/)、[pytest](https://pypi.org/project/pytest/)、[Ruff](https://pypi.org/project/ruff/)。 |
+| **已最新** | [uv 容器工具](https://docs.astral.sh/uv/guides/integration/docker/) | 镜像 **0.12.9** | Docker 构建使用的 uv 已是最新稳定版。 |
+
+本机开发环境与容器还有轻微偏差：mise Node 是 26.5.0，而前端镜像是 Node 24.20.0；本机 uv 是 0.11.21，而后端镜像是 0.12.9；现有 `backend/.venv` 是 Python 3.13.14，而后端镜像是 3.13.15。它们不构成仓库运行依赖升级，但建议后续增加项目级 mise 配置，将本机默认 Node 固定到 24.20.0，并把 Python/uv 对齐容器，避免“本机通过、镜像失败”的工具链差异。
+
+本次只复核并记录，没有修改代码、依赖或锁文件。
