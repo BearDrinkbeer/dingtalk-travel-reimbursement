@@ -19,7 +19,7 @@ fi
 # The frontend only needs public host/port settings. Do not leave backend
 # credentials in the Vite process environment even though Vite only exposes
 # variables with its public prefix.
-unset DINGTALK_CLIENT_SECRET SESSION_SECRET ADMIN_USER_IDS
+unset DINGTALK_CLIENT_SECRET DINGTALK_AGENT_ID SESSION_SECRET ADMIN_USER_IDS
 
 DINGTALK_DEV_BIND_ADDRESS=${DINGTALK_DEV_BIND_ADDRESS:-127.0.0.1}
 DINGTALK_DEV_FRONTEND_PORT=${DINGTALK_DEV_FRONTEND_PORT:-5173}

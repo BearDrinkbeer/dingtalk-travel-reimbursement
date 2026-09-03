@@ -23,6 +23,7 @@ class DepartmentIdentity:
 @dataclass(frozen=True, slots=True)
 class DingTalkIdentity:
     user_id: str
+    union_id: str
     name: str
     departments: tuple[DepartmentIdentity, ...]
 
@@ -76,8 +77,9 @@ class DingTalkService:
             retry_transient=True,
         )
         name = str(user.get("name") or "").strip()
+        union_id = str(user.get("unionid") or "").strip()
         raw_department_ids = user.get("dept_id_list")
-        if not name or not isinstance(raw_department_ids, list):
+        if not name or not union_id or not isinstance(raw_department_ids, list):
             raise self._safe_error()
 
         departments: list[DepartmentIdentity] = []
@@ -103,7 +105,12 @@ class DingTalkService:
                 "无法读取所属部门，请联系管理员检查钉钉应用权限",
                 502,
             )
-        return DingTalkIdentity(user_id=user_id, name=name, departments=tuple(departments))
+        return DingTalkIdentity(
+            user_id=user_id,
+            union_id=union_id,
+            name=name,
+            departments=tuple(departments),
+        )
 
     async def request_openapi_json(
         self,

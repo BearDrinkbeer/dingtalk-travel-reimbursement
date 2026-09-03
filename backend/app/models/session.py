@@ -19,6 +19,7 @@ class UserSession(Base):
 
     session_id_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
     dingtalk_user_id: Mapped[str] = mapped_column(String(128))
+    dingtalk_union_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     name: Mapped[str] = mapped_column(String(128))
     corp_id: Mapped[str] = mapped_column(String(128), default="", server_default="")
     departments_json: Mapped[str] = mapped_column(Text)

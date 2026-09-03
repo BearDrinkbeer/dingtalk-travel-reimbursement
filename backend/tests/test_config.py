@@ -5,6 +5,8 @@ from pydantic import ValidationError
 
 from app.core.config import Settings
 
+REPOSITORY_ROOT = Path(__file__).parents[2]
+
 
 def test_settings_use_local_ocr_and_sqlite(tmp_path: Path) -> None:
     settings = Settings(
@@ -75,3 +77,39 @@ def test_production_ocr_requires_linux_limits(
         settings_factory(**common)
     monkeypatch.setattr("app.core.config.platform.machine", lambda: "AMD64")
     assert settings_factory(**common).ocr_enabled
+
+
+def test_production_requires_positive_numeric_dingtalk_agent_id(settings_factory) -> None:
+    with pytest.raises(ValidationError, match="DINGTALK_AGENT_ID"):
+        settings_factory(
+            app_env="production",
+            session_cookie_secure=True,
+            dingtalk_agent_id=None,
+        )
+    with pytest.raises(ValidationError, match="DINGTALK_AGENT_ID"):
+        settings_factory(dingtalk_agent_id=0)
+    invalid_agent_id = "agent-id-must-not-reach-errors"
+    with pytest.raises(ValidationError, match="DINGTALK_AGENT_ID") as caught:
+        settings_factory(dingtalk_agent_id=invalid_agent_id)
+    assert invalid_agent_id not in str(caught.value)
+    assert invalid_agent_id not in repr(caught.value)
+
+    assert settings_factory(dingtalk_agent_id="1234567890").dingtalk_agent_id == 1234567890
+
+
+def test_agent_id_is_wired_through_deployment_and_development_entrypoints() -> None:
+    for env_name in (".env.example", ".env.production.example", ".env.dingtalk-dev.example"):
+        assert "DINGTALK_AGENT_ID=" in (REPOSITORY_ROOT / env_name).read_text()
+
+    compose = (REPOSITORY_ROOT / "docker-compose.yml").read_text()
+    assert "DINGTALK_AGENT_ID: ${DINGTALK_AGENT_ID:-}" in compose
+
+    dingtalk_script = (REPOSITORY_ROOT / "scripts" / "dev-dingtalk-backend.sh").read_text()
+    required_variables = dingtalk_script.split("for variable_name in ", maxsplit=1)[1].split(
+        "; do", maxsplit=1
+    )[0]
+    assert "DINGTALK_AGENT_ID" in required_variables
+
+    frontend_script = (REPOSITORY_ROOT / "scripts" / "dev-dingtalk-frontend.sh").read_text()
+    unset_line = next(line for line in frontend_script.splitlines() if line.startswith("unset "))
+    assert "DINGTALK_AGENT_ID" in unset_line

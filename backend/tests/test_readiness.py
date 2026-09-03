@@ -26,10 +26,52 @@ def test_ready_reports_required_components_without_paths(client_factory) -> None
                 "excelTemplate": "ok",
                 "tempStorage": "ok",
                 "ocr": "disabled",
+                "dingtalkConfiguration": "configured",
             },
         },
     }
     assert "path" not in response.text.lower()
+
+
+def test_ready_fails_closed_when_dingtalk_agent_id_is_not_configured(
+    client_factory,
+) -> None:
+    client = client_factory(dingtalk_agent_id=None)
+
+    response = client.get("/api/ready")
+
+    assert response.status_code == 503
+    assert response.json()["data"]["checks"]["dingtalkConfiguration"] == "not_ready"
+    assert "client-secret" not in response.text
+    assert "1234567890" not in response.text
+
+
+def test_ready_allows_explicit_development_mock_without_real_dingtalk_config(
+    client_factory,
+) -> None:
+    client = client_factory(
+        auth_mock_enabled=True,
+        dingtalk_client_id="",
+        dingtalk_client_secret="",
+        dingtalk_corp_id="",
+        dingtalk_agent_id=None,
+    )
+
+    response = client.get("/api/ready")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["checks"]["dingtalkConfiguration"] == "development_mock"
+
+
+def test_ready_rejects_database_without_union_id_column(client_factory) -> None:
+    client = client_factory()
+    with client.app.state.database_engine.begin() as connection:
+        connection.execute(text("ALTER TABLE sessions DROP COLUMN dingtalk_union_id"))
+
+    response = client.get("/api/ready")
+
+    assert response.status_code == 503
+    assert response.json()["data"]["checks"]["database"] == "not_ready"
 
 
 def test_ready_fails_closed_for_invalid_template(settings_factory, tmp_path: Path) -> None:

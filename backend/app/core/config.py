@@ -16,6 +16,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
     app_env: Literal["development", "test", "production"] = "development"
@@ -69,6 +70,7 @@ class Settings(BaseSettings):
     dingtalk_client_id: str = ""
     dingtalk_client_secret: str = ""
     dingtalk_corp_id: str = ""
+    dingtalk_agent_id: int | None = None
     session_secret: str = ""
     admin_user_ids: str = ""
     session_cookie_name: str = "expense_session"
@@ -95,6 +97,26 @@ class Settings(BaseSettings):
         if not value.startswith("sqlite:///"):
             raise ValueError("V1 DATABASE_URL must use SQLite")
         return value
+
+    @field_validator("dingtalk_agent_id", mode="before")
+    @classmethod
+    def validate_dingtalk_agent_id(cls, value: object) -> int | None:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        if isinstance(value, bool):
+            raise ValueError("DINGTALK_AGENT_ID must be a positive numeric AgentId")
+        if isinstance(value, int):
+            agent_id = value
+        elif isinstance(value, str):
+            normalized = value.strip()
+            if not normalized.isascii() or not normalized.isdecimal():
+                raise ValueError("DINGTALK_AGENT_ID must be a positive numeric AgentId")
+            agent_id = int(normalized)
+        else:
+            raise ValueError("DINGTALK_AGENT_ID must be a positive numeric AgentId")
+        if agent_id <= 0:
+            raise ValueError("DINGTALK_AGENT_ID must be a positive numeric AgentId")
+        return agent_id
 
     @field_validator("session_ttl_minutes")
     @classmethod
@@ -190,6 +212,8 @@ class Settings(BaseSettings):
                 raise ValueError("AUTH_MOCK_ENABLED must be false in production")
             if not self.session_cookie_secure:
                 raise ValueError("SESSION_COOKIE_SECURE must be true in production")
+            if self.dingtalk_agent_id is None:
+                raise ValueError("DINGTALK_AGENT_ID must be configured for production")
             required = {
                 "DINGTALK_CLIENT_ID": self.dingtalk_client_id,
                 "DINGTALK_CLIENT_SECRET": self.dingtalk_client_secret,

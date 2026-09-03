@@ -257,7 +257,7 @@ def test_alembic_0003_preserves_legacy_rate_for_old_automatic_types(
                 row[1]
                 for row in connection.execute("PRAGMA table_info(oa_template_profiles)").fetchall()
             }
-        assert revision == ("20260903_0007",)
+        assert revision == ("20260904_0008",)
         assert keyword_count == (18,)
         assert keyword_columns == {
             "id",
@@ -283,6 +283,11 @@ def test_alembic_0003_preserves_legacy_rate_for_old_automatic_types(
             "created_at",
             "updated_at",
         }
+        with sqlite3.connect(database_path) as connection:
+            session_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+        assert "dingtalk_union_id" in session_columns
         assert values == {
             "subsidy_per_day": "88.50",
             "subsidy_business_per_day": "88.50",
@@ -291,5 +296,61 @@ def test_alembic_0003_preserves_legacy_rate_for_old_automatic_types(
             "subsidy_same_city_project_per_day": "50.00",
             "subsidy_internal_per_day": "100.00",
         }
+    finally:
+        get_settings.cache_clear()
+
+
+def test_alembic_0008_adds_nullable_union_id_without_fabricating_legacy_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database_path = tmp_path / "legacy-session.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{database_path}")
+    get_settings.cache_clear()
+    config = Config()
+    config.set_main_option("script_location", str(Path(__file__).parents[1] / "migrations"))
+    try:
+        command.upgrade(config, "20260903_0007")
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO sessions (
+                    session_id_hash, dingtalk_user_id, name, departments_json,
+                    current_department_id, current_department_name, csrf_token_hash,
+                    created_at, expires_at, last_seen_at, corp_id, is_admin
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "legacy-session",
+                    "legacy-user",
+                    "Legacy User",
+                    '[{"id":"10","name":"Legacy Department"}]',
+                    "10",
+                    "Legacy Department",
+                    "legacy-csrf",
+                    "2026-09-03 00:00:00",
+                    "2099-09-03 00:00:00",
+                    "2026-09-03 00:00:00",
+                    "corp-fixed",
+                    0,
+                ),
+            )
+            connection.commit()
+
+        command.upgrade(config, "head")
+
+        with sqlite3.connect(database_path) as connection:
+            revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+            session_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            union_id = connection.execute(
+                "SELECT dingtalk_union_id FROM sessions WHERE session_id_hash = ?",
+                ("legacy-session",),
+            ).fetchone()
+
+        assert revision == ("20260904_0008",)
+        assert "dingtalk_union_id" in session_columns
+        assert union_id == (None,)
     finally:
         get_settings.cache_clear()

@@ -14,6 +14,8 @@ from app.models.session import UserSession, utc_now
 
 def test_public_config_exposes_authoritative_upload_limits(client_factory) -> None:
     client = client_factory(
+        dingtalk_agent_id=1234567890,
+        dingtalk_client_secret="secret-must-stay-server-side",
         upload_max_file_bytes=12 * 1024 * 1024,
         session_max_files=7,
         session_max_bytes=55 * 1024 * 1024,
@@ -29,6 +31,8 @@ def test_public_config_exposes_authoritative_upload_limits(client_factory) -> No
         "maxSessionBytes": 55 * 1024 * 1024,
     }
     assert response.json()["data"]["expenseLimits"] == {"maxItems": 123}
+    assert "1234567890" not in response.text
+    assert "secret-must-stay-server-side" not in response.text
 
 
 def success_transport(department_ids: list[int] | None = None):
@@ -57,7 +61,11 @@ def success_transport(department_ids: list[int] | None = None):
                 200,
                 json={
                     "errcode": 0,
-                    "result": {"name": "测试员工", "dept_id_list": department_ids},
+                    "result": {
+                        "name": "测试员工",
+                        "unionid": "union-id-must-stay-server-side",
+                        "dept_id_list": department_ids,
+                    },
                 },
             )
         department_id = body["dept_id"]
@@ -100,10 +108,13 @@ def test_single_department_login_session_cookie_and_csrf_rotation(client_factory
         assert session is not None
         assert session.session_id_hash != raw_cookie
         assert session.corp_id == "corp-fixed"
+        assert session.dingtalk_union_id == "union-id-must-stay-server-side"
         assert "测试员工" not in raw_cookie
+    assert "union-id-must-stay-server-side" not in login.text
 
     me = client.get("/api/me")
     assert me.status_code == 200
+    assert "union-id-must-stay-server-side" not in me.text
     new_csrf = me.json()["data"]["csrfToken"]
     assert new_csrf != old_csrf
     stale = client.post(
@@ -119,6 +130,33 @@ def test_single_department_login_session_cookie_and_csrf_rotation(client_factory
     )
     assert current.status_code == 200
     assert len([call for call in calls if "oauth2" in call[1]]) == 1
+
+
+@pytest.mark.parametrize("union_id", [None, "", "   "])
+def test_login_rejects_member_response_without_nonempty_union_id(
+    client_factory,
+    union_id: str | None,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.dingtalk.com":
+            return httpx.Response(200, json={"access_token": "access-1", "expires_in": 7200})
+        if request.url.path.endswith("/user/getuserinfo"):
+            return httpx.Response(200, json={"errcode": 0, "result": {"userid": "user-1"}})
+        if request.url.path.endswith("/user/get"):
+            member = {"name": "测试员工", "dept_id_list": [10]}
+            if union_id is not None:
+                member["unionid"] = union_id
+            return httpx.Response(200, json={"errcode": 0, "result": member})
+        pytest.fail("department lookup must not run for an incomplete member identity")
+
+    client = client_factory(transport=httpx.MockTransport(handler))
+
+    response = client.post("/api/auth/dingtalk", json={"authCode": "one-time-code"})
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "DINGTALK_AUTH_FAILED"
+    assert "union" not in response.text.lower()
+    assert "expense_session" not in client.cookies
 
 
 def test_multiple_departments_require_authoritative_selection(client_factory) -> None:
@@ -169,6 +207,27 @@ def test_expired_and_forged_sessions_return_401(client_factory) -> None:
     assert client.get("/api/me").status_code == 401
 
 
+def test_session_without_union_id_requires_fresh_login(client_factory) -> None:
+    client = client_factory(auth_mock_enabled=True)
+    login = client.post("/api/auth/mock")
+    assert login.status_code == 200
+    raw_cookie = client.cookies["expense_session"]
+    session_hash = token_hash(raw_cookie, client.app.state.settings.session_secret)
+    with client.app.state.database_session_factory() as database:
+        record = database.get(UserSession, session_hash)
+        assert record is not None
+        record.dingtalk_union_id = None
+        database.commit()
+
+    response = client.get("/api/me")
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "UNAUTHORIZED"
+    assert "union" not in response.text.lower()
+    with client.app.state.database_session_factory() as database:
+        assert database.get(UserSession, session_hash) is None
+
+
 def test_logout_requires_csrf_and_invalidates_server_session(client_factory) -> None:
     client = client_factory(auth_mock_enabled=True)
     login = client.post("/api/auth/mock").json()["data"]
@@ -199,6 +258,15 @@ def test_mock_auth_is_explicit_and_cannot_accept_identity_or_admin_override(clie
     assert response.status_code == 200
     assert response.json()["data"]["user"]["userId"] == "fixed-user"
     assert response.json()["data"]["isAdmin"] is False
+    assert "mock-union-id" not in response.text
+    raw_cookie = enabled.cookies["expense_session"]
+    with enabled.app.state.database_session_factory() as database:
+        record = database.get(
+            UserSession,
+            token_hash(raw_cookie, enabled.app.state.settings.session_secret),
+        )
+        assert record is not None
+        assert record.dingtalk_union_id == "mock-union-id:fixed-user"
 
 
 def test_production_rejects_mock_placeholders_and_insecure_cookie(settings_factory) -> None:
@@ -263,7 +331,14 @@ def test_invalid_access_token_is_evicted_and_retried_once(client_factory) -> Non
         if request.url.path.endswith("/user/get"):
             return httpx.Response(
                 200,
-                json={"errcode": 0, "result": {"name": "测试员工", "dept_id_list": [10]}},
+                json={
+                    "errcode": 0,
+                    "result": {
+                        "name": "测试员工",
+                        "unionid": "union-retry-1",
+                        "dept_id_list": [10],
+                    },
+                },
             )
         return httpx.Response(200, json={"errcode": 0, "result": {"name": "测试部门"}})
 
@@ -331,6 +406,8 @@ def test_dingtalk_credentials_and_codes_never_reach_http_client_logs(
     access_token = "access-token-must-not-log"
     auth_code = "auth-code-must-not-log"
     client_secret = "client-secret-must-not-log"
+    union_id = "union-id-must-not-log"
+    agent_id = 9876543210
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode()) if request.content else {}
@@ -352,7 +429,11 @@ def test_dingtalk_credentials_and_codes_never_reach_http_client_logs(
                 200,
                 json={
                     "errcode": 0,
-                    "result": {"name": "日志测试用户", "dept_id_list": [10]},
+                    "result": {
+                        "name": "日志测试用户",
+                        "unionid": union_id,
+                        "dept_id_list": [10],
+                    },
                 },
             )
         return httpx.Response(
@@ -363,6 +444,7 @@ def test_dingtalk_credentials_and_codes_never_reach_http_client_logs(
     client = client_factory(
         transport=httpx.MockTransport(handler),
         dingtalk_client_secret=client_secret,
+        dingtalk_agent_id=agent_id,
     )
     caplog.set_level(logging.INFO)
 
@@ -374,6 +456,13 @@ def test_dingtalk_credentials_and_codes_never_reach_http_client_logs(
     assert access_token not in caplog.text
     assert auth_code not in caplog.text
     assert client_secret not in caplog.text
+    assert union_id not in caplog.text
+    assert str(agent_id) not in caplog.text
+    assert access_token not in response.text
+    assert auth_code not in response.text
+    assert client_secret not in response.text
+    assert union_id not in response.text
+    assert str(agent_id) not in response.text
 
 
 def test_admin_access_is_rederived_from_current_configuration(client_factory) -> None:

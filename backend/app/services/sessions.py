@@ -100,14 +100,14 @@ def require_fresh_active_file_session(
     """
 
     with session_factory() as database:
-        active_session = database.scalar(
-            select(UserSession.session_id_hash).where(
+        active_union_id = database.scalar(
+            select(UserSession.dingtalk_union_id).where(
                 UserSession.session_id_hash == session_id_hash,
                 UserSession.corp_id == settings.dingtalk_corp_id,
                 UserSession.expires_at > utc_now(),
             )
         )
-    if active_session is None:
+    if not str(active_union_id or "").strip():
         raise ApiError("UNAUTHORIZED", "登录状态已失效，请重新进入", 401)
 
 
@@ -132,6 +132,7 @@ def create_session(
     record = UserSession(
         session_id_hash=token_hash(session_token, settings.session_secret),
         dingtalk_user_id=identity.user_id,
+        dingtalk_union_id=identity.union_id,
         name=identity.name,
         corp_id=settings.dingtalk_corp_id,
         departments_json=serialize_departments(identity.departments),
@@ -199,6 +200,10 @@ def get_current_session(
         database.delete(record)
         database.commit()
         raise ApiError("INVALID_CORP_CONTEXT", "当前登录不属于本公司应用", 401)
+    if not str(record.dingtalk_union_id or "").strip():
+        database.delete(record)
+        database.commit()
+        raise ApiError("UNAUTHORIZED", "登录身份数据已更新，请重新进入", 401)
     changed = False
     current_admin = record.dingtalk_user_id in settings.admin_ids
     if record.is_admin != current_admin:

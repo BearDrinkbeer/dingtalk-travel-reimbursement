@@ -127,6 +127,7 @@ def mock_login(
         raise ApiError("AUTH_MOCK_INVALID", "开发免登部门配置无效", 500)
     identity = DingTalkIdentity(
         user_id=settings.auth_mock_user_id,
+        union_id=f"mock-union-id:{settings.auth_mock_user_id}",
         name=settings.auth_mock_user_name,
         departments=departments,
     )

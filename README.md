@@ -97,7 +97,8 @@ V1 不实现：
 ## Phase 2：钉钉免登配置
 
 后端使用固定的组织应用配置完成免登，浏览器只会读取 `DINGTALK_CLIENT_ID` 和
-`DINGTALK_CORP_ID`；`DINGTALK_CLIENT_SECRET` 与 `SESSION_SECRET` 只存在后端环境变量中。
+`DINGTALK_CORP_ID`；`DINGTALK_CLIENT_SECRET`、`DINGTALK_AGENT_ID` 与 `SESSION_SECRET`
+只存在后端环境变量中。
 钉钉应用需要具备免登码换用户、读取用户详情和读取部门详情的权限，并将部署使用的
 HTTPS 域名配置为应用可信域名。管理员使用 `ADMIN_USER_IDS` 配置钉钉 userId，多个值用
 英文逗号分隔。
@@ -132,7 +133,8 @@ cp .env.dingtalk-dev.example .env.dingtalk-dev
 
 `.env.dingtalk-dev` 已被 Git 忽略，但不是必需文件：文件不存在时，脚本直接读取当前终端
 已有的环境变量；显式设置 `DINGTALK_DEV_ENV_FILE` 后，指定文件不存在则拒绝启动。后端始终
-要求真实的 `DINGTALK_CLIENT_ID`、`DINGTALK_CLIENT_SECRET` 和 `DINGTALK_CORP_ID`。
+要求真实的 `DINGTALK_CLIENT_ID`、`DINGTALK_CLIENT_SECRET`、`DINGTALK_CORP_ID` 和
+`DINGTALK_AGENT_ID`。
 开发配置中的 `SESSION_SECRET` 可留空，脚本会为本次进程生成随机值；重启后已有开发 Session
 失效是预期行为。生产环境仍必须显式提供至少 32 字符的持久随机值。
 
@@ -331,7 +333,7 @@ Compose 要求显式提供 `APP_ENV`，没有该值会在配置展开阶段失�
 ```bash
 cp .env.production.example .env
 chmod 600 .env
-# 填写钉钉三项凭据、管理员 userId，并用 `openssl rand -hex 32` 生成 SESSION_SECRET
+# 填写钉钉应用凭据和 AgentId、管理员 userId，并用 `openssl rand -hex 32` 生成 SESSION_SECRET
 make deploy
 ```
 

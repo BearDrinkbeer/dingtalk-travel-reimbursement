@@ -20,7 +20,7 @@ class ReadinessReport:
     checks: dict[str, str]
 
 
-_EXPECTED_ALEMBIC_REVISION = "20260903_0007"
+_EXPECTED_ALEMBIC_REVISION = "20260904_0008"
 _REQUIRED_COLUMNS = {
     "oa_template_profiles": {
         "profile_key",
@@ -51,6 +51,7 @@ _REQUIRED_COLUMNS = {
     "sessions": {
         "session_id_hash",
         "dingtalk_user_id",
+        "dingtalk_union_id",
         "name",
         "corp_id",
         "departments_json",
@@ -160,6 +161,18 @@ def _ocr_readiness(settings: Settings) -> tuple[bool, str]:
     return versions_match, "configured" if versions_match else "not_ready"
 
 
+def _dingtalk_configuration_readiness(settings: Settings) -> tuple[bool, str]:
+    if settings.app_env in {"development", "test"} and settings.auth_mock_enabled:
+        return True, "development_mock"
+    configured = bool(
+        settings.dingtalk_client_id.strip()
+        and settings.dingtalk_client_secret.strip()
+        and settings.dingtalk_corp_id.strip()
+        and settings.dingtalk_agent_id is not None
+    )
+    return configured, "configured" if configured else "not_ready"
+
+
 def check_readiness(settings: Settings, engine: Engine) -> ReadinessReport:
     """Run bounded, non-recognition checks without returning paths or exception details."""
 
@@ -167,13 +180,15 @@ def check_readiness(settings: Settings, engine: Engine) -> ReadinessReport:
     template_ok = _template_ready(settings.excel_template_path)
     temp_ok = _temp_storage_ready(settings.temp_dir)
     ocr_ok, ocr_status = _ocr_readiness(settings)
+    dingtalk_ok, dingtalk_status = _dingtalk_configuration_readiness(settings)
     checks = {
         "database": "ok" if database_ok else "not_ready",
         "excelTemplate": "ok" if template_ok else "not_ready",
         "tempStorage": "ok" if temp_ok else "not_ready",
         "ocr": ocr_status,
+        "dingtalkConfiguration": dingtalk_status,
     }
     return ReadinessReport(
-        ready=database_ok and template_ok and temp_ok and ocr_ok,
+        ready=database_ok and template_ok and temp_ok and ocr_ok and dingtalk_ok,
         checks=checks,
     )

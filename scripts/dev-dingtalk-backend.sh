@@ -18,7 +18,7 @@ elif [ -n "${DINGTALK_DEV_ENV_FILE:-}" ]; then
     exit 2
 fi
 
-for variable_name in DINGTALK_CLIENT_ID DINGTALK_CLIENT_SECRET DINGTALK_CORP_ID; do
+for variable_name in DINGTALK_CLIENT_ID DINGTALK_CLIENT_SECRET DINGTALK_CORP_ID DINGTALK_AGENT_ID; do
     eval "variable_value=\${$variable_name:-}"
     if [ -z "$variable_value" ]; then
         echo "$variable_name 未配置，不能启动真实钉钉免登联调。" >&2
