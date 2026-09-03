@@ -253,13 +253,35 @@ def test_alembic_0003_preserves_legacy_rate_for_old_automatic_types(
                     "PRAGMA table_info(receipt_keyword_mappings)"
                 ).fetchall()
             }
-        assert revision == ("20260902_0006",)
+            oa_template_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(oa_template_profiles)").fetchall()
+            }
+        assert revision == ("20260903_0007",)
         assert keyword_count == (18,)
         assert keyword_columns == {
             "id",
             "keyword",
             "normalized_keyword",
             "category_id",
+        }
+        assert oa_template_columns == {
+            "profile_key",
+            "process_code",
+            "template_name",
+            "schema_fingerprint",
+            "confirmed_schema_fingerprint",
+            "schema_json",
+            "mapping_json",
+            "config_version",
+            "allowed_travel_process_codes_json",
+            "related_approval_smoke_test_confirmed",
+            "compatibility_status",
+            "confirmed_by_user_id",
+            "last_checked_at",
+            "confirmed_at",
+            "created_at",
+            "updated_at",
         }
         assert values == {
             "subsidy_per_day": "88.50",

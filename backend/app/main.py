@@ -14,6 +14,7 @@ from app.api.calculations import router as calculations_router
 from app.api.excel import router as excel_router
 from app.api.files import router as files_router
 from app.api.health import router as health_router
+from app.api.oa_templates import router as oa_templates_router
 from app.api.ocr import router as ocr_router
 from app.api.projects import router as projects_router
 from app.api.receipt_keywords import router as receipt_keywords_router
@@ -23,6 +24,8 @@ from app.core.errors import ApiError, error_response, install_error_handlers
 from app.core.logging import configure_logging
 from app.core.request_id import bind_request_id, request_id_from_header, reset_request_id
 from app.database.session import create_database_engine, create_session_factory
+from app.integrations.dingtalk.client import DingTalkOpenAPIClient
+from app.integrations.dingtalk.workflow import DingTalkWorkflowClient
 from app.ocr.engine import FakeOcrEngine
 from app.ocr.types import LocalOcrEngine
 from app.services.dingtalk import DingTalkService
@@ -46,7 +49,9 @@ def create_app(
     configure_logging(runtime_settings.log_level)
     database_engine = create_database_engine(runtime_settings.database_url)
     database_session_factory = create_session_factory(database_engine)
-    dingtalk_service = DingTalkService(runtime_settings, transport=dingtalk_transport)
+    dingtalk_client = DingTalkOpenAPIClient(runtime_settings, transport=dingtalk_transport)
+    dingtalk_service = DingTalkService(dingtalk_client)
+    dingtalk_workflow = DingTalkWorkflowClient(dingtalk_client)
     session_cleanup_gate = SessionCleanupGate(runtime_settings.session_cleanup_interval_seconds)
     file_coordinator = SessionFileCoordinator(
         file_wait_seconds=runtime_settings.file_operation_wait_seconds,
@@ -102,7 +107,7 @@ def create_app(
                 cleanup_task.cancel()
             await ocr_service.close()
             await process_runner.close()
-            await dingtalk_service.close()
+            await dingtalk_client.close()
             database_engine.dispose()
 
     application = FastAPI(
@@ -116,6 +121,8 @@ def create_app(
     application.state.database_engine = database_engine
     application.state.database_session_factory = database_session_factory
     application.state.dingtalk_service = dingtalk_service
+    application.state.dingtalk_client = dingtalk_client
+    application.state.dingtalk_workflow = dingtalk_workflow
     application.state.session_cleanup_gate = session_cleanup_gate
     application.state.ocr_service = ocr_service
     application.state.process_runner = process_runner
@@ -184,6 +191,7 @@ def create_app(
     application.include_router(excel_router, prefix="/api")
     application.include_router(files_router, prefix="/api")
     application.include_router(ocr_router, prefix="/api")
+    application.include_router(oa_templates_router, prefix="/api")
     return application
 
 

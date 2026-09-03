@@ -20,8 +20,26 @@ class ReadinessReport:
     checks: dict[str, str]
 
 
-_EXPECTED_ALEMBIC_REVISION = "20260902_0006"
+_EXPECTED_ALEMBIC_REVISION = "20260903_0007"
 _REQUIRED_COLUMNS = {
+    "oa_template_profiles": {
+        "profile_key",
+        "process_code",
+        "template_name",
+        "schema_fingerprint",
+        "confirmed_schema_fingerprint",
+        "schema_json",
+        "mapping_json",
+        "config_version",
+        "allowed_travel_process_codes_json",
+        "related_approval_smoke_test_confirmed",
+        "compatibility_status",
+        "confirmed_by_user_id",
+        "last_checked_at",
+        "confirmed_at",
+        "created_at",
+        "updated_at",
+    },
     "projects": {"id", "project_code", "project_name", "enabled", "created_at", "updated_at"},
     "settings": {"key", "value"},
     "receipt_keyword_mappings": {
