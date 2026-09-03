@@ -22,7 +22,7 @@ class ReadinessReport:
     checks: dict[str, str]
 
 
-_EXPECTED_ALEMBIC_REVISION = "20260904_0009"
+_EXPECTED_ALEMBIC_REVISION = "20260904_0010"
 _REQUIRED_COLUMNS = {
     "oa_template_profiles": {
         "profile_key",
@@ -34,6 +34,7 @@ _REQUIRED_COLUMNS = {
         "mapping_json",
         "config_version",
         "allowed_travel_process_codes_json",
+        "travel_profiles_json",
         "related_approval_smoke_test_confirmed",
         "compatibility_status",
         "confirmed_by_user_id",
@@ -89,6 +90,28 @@ _REQUIRED_COLUMNS = {
         "size_bytes",
         "sha256",
         "ocr_status",
+    },
+    "reimbursement_draft_related_approvals": {
+        "id",
+        "draft_id",
+        "corp_id",
+        "owner_user_id",
+        "sort_order",
+        "process_instance_id",
+        "travel_profile_key",
+        "process_code",
+        "catalog_config_version",
+        "travel_schema_fingerprint",
+        "listed_from_ms",
+        "listed_to_ms",
+        "travel_start_date",
+        "travel_end_date",
+        "title",
+        "business_id",
+        "instance_created_at",
+        "verified_at",
+        "created_at",
+        "updated_at",
     },
     "reimbursement_submissions": {
         "id",

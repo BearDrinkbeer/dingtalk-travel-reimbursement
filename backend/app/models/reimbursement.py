@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from uuid import uuid4
 
 from sqlalchemy import (
     DDL,
+    BigInteger,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
@@ -171,6 +173,79 @@ class ReimbursementDraft(Base):
     related_instance_ids_json: Mapped[str] = mapped_column(Text, default="[]")
     expires_at: Mapped[datetime] = mapped_column(DateTime())
     locked_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(), default=utc_now, onupdate=utc_now)
+
+
+class ReimbursementDraftRelatedApproval(Base):
+    __tablename__ = "reimbursement_draft_related_approvals"
+    __table_args__ = (
+        UniqueConstraint(
+            "draft_id",
+            "process_instance_id",
+            name="uq_reimbursement_draft_related_approvals_draft_instance",
+        ),
+        UniqueConstraint(
+            "draft_id",
+            "sort_order",
+            name="uq_reimbursement_draft_related_approvals_draft_sort_order",
+        ),
+        CheckConstraint(
+            "sort_order >= 0",
+            name="ck_reimbursement_draft_related_approvals_sort_order",
+        ),
+        CheckConstraint(
+            "catalog_config_version > 0",
+            name="ck_reimbursement_draft_related_approvals_catalog_version_positive",
+        ),
+        CheckConstraint(
+            "length(travel_schema_fingerprint) = 64",
+            name="ck_reimbursement_draft_related_approvals_fingerprint_length",
+        ),
+        CheckConstraint(
+            "listed_from_ms >= 0 AND listed_to_ms >= listed_from_ms",
+            name="ck_reimbursement_draft_related_approvals_listing_window",
+        ),
+        CheckConstraint(
+            "travel_end_date >= travel_start_date",
+            name="ck_reimbursement_draft_related_approvals_travel_dates",
+        ),
+        ForeignKeyConstraint(
+            ["draft_id", "corp_id", "owner_user_id"],
+            [
+                "reimbursement_drafts.id",
+                "reimbursement_drafts.corp_id",
+                "reimbursement_drafts.owner_user_id",
+            ],
+            ondelete="CASCADE",
+            name="fk_reimbursement_draft_related_approvals_draft_owner",
+        ),
+        Index(
+            "ix_reimbursement_draft_related_approvals_owner_instance",
+            "corp_id",
+            "owner_user_id",
+            "process_instance_id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    draft_id: Mapped[str] = mapped_column(String(36))
+    corp_id: Mapped[str] = mapped_column(String(128))
+    owner_user_id: Mapped[str] = mapped_column(String(128))
+    sort_order: Mapped[int] = mapped_column(Integer)
+    process_instance_id: Mapped[str] = mapped_column(String(128))
+    travel_profile_key: Mapped[str] = mapped_column(String(64))
+    process_code: Mapped[str] = mapped_column(String(128))
+    catalog_config_version: Mapped[int] = mapped_column(Integer)
+    travel_schema_fingerprint: Mapped[str] = mapped_column(String(64))
+    listed_from_ms: Mapped[int] = mapped_column(BigInteger)
+    listed_to_ms: Mapped[int] = mapped_column(BigInteger)
+    travel_start_date: Mapped[date] = mapped_column(Date)
+    travel_end_date: Mapped[date] = mapped_column(Date)
+    title: Mapped[str] = mapped_column(String(500))
+    business_id: Mapped[str] = mapped_column(String(128))
+    instance_created_at: Mapped[datetime] = mapped_column(DateTime())
+    verified_at: Mapped[datetime] = mapped_column(DateTime())
     created_at: Mapped[datetime] = mapped_column(DateTime(), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(), default=utc_now, onupdate=utc_now)
 

@@ -141,6 +141,29 @@ EXPECTED_COLUMNS = {
     },
 }
 
+RELATED_APPROVAL_COLUMNS = {
+    "id",
+    "draft_id",
+    "corp_id",
+    "owner_user_id",
+    "sort_order",
+    "process_instance_id",
+    "travel_profile_key",
+    "process_code",
+    "catalog_config_version",
+    "travel_schema_fingerprint",
+    "listed_from_ms",
+    "listed_to_ms",
+    "travel_start_date",
+    "travel_end_date",
+    "title",
+    "business_id",
+    "instance_created_at",
+    "verified_at",
+    "created_at",
+    "updated_at",
+}
+
 
 def alembic_config() -> Config:
     config = Config()
@@ -287,9 +310,113 @@ def test_reimbursement_migration_upgrade_downgrade_and_reupgrade(
         command.upgrade(config, "head")
         with sqlite3.connect(database_path) as connection:
             assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
-                "20260904_0009",
+                "20260904_0010",
             )
             assert set(EXPECTED_COLUMNS).issubset(table_names(connection))
+    finally:
+        get_settings.cache_clear()
+
+
+def test_related_approval_catalog_migration_upgrade_downgrade_and_reupgrade(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database_path = tmp_path / "related-approval-catalog-migration.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{database_path}")
+    get_settings.cache_clear()
+    config = alembic_config()
+    try:
+        command.upgrade(config, "20260904_0009")
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO oa_template_profiles (
+                    profile_key, process_code, template_name, schema_fingerprint,
+                    confirmed_schema_fingerprint, schema_json, mapping_json, config_version,
+                    allowed_travel_process_codes_json,
+                    related_approval_smoke_test_confirmed, compatibility_status,
+                    confirmed_by_user_id, last_checked_at, confirmed_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "reimbursement",
+                    "PROC-REIMBURSEMENT",
+                    "差旅费报销",
+                    "a" * 64,
+                    "a" * 64,
+                    "{}",
+                    "{}",
+                    1,
+                    "[]",
+                    1,
+                    "COMPATIBLE",
+                    "admin-1",
+                    "2026-09-04 01:00:00",
+                    "2026-09-04 01:00:00",
+                    "2026-09-04 01:00:00",
+                    "2026-09-04 01:00:00",
+                ),
+            )
+            connection.commit()
+            assert "travel_profiles_json" not in {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(oa_template_profiles)").fetchall()
+            }
+            assert "reimbursement_draft_related_approvals" not in table_names(connection)
+
+        command.upgrade(config, "20260904_0010")
+        with sqlite3.connect(database_path) as connection:
+            assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
+                "20260904_0010",
+            )
+            assert connection.execute(
+                "SELECT travel_profiles_json FROM oa_template_profiles WHERE profile_key = ?",
+                ("reimbursement",),
+            ).fetchone() == ("[]",)
+            assert {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(reimbursement_draft_related_approvals)"
+                ).fetchall()
+            } == RELATED_APPROVAL_COLUMNS
+            foreign_keys = connection.execute(
+                "PRAGMA foreign_key_list(reimbursement_draft_related_approvals)"
+            ).fetchall()
+            assert {(row[2], row[3], row[4], row[6]) for row in foreign_keys} == {
+                ("reimbursement_drafts", "draft_id", "id", "CASCADE"),
+                ("reimbursement_drafts", "corp_id", "corp_id", "CASCADE"),
+                ("reimbursement_drafts", "owner_user_id", "owner_user_id", "CASCADE"),
+            }
+            table_sql = str(
+                connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'reimbursement_draft_related_approvals'"
+                ).fetchone()[0]
+            )
+            assert "fk_reimbursement_draft_related_approvals_draft_owner" in table_sql
+            assert "uq_reimbursement_draft_related_approvals_draft_instance" in table_sql
+            assert "uq_reimbursement_draft_related_approvals_draft_sort_order" in table_sql
+            assert "ck_reimbursement_draft_related_approvals_listing_window" in table_sql
+            assert "ck_reimbursement_draft_related_approvals_travel_dates" in table_sql
+            assert connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+                "AND name = 'ix_reimbursement_draft_related_approvals_owner_instance'"
+            ).fetchone() == (1,)
+
+        command.downgrade(config, "20260904_0009")
+        with sqlite3.connect(database_path) as connection:
+            assert "reimbursement_draft_related_approvals" not in table_names(connection)
+            assert "travel_profiles_json" not in {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(oa_template_profiles)").fetchall()
+            }
+
+        command.upgrade(config, "head")
+        with sqlite3.connect(database_path) as connection:
+            assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
+                "20260904_0010",
+            )
+            assert "reimbursement_draft_related_approvals" in table_names(connection)
     finally:
         get_settings.cache_clear()
 

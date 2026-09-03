@@ -14,6 +14,7 @@ from app.core.errors import ApiError
 from app.integrations.dingtalk.workflow import (
     DingTalkWorkflowClient,
     FormComponent,
+    FormOption,
     FormSchema,
     form_schema_from_dict,
 )
@@ -24,11 +25,25 @@ REIMBURSEMENT_PROFILE_KEY: Final = "reimbursement"
 COMPATIBLE = "COMPATIBLE"
 DRIFTED = "DRIFTED"
 UNCONFIGURED = "UNCONFIGURED"
-PROCESS_CODE_CHANGED = "PROCESS_CODE_CHANGED"
+CATALOG_CHANGED = "CATALOG_CHANGED"
 
 _FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _PROCESS_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_PROFILE_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _MAX_CONFIG_CAS_ATTEMPTS = 3
+_MAX_TRAVEL_PROFILES = 20
+_TRAVEL_PROFILE_JSON_KEYS = frozenset(
+    {
+        "profileKey",
+        "displayName",
+        "processCode",
+        "schemaFingerprint",
+        "confirmedSchemaFingerprint",
+        "schema",
+        "mappings",
+        "travelTypeOption",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,25 +62,68 @@ class LogicalFieldSpec:
 
 @dataclass(frozen=True, slots=True)
 class ReimbursementTemplateContract:
-    """Validated data needed by the future OA submission orchestrator."""
-
     process_code: str
     schema: FormSchema
     mappings: dict[str, str]
-    allowed_travel_process_codes: tuple[str, ...]
-
-    def require_allowed_travel_process(self, actual_process_code: str) -> None:
-        """Validate the processCode read back from a selected trip instance."""
-
-        if actual_process_code not in self.allowed_travel_process_codes:
-            raise ApiError(
-                "TRAVEL_APPROVAL_TEMPLATE_NOT_ALLOWED",
-                "所选出差审批不属于允许关联的出差模板",
-                400,
-            )
 
 
-LOGICAL_FIELD_SPECS: Final[tuple[LogicalFieldSpec, ...]] = (
+@dataclass(frozen=True, slots=True)
+class TravelTemplateContract:
+    profile_key: str
+    display_name: str
+    process_code: str
+    schema: FormSchema
+    start_date_component_id: str
+    end_date_component_id: str
+    travel_type_option: FormOption
+
+    @property
+    def mappings(self) -> dict[str, str]:
+        return {
+            "startDate": self.start_date_component_id,
+            "endDate": self.end_date_component_id,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class OaTemplateCatalogContract:
+    config_version: int
+    reimbursement: ReimbursementTemplateContract
+    travel_profiles: tuple[TravelTemplateContract, ...]
+
+    @property
+    def allowed_travel_process_codes(self) -> tuple[str, ...]:
+        return tuple(profile.process_code for profile in self.travel_profiles)
+
+    def travel_profile(self, profile_key: str) -> TravelTemplateContract:
+        for profile in self.travel_profiles:
+            if profile.profile_key == profile_key:
+                return profile
+        raise ApiError(
+            "TRAVEL_APPROVAL_TEMPLATE_NOT_ALLOWED",
+            "所选出差审批不属于允许关联的出差模板",
+            400,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TravelProfileInspection:
+    profile_key: str
+    display_name: str
+    process_code: str
+
+
+@dataclass(frozen=True, slots=True)
+class TravelProfileConfirmation:
+    profile_key: str
+    display_name: str
+    process_code: str
+    schema_fingerprint: str
+    mappings: dict[str, str]
+    travel_type_option: FormOption
+
+
+REIMBURSEMENT_LOGICAL_FIELD_SPECS: Final[tuple[LogicalFieldSpec, ...]] = (
     LogicalFieldSpec("company", "所属公司", frozenset({"DDSelectField"})),
     LogicalFieldSpec("budgetCode", "预算代码", frozenset({"DDSelectField"})),
     LogicalFieldSpec("travelType", "出差类别", frozenset({"DDSelectField"})),
@@ -85,133 +143,233 @@ LOGICAL_FIELD_SPECS: Final[tuple[LogicalFieldSpec, ...]] = (
     LogicalFieldSpec("relatedApprovals", "关联审批单", frozenset({"RelateField"})),
     LogicalFieldSpec("attachments", "附件", frozenset({"DDAttachment"})),
 )
-LOGICAL_FIELD_BY_KEY: Final = {item.key: item for item in LOGICAL_FIELD_SPECS}
+TRAVEL_LOGICAL_FIELD_SPECS: Final[tuple[LogicalFieldSpec, ...]] = (
+    LogicalFieldSpec("startDate", "出差开始日期", frozenset({"DDDateField"})),
+    LogicalFieldSpec("endDate", "出差结束日期", frozenset({"DDDateField"})),
+)
+LOGICAL_FIELD_SPECS = REIMBURSEMENT_LOGICAL_FIELD_SPECS
 
 
-async def inspect_reimbursement_template(
-    database: Session,
-    workflow: DingTalkWorkflowClient,
-    process_code: str,
-) -> dict[str, object]:
-    profile: OaTemplateProfile | None = None
-    schema: FormSchema | None = None
-    status = UNCONFIGURED
-    for _attempt in range(_MAX_CONFIG_CAS_ATTEMPTS):
-        schema = await workflow.get_form_schema(process_code)
-        profile = _fresh_profile(database)
-        if profile is None:
-            status = UNCONFIGURED
-            break
-        if profile.process_code != process_code:
-            status = PROCESS_CODE_CHANGED
-            break
-        status = (
-            COMPATIBLE if profile.confirmed_schema_fingerprint == schema.fingerprint else DRIFTED
-        )
-        expected_config_version = profile.config_version
-        if _record_schema_observation(
-            database,
-            schema,
-            expected_config_version=expected_config_version,
-            expected_schema_fingerprint=profile.schema_fingerprint,
-            compatibility_status=status,
-        ):
-            profile = _fresh_profile(database)
-            if (
-                profile is not None
-                and profile.process_code == process_code
-                and profile.config_version == expected_config_version
-                and profile.schema_fingerprint == schema.fingerprint
-            ):
-                status = profile.compatibility_status
-                break
-            database.rollback()
-    else:
-        raise _configuration_changed_error()
-
-    if schema is None:
-        raise _configuration_changed_error()
-
-    existing_mappings = None
-    if profile is not None and profile.process_code == process_code:
-        existing_mappings = _display_mapping(profile.mapping_json)
-    allowed_travel_process_codes = (
-        _display_process_codes(profile.allowed_travel_process_codes_json)
-        if profile is not None and profile.process_code == process_code
-        else []
-    )
-    relationship_confirmed = bool(
-        profile is not None
-        and profile.process_code == process_code
-        and profile.related_approval_smoke_test_confirmed
-    )
-    is_submission_ready = bool(
-        profile is not None
-        and profile.process_code == process_code
-        and _profile_submission_ready(profile)
-    )
-    return {
-        "schema": _schema_api_data(schema),
-        "logicalFields": [item.as_dict() for item in LOGICAL_FIELD_SPECS],
-        "compatibilityStatus": status,
-        "requiresConfirmation": not is_submission_ready,
-        "isSubmissionReady": is_submission_ready,
-        "configuredProcessCode": profile.process_code if profile is not None else None,
-        "configuredConfigVersion": profile.config_version if profile is not None else None,
-        "confirmedSchemaFingerprint": (
-            profile.confirmed_schema_fingerprint
-            if profile is not None and profile.process_code == process_code
-            else None
-        ),
-        "mappings": existing_mappings,
-        "allowedTravelProcessCodes": allowed_travel_process_codes,
-        "relatedApprovalSmokeTestConfirmed": relationship_confirmed,
-    }
-
-
-async def confirm_reimbursement_template(
+async def inspect_template_catalog(
     database: Session,
     workflow: DingTalkWorkflowClient,
     *,
-    process_code: str,
+    reimbursement_process_code: str,
+    travel_profiles: list[TravelProfileInspection],
+) -> dict[str, object]:
+    normalized_profiles = _validate_profile_headers(
+        reimbursement_process_code,
+        travel_profiles,
+    )
+    reimbursement_schema = await workflow.get_form_schema(reimbursement_process_code)
+    travel_schemas = [
+        await workflow.get_form_schema(profile.process_code) for profile in normalized_profiles
+    ]
+
+    profile = _fresh_profile(database)
+    configured_travel_profiles = _display_travel_profiles(profile) if profile is not None else []
+    same_catalog = bool(
+        profile is not None
+        and profile.process_code == reimbursement_process_code
+        and [
+            (item.get("profileKey"), item.get("processCode")) for item in configured_travel_profiles
+        ]
+        == [(item.profile_key, item.process_code) for item in normalized_profiles]
+    )
+    compatible = bool(
+        same_catalog
+        and profile is not None
+        and profile.confirmed_schema_fingerprint == reimbursement_schema.fingerprint
+        and all(
+            stored.get("confirmedSchemaFingerprint") == schema.fingerprint
+            for stored, schema in zip(
+                configured_travel_profiles,
+                travel_schemas,
+                strict=True,
+            )
+        )
+    )
+    reusable_relationship_confirmation = bool(
+        same_catalog
+        and compatible
+        and profile is not None
+        and _relationship_confirmation_matches_inspection(
+            profile,
+            reimbursement_schema=reimbursement_schema,
+            requested_profiles=normalized_profiles,
+            travel_schemas=travel_schemas,
+            stored_profiles=configured_travel_profiles,
+        )
+    )
+    status = (
+        UNCONFIGURED
+        if profile is None
+        else COMPATIBLE
+        if compatible
+        else CATALOG_CHANGED
+        if not same_catalog
+        else DRIFTED
+    )
+    if same_catalog and profile is not None:
+        expected_config_version = profile.config_version
+        if not _record_catalog_status(
+            database,
+            expected_config_version=expected_config_version,
+            expected_process_code=profile.process_code,
+            compatibility_status=COMPATIBLE if compatible else DRIFTED,
+        ):
+            raise _configuration_changed_error()
+        profile = _fresh_profile(database)
+        if (
+            profile is None
+            or profile.config_version != expected_config_version
+            or profile.process_code != reimbursement_process_code
+        ):
+            raise _configuration_changed_error()
+
+    stored_by_key = {str(item.get("profileKey")): item for item in configured_travel_profiles}
+    travel_data: list[dict[str, object]] = []
+    for requested, schema in zip(normalized_profiles, travel_schemas, strict=True):
+        stored = stored_by_key.get(requested.profile_key)
+        travel_data.append(
+            {
+                "profileKey": requested.profile_key,
+                "displayName": requested.display_name,
+                "processCode": requested.process_code,
+                "schema": _schema_api_data(schema, TRAVEL_LOGICAL_FIELD_SPECS),
+                "logicalFields": [item.as_dict() for item in TRAVEL_LOGICAL_FIELD_SPECS],
+                "mappings": (
+                    _display_mapping_value(stored.get("mappings"))
+                    if stored is not None and stored.get("processCode") == requested.process_code
+                    else None
+                ),
+                "travelTypeOption": (
+                    _display_option_value(stored.get("travelTypeOption"))
+                    if stored is not None and stored.get("processCode") == requested.process_code
+                    else None
+                ),
+                "confirmedSchemaFingerprint": (
+                    stored.get("confirmedSchemaFingerprint")
+                    if stored is not None and stored.get("processCode") == requested.process_code
+                    else None
+                ),
+            }
+        )
+
+    is_ready = bool(profile is not None and compatible and _profile_submission_ready(profile))
+    return {
+        "configured": profile is not None,
+        "compatibilityStatus": status,
+        "requiresConfirmation": not is_ready,
+        "isSubmissionReady": is_ready,
+        "configuredConfigVersion": profile.config_version if profile is not None else None,
+        "reimbursement": {
+            "processCode": reimbursement_process_code,
+            "schema": _schema_api_data(
+                reimbursement_schema,
+                REIMBURSEMENT_LOGICAL_FIELD_SPECS,
+            ),
+            "logicalFields": [item.as_dict() for item in REIMBURSEMENT_LOGICAL_FIELD_SPECS],
+            "mappings": (
+                _display_mapping(profile.mapping_json)
+                if profile is not None and profile.process_code == reimbursement_process_code
+                else None
+            ),
+            "confirmedSchemaFingerprint": (
+                profile.confirmed_schema_fingerprint
+                if profile is not None and profile.process_code == reimbursement_process_code
+                else None
+            ),
+        },
+        "travelProfiles": travel_data,
+        "relatedApprovalSmokeTestConfirmed": reusable_relationship_confirmation,
+    }
+
+
+async def confirm_template_catalog(
+    database: Session,
+    workflow: DingTalkWorkflowClient,
+    *,
+    reimbursement_process_code: str,
     expected_config_version: int | None,
-    inspected_fingerprint: str,
-    mappings: dict[str, str],
-    allowed_travel_process_codes: list[str],
+    reimbursement_schema_fingerprint: str,
+    reimbursement_mappings: dict[str, str],
+    travel_profiles: list[TravelProfileConfirmation],
     related_approval_smoke_test_confirmed: bool,
     administrator_user_id: str,
 ) -> dict[str, object]:
-    if not _FINGERPRINT_PATTERN.fullmatch(inspected_fingerprint):
-        raise _mapping_error("Schema 指纹格式无效")
+    if not _FINGERPRINT_PATTERN.fullmatch(reimbursement_schema_fingerprint):
+        raise _mapping_error("报销模板 Schema 指纹格式无效")
+    normalized_headers = _validate_profile_headers(
+        reimbursement_process_code,
+        [
+            TravelProfileInspection(
+                profile_key=item.profile_key,
+                display_name=item.display_name,
+                process_code=item.process_code,
+            )
+            for item in travel_profiles
+        ],
+    )
+    confirmation_by_key = {item.profile_key.strip(): item for item in travel_profiles}
 
-    schema = await workflow.get_form_schema(process_code)
-    if schema.fingerprint != inspected_fingerprint:
-        raise ApiError(
-            "OA_TEMPLATE_SCHEMA_CHANGED",
-            "审批模板已更新，请重新检查字段并确认",
-            409,
+    # A partial remote success can never leave a partially confirmed local catalog.
+    reimbursement_schema = await workflow.get_form_schema(reimbursement_process_code)
+    travel_schemas = [
+        await workflow.get_form_schema(profile.process_code) for profile in normalized_headers
+    ]
+
+    if reimbursement_schema.fingerprint != reimbursement_schema_fingerprint:
+        raise _schema_changed_error()
+    normalized_reimbursement_mapping = validate_template_mapping(
+        reimbursement_schema,
+        reimbursement_mappings,
+    )
+
+    contracts: list[TravelTemplateContract] = []
+    for header, schema in zip(normalized_headers, travel_schemas, strict=True):
+        confirmation = confirmation_by_key[header.profile_key]
+        if not _FINGERPRINT_PATTERN.fullmatch(confirmation.schema_fingerprint):
+            raise _mapping_error(f"{header.display_name}的 Schema 指纹格式无效")
+        if schema.fingerprint != confirmation.schema_fingerprint:
+            raise _schema_changed_error()
+        mapping = validate_travel_template_mapping(schema, confirmation.mappings)
+        exact_option = validate_exact_travel_type_option(
+            reimbursement_schema,
+            normalized_reimbursement_mapping,
+            confirmation.travel_type_option,
         )
-    normalized_mapping = validate_template_mapping(schema, mappings)
-    normalized_travel_process_codes = validate_related_approval_configuration(
-        schema,
-        normalized_mapping,
-        reimbursement_process_code=process_code,
-        allowed_travel_process_codes=allowed_travel_process_codes,
+        contracts.append(
+            TravelTemplateContract(
+                profile_key=header.profile_key,
+                display_name=header.display_name,
+                process_code=header.process_code,
+                schema=schema,
+                start_date_component_id=mapping["startDate"],
+                end_date_component_id=mapping["endDate"],
+                travel_type_option=exact_option,
+            )
+        )
+
+    allowed_process_codes = tuple(item.process_code for item in contracts)
+    validate_related_approval_configuration(
+        reimbursement_schema,
+        normalized_reimbursement_mapping,
+        reimbursement_process_code=reimbursement_process_code,
+        allowed_travel_process_codes=list(allowed_process_codes),
         smoke_test_confirmed=related_approval_smoke_test_confirmed,
     )
 
     now = utc_now()
-    profile = _fresh_profile(database)
     values = {
-        "process_code": process_code,
-        "template_name": schema.template_name,
-        "schema_fingerprint": schema.fingerprint,
-        "confirmed_schema_fingerprint": schema.fingerprint,
-        "schema_json": _serialize_schema(schema),
-        "mapping_json": _serialize_mapping(normalized_mapping),
-        "allowed_travel_process_codes_json": _serialize_process_codes(
-            normalized_travel_process_codes
-        ),
+        "process_code": reimbursement_process_code,
+        "template_name": reimbursement_schema.template_name,
+        "schema_fingerprint": reimbursement_schema.fingerprint,
+        "confirmed_schema_fingerprint": reimbursement_schema.fingerprint,
+        "schema_json": _serialize_schema(reimbursement_schema),
+        "mapping_json": _serialize_mapping(normalized_reimbursement_mapping),
+        "allowed_travel_process_codes_json": _serialize_process_codes(allowed_process_codes),
+        "travel_profiles_json": _serialize_travel_profiles(contracts),
         "related_approval_smoke_test_confirmed": True,
         "compatibility_status": COMPATIBLE,
         "confirmed_by_user_id": administrator_user_id,
@@ -219,16 +377,19 @@ async def confirm_reimbursement_template(
         "confirmed_at": now,
         "updated_at": now,
     }
+
+    profile = _fresh_profile(database)
     if expected_config_version is None:
         if profile is not None:
             raise _configuration_changed_error()
-        profile = OaTemplateProfile(
-            profile_key=REIMBURSEMENT_PROFILE_KEY,
-            config_version=1,
-            created_at=now,
-            **values,
+        database.add(
+            OaTemplateProfile(
+                profile_key=REIMBURSEMENT_PROFILE_KEY,
+                config_version=1,
+                created_at=now,
+                **values,
+            )
         )
-        database.add(profile)
         try:
             database.commit()
         except IntegrityError:
@@ -237,140 +398,169 @@ async def confirm_reimbursement_template(
     else:
         if profile is None or profile.config_version != expected_config_version:
             raise _configuration_changed_error()
-        next_version = expected_config_version + 1
         result = database.execute(
             update(OaTemplateProfile)
             .where(
                 OaTemplateProfile.profile_key == REIMBURSEMENT_PROFILE_KEY,
                 OaTemplateProfile.config_version == expected_config_version,
             )
-            .values(config_version=next_version, **values),
+            .values(config_version=expected_config_version + 1, **values),
             execution_options={"synchronize_session": False},
         )
         if result.rowcount != 1:
             database.rollback()
             raise _configuration_changed_error()
         database.commit()
-    profile = _fresh_profile(database)
-    if profile is None:
+
+    saved = _fresh_profile(database)
+    if saved is None:
         raise _configuration_changed_error()
-    return template_profile_data(profile)
+    return template_catalog_data(saved)
 
 
-def current_reimbursement_template(database: Session) -> dict[str, object]:
+def current_template_catalog(database: Session) -> dict[str, object]:
     profile = _fresh_profile(database)
     if profile is None:
         return {
             "configured": False,
+            "configVersion": None,
             "compatibilityStatus": UNCONFIGURED,
             "isSubmissionReady": False,
             "requiresConfirmation": True,
-            "profile": None,
+            "catalog": None,
         }
-    is_submission_ready = _profile_submission_ready(profile)
+    try:
+        data = template_catalog_data(profile)
+    except ApiError:
+        return {
+            "configured": True,
+            "configVersion": profile.config_version,
+            "compatibilityStatus": profile.compatibility_status,
+            "isSubmissionReady": False,
+            "requiresConfirmation": True,
+            "catalog": None,
+        }
     return {
         "configured": True,
+        "configVersion": profile.config_version,
         "compatibilityStatus": profile.compatibility_status,
-        "isSubmissionReady": is_submission_ready,
-        "requiresConfirmation": not is_submission_ready,
-        "profile": template_profile_data(profile),
+        "isSubmissionReady": bool(data["isSubmissionReady"]),
+        "requiresConfirmation": not bool(data["isSubmissionReady"]),
+        "catalog": data,
     }
 
 
-def require_submission_ready_template(database: Session) -> OaTemplateProfile:
-    """Validate persisted state without making a network request.
-
-    Submission orchestration should normally use ``load_fresh_submission_template``
-    so checking the remote schema cannot be skipped accidentally.
-    """
-
+def require_submission_ready_catalog(database: Session) -> OaTemplateCatalogContract:
     profile = _fresh_profile(database)
     if profile is None:
         raise ApiError(
             "OA_TEMPLATE_NOT_CONFIGURED",
-            "报销审批模板尚未配置，请联系管理员",
+            "报销审批模板目录尚未配置，请联系管理员",
             409,
         )
     if (
         profile.compatibility_status != COMPATIBLE
         or profile.schema_fingerprint != profile.confirmed_schema_fingerprint
     ):
-        raise ApiError(
-            "OA_TEMPLATE_CONFIRMATION_REQUIRED",
-            "审批模板已经变化，请管理员重新确认字段对应关系",
-            409,
-        )
-    if not _profile_relationship_ready(profile):
-        raise ApiError(
-            "OA_TEMPLATE_RELATIONSHIP_CONFIRMATION_REQUIRED",
-            "关联审批模板白名单尚未确认，请管理员完成配置和关联测试",
-            409,
-        )
+        raise _confirmation_required_error()
     try:
-        _validated_persisted_contract(profile)
+        return _validated_persisted_catalog(profile)
     except ApiError:
-        raise ApiError(
-            "OA_TEMPLATE_CONFIRMATION_REQUIRED",
-            "审批模板配置已经失效，请管理员重新检查并确认",
-            409,
-        ) from None
-    return profile
+        raise _confirmation_required_error() from None
+
+
+async def load_fresh_submission_catalog(
+    database_session_factory: sessionmaker[Session],
+    workflow: DingTalkWorkflowClient,
+) -> OaTemplateCatalogContract:
+    for _attempt in range(_MAX_CONFIG_CAS_ATTEMPTS):
+        with database_session_factory() as snapshot_database:
+            contract = require_submission_ready_catalog(snapshot_database)
+            config_version = contract.config_version
+            reimbursement_process_code = contract.reimbursement.process_code
+            travel_process_codes = tuple(
+                profile.process_code for profile in contract.travel_profiles
+            )
+
+        reimbursement_schema = await workflow.get_form_schema(reimbursement_process_code)
+        travel_schemas = [
+            await workflow.get_form_schema(process_code) for process_code in travel_process_codes
+        ]
+        compatible = bool(
+            reimbursement_schema.fingerprint == contract.reimbursement.schema.fingerprint
+            and all(
+                observed.fingerprint == configured.schema.fingerprint
+                for observed, configured in zip(
+                    travel_schemas,
+                    contract.travel_profiles,
+                    strict=True,
+                )
+            )
+        )
+        with database_session_factory() as observation_database:
+            observed = _record_catalog_status(
+                observation_database,
+                expected_config_version=config_version,
+                expected_process_code=reimbursement_process_code,
+                compatibility_status=COMPATIBLE if compatible else DRIFTED,
+            )
+        if not observed:
+            continue
+        if not compatible:
+            raise _confirmation_required_error()
+
+        with database_session_factory() as final_database:
+            current = require_submission_ready_catalog(final_database)
+            if (
+                current.config_version == config_version
+                and current.reimbursement.process_code == reimbursement_process_code
+                and tuple(item.process_code for item in current.travel_profiles)
+                == travel_process_codes
+            ):
+                return current
+    raise _configuration_changed_error()
 
 
 async def load_fresh_submission_template(
     database_session_factory: sessionmaker[Session],
     workflow: DingTalkWorkflowClient,
-) -> ReimbursementTemplateContract:
-    """Refresh compatibility and return a fail-closed submission contract.
+) -> OaTemplateCatalogContract:
+    """Compatibility name for callers that predate the aggregate catalog."""
 
-    Future submission code should call this once before uploading files. Keeping
-    the refresh and readiness check in one boundary prevents callers from using
-    a stale locally-compatible profile accidentally.
-    """
-
-    for _attempt in range(_MAX_CONFIG_CAS_ATTEMPTS):
-        with database_session_factory() as snapshot_database:
-            profile = require_submission_ready_template(snapshot_database)
-            process_code = profile.process_code
-            config_version = profile.config_version
-            observed_fingerprint = profile.schema_fingerprint
-            confirmed_fingerprint = profile.confirmed_schema_fingerprint
-
-        # The database session is closed before this network wait, so a slow
-        # DingTalk response never pins a transaction or pooled connection.
-        schema = await workflow.get_form_schema(process_code)
-        compatibility_status = (
-            COMPATIBLE if schema.fingerprint == confirmed_fingerprint else DRIFTED
-        )
-        with database_session_factory() as observation_database:
-            observed = _record_schema_observation(
-                observation_database,
-                schema,
-                expected_config_version=config_version,
-                expected_schema_fingerprint=observed_fingerprint,
-                compatibility_status=compatibility_status,
-            )
-        if not observed:
-            continue
-
-        with database_session_factory() as final_database:
-            current = final_database.scalar(
-                select(OaTemplateProfile).where(
-                    OaTemplateProfile.profile_key == REIMBURSEMENT_PROFILE_KEY,
-                    OaTemplateProfile.process_code == process_code,
-                    OaTemplateProfile.config_version == config_version,
-                )
-            )
-            if current is None:
-                continue
-            require_submission_ready_template(final_database)
-            return _validated_persisted_contract(current)
-    raise _configuration_changed_error()
+    return await load_fresh_submission_catalog(database_session_factory, workflow)
 
 
 def validate_template_mapping(schema: FormSchema, mappings: dict[str, str]) -> dict[str, str]:
+    return _validate_mapping(
+        schema,
+        mappings,
+        specs=REIMBURSEMENT_LOGICAL_FIELD_SPECS,
+        reject_unmapped_required=True,
+    )
+
+
+def validate_travel_template_mapping(
+    schema: FormSchema,
+    mappings: dict[str, str],
+) -> dict[str, str]:
+    return _validate_mapping(
+        schema,
+        mappings,
+        specs=TRAVEL_LOGICAL_FIELD_SPECS,
+        reject_unmapped_required=False,
+    )
+
+
+def _validate_mapping(
+    schema: FormSchema,
+    mappings: dict[str, str],
+    *,
+    specs: tuple[LogicalFieldSpec, ...],
+    reject_unmapped_required: bool,
+) -> dict[str, str]:
+    field_by_key = {item.key: item for item in specs}
     supplied_keys = set(mappings)
-    required_keys = set(LOGICAL_FIELD_BY_KEY)
+    required_keys = set(field_by_key)
     if supplied_keys != required_keys:
         missing = sorted(required_keys - supplied_keys)
         unknown = sorted(supplied_keys - required_keys)
@@ -381,7 +571,7 @@ def validate_template_mapping(schema: FormSchema, mappings: dict[str, str]) -> d
     normalized: dict[str, str] = {}
     used_component_ids: set[str] = set()
     component_by_id = {component.component_id: component for component in schema.components}
-    for spec in LOGICAL_FIELD_SPECS:
+    for spec in specs:
         raw_component_id = mappings[spec.key]
         component_id = raw_component_id.strip() if isinstance(raw_component_id, str) else ""
         if not component_id:
@@ -397,20 +587,45 @@ def validate_template_mapping(schema: FormSchema, mappings: dict[str, str]) -> d
         used_component_ids.add(component_id)
         normalized[spec.key] = component_id
 
-    unsupported_required = [
-        component.label
-        for component in schema.components
-        if not component.in_subtable
-        and component.required
-        and not component.disabled
-        and not component.hidden
-        and not component.ancestor_disabled
-        and not component.ancestor_hidden
-        and component.component_id not in used_component_ids
-    ]
-    if unsupported_required:
-        raise _mapping_error("模板还有未映射的必填控件：" + "、".join(unsupported_required))
+    if reject_unmapped_required:
+        unsupported_required = [
+            component.label
+            for component in schema.components
+            if not component.in_subtable
+            and component.required
+            and not component.disabled
+            and not component.hidden
+            and not component.ancestor_disabled
+            and not component.ancestor_hidden
+            and component.component_id not in used_component_ids
+        ]
+        if unsupported_required:
+            raise _mapping_error("模板还有未映射的必填控件：" + "、".join(unsupported_required))
     return normalized
+
+
+def validate_exact_travel_type_option(
+    reimbursement_schema: FormSchema,
+    reimbursement_mappings: dict[str, str],
+    requested: FormOption,
+) -> FormOption:
+    component_id = reimbursement_mappings["travelType"]
+    component = next(
+        (item for item in reimbursement_schema.components if item.component_id == component_id),
+        None,
+    )
+    if component is None or component.component_type != "DDSelectField":
+        raise _mapping_error("出差类别对应的 OA 选择控件不存在")
+    matches = [
+        option
+        for option in component.options
+        if option.value == requested.value
+        and option.label == requested.label
+        and option.key == requested.key
+    ]
+    if len(matches) != 1:
+        raise _mapping_error("出差模板对应的出差类别选项已失效，请重新选择")
+    return matches[0]
 
 
 def validate_related_approval_configuration(
@@ -448,36 +663,93 @@ def validate_related_approval_configuration(
         outside_policy = sorted(set(normalized) - set(policy.process_codes))
         if outside_policy:
             raise _relationship_error("出差审批模板不在关联控件声明的允许范围内")
-    # UNKNOWN remains UNKNOWN. The explicit local allowlist plus the confirmed
-    # smoke test is the fail-closed fallback; it is never interpreted as allow-all.
     return tuple(normalized)
 
 
-def template_profile_data(profile: OaTemplateProfile) -> dict[str, object]:
-    schema = _deserialize_schema(profile.schema_json)
-    if schema.fingerprint != profile.schema_fingerprint:
-        raise _configuration_error()
-    mappings = _display_mapping(profile.mapping_json)
-    allowed_travel_process_codes = _display_process_codes(profile.allowed_travel_process_codes_json)
-    is_submission_ready = _profile_submission_ready(
-        profile,
-        schema=schema,
-        mappings=mappings,
-        allowed_travel_process_codes=allowed_travel_process_codes,
+def _relationship_confirmation_matches_inspection(
+    profile: OaTemplateProfile,
+    *,
+    reimbursement_schema: FormSchema,
+    requested_profiles: list[TravelProfileInspection],
+    travel_schemas: list[FormSchema],
+    stored_profiles: list[dict[str, object]],
+) -> bool:
+    if not profile.related_approval_smoke_test_confirmed:
+        return False
+    try:
+        reimbursement_mapping = validate_template_mapping(
+            reimbursement_schema,
+            _deserialize_mapping(profile.mapping_json),
+        )
+        allowed_process_codes: list[str] = []
+        for requested, schema, stored in zip(
+            requested_profiles,
+            travel_schemas,
+            stored_profiles,
+            strict=True,
+        ):
+            if (
+                set(stored) != _TRAVEL_PROFILE_JSON_KEYS
+                or stored.get("profileKey") != requested.profile_key
+                or stored.get("processCode") != requested.process_code
+            ):
+                return False
+            validate_travel_template_mapping(
+                schema,
+                _mapping_from_value(stored.get("mappings")),
+            )
+            validate_exact_travel_type_option(
+                reimbursement_schema,
+                reimbursement_mapping,
+                _option_from_value(stored.get("travelTypeOption")),
+            )
+            allowed_process_codes.append(requested.process_code)
+        validate_related_approval_configuration(
+            reimbursement_schema,
+            reimbursement_mapping,
+            reimbursement_process_code=profile.process_code,
+            allowed_travel_process_codes=allowed_process_codes,
+            smoke_test_confirmed=True,
+        )
+    except (ApiError, KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
+def template_catalog_data(profile: OaTemplateProfile) -> dict[str, object]:
+    reimbursement_schema = _deserialize_schema(profile.schema_json)
+    reimbursement_mapping = _deserialize_mapping(profile.mapping_json)
+    travel_profiles = _deserialize_travel_profiles(
+        profile.travel_profiles_json,
+        reimbursement_schema=reimbursement_schema,
+        reimbursement_mapping=reimbursement_mapping,
+        allow_empty=True,
     )
+    allowed_codes = _deserialize_process_codes(
+        profile.allowed_travel_process_codes_json,
+        allow_empty=True,
+    )
+    is_ready = _profile_submission_ready(profile)
     return {
-        "processCode": profile.process_code,
         "configVersion": profile.config_version,
+        "processCode": profile.process_code,
         "templateName": profile.template_name,
         "schemaFingerprint": profile.schema_fingerprint,
         "confirmedSchemaFingerprint": profile.confirmed_schema_fingerprint,
         "compatibilityStatus": profile.compatibility_status,
-        "isSubmissionReady": is_submission_ready,
-        "requiresConfirmation": not is_submission_ready,
-        "schema": _schema_api_data(schema),
-        "logicalFields": [item.as_dict() for item in LOGICAL_FIELD_SPECS],
-        "mappings": mappings,
-        "allowedTravelProcessCodes": allowed_travel_process_codes,
+        "isSubmissionReady": is_ready,
+        "requiresConfirmation": not is_ready,
+        "reimbursement": {
+            "processCode": profile.process_code,
+            "schema": _schema_api_data(
+                reimbursement_schema,
+                REIMBURSEMENT_LOGICAL_FIELD_SPECS,
+            ),
+            "logicalFields": [item.as_dict() for item in REIMBURSEMENT_LOGICAL_FIELD_SPECS],
+            "mappings": reimbursement_mapping,
+        },
+        "travelProfiles": [_travel_profile_api_data(item) for item in travel_profiles],
+        "allowedTravelProcessCodes": allowed_codes,
         "relatedApprovalSmokeTestConfirmed": profile.related_approval_smoke_test_confirmed,
         "lastCheckedAt": _timestamp(profile.last_checked_at),
         "confirmedAt": _timestamp(profile.confirmed_at),
@@ -485,13 +757,30 @@ def template_profile_data(profile: OaTemplateProfile) -> dict[str, object]:
     }
 
 
-def _schema_api_data(schema: FormSchema) -> dict[str, object]:
+def _travel_profile_api_data(profile: TravelTemplateContract) -> dict[str, object]:
+    return {
+        "profileKey": profile.profile_key,
+        "displayName": profile.display_name,
+        "processCode": profile.process_code,
+        "schemaFingerprint": profile.schema.fingerprint,
+        "confirmedSchemaFingerprint": profile.schema.fingerprint,
+        "schema": _schema_api_data(profile.schema, TRAVEL_LOGICAL_FIELD_SPECS),
+        "logicalFields": [item.as_dict() for item in TRAVEL_LOGICAL_FIELD_SPECS],
+        "mappings": profile.mappings,
+        "travelTypeOption": profile.travel_type_option.as_dict(),
+    }
+
+
+def _schema_api_data(
+    schema: FormSchema,
+    specs: tuple[LogicalFieldSpec, ...],
+) -> dict[str, object]:
     data = schema.as_dict()
     components = []
     for component in schema.components:
         component_data = component.as_dict()
         component_data["compatibleLogicalFields"] = [
-            spec.key for spec in LOGICAL_FIELD_SPECS if _component_supports(component, spec)
+            spec.key for spec in specs if _component_supports(component, spec)
         ]
         components.append(component_data)
     data["components"] = components
@@ -524,6 +813,49 @@ def _component_incompatibility(
     return None
 
 
+def _validate_profile_headers(
+    reimbursement_process_code: str,
+    profiles: list[TravelProfileInspection],
+) -> list[TravelProfileInspection]:
+    reimbursement_code = reimbursement_process_code.strip()
+    if not _PROCESS_CODE_PATTERN.fullmatch(reimbursement_code):
+        raise _relationship_error("报销审批模板 processCode 格式无效")
+    if not profiles:
+        raise _relationship_error("至少配置一个允许关联的出差审批模板")
+    if len(profiles) > _MAX_TRAVEL_PROFILES:
+        raise _relationship_error("允许关联的出差审批模板数量超过限制")
+
+    normalized: list[TravelProfileInspection] = []
+    seen_keys: set[str] = set()
+    seen_codes: set[str] = set()
+    for profile in profiles:
+        profile_key = profile.profile_key.strip()
+        display_name = profile.display_name.strip()
+        process_code = profile.process_code.strip()
+        if not _PROFILE_KEY_PATTERN.fullmatch(profile_key):
+            raise _relationship_error("出差模板 profileKey 格式无效")
+        if not display_name or len(display_name) > 128:
+            raise _relationship_error("出差模板显示名称格式无效")
+        if not _PROCESS_CODE_PATTERN.fullmatch(process_code):
+            raise _relationship_error("出差审批模板 processCode 格式无效")
+        if profile_key in seen_keys:
+            raise _relationship_error("出差模板 profileKey 不能重复")
+        if process_code in seen_codes:
+            raise _relationship_error("出差审批模板 processCode 不能重复")
+        if process_code == reimbursement_code:
+            raise _relationship_error("报销模板不能同时作为出差模板")
+        seen_keys.add(profile_key)
+        seen_codes.add(process_code)
+        normalized.append(
+            TravelProfileInspection(
+                profile_key=profile_key,
+                display_name=display_name,
+                process_code=process_code,
+            )
+        )
+    return normalized
+
+
 def _fresh_profile(database: Session) -> OaTemplateProfile | None:
     return database.scalar(
         select(OaTemplateProfile)
@@ -532,26 +864,21 @@ def _fresh_profile(database: Session) -> OaTemplateProfile | None:
     )
 
 
-def _record_schema_observation(
+def _record_catalog_status(
     database: Session,
-    schema: FormSchema,
     *,
     expected_config_version: int,
-    expected_schema_fingerprint: str,
+    expected_process_code: str,
     compatibility_status: str,
 ) -> bool:
     result = database.execute(
         update(OaTemplateProfile)
         .where(
             OaTemplateProfile.profile_key == REIMBURSEMENT_PROFILE_KEY,
-            OaTemplateProfile.process_code == schema.process_code,
+            OaTemplateProfile.process_code == expected_process_code,
             OaTemplateProfile.config_version == expected_config_version,
-            OaTemplateProfile.schema_fingerprint == expected_schema_fingerprint,
         )
         .values(
-            template_name=schema.template_name,
-            schema_fingerprint=schema.fingerprint,
-            schema_json=_serialize_schema(schema),
             compatibility_status=compatibility_status,
             last_checked_at=utc_now(),
         ),
@@ -580,7 +907,10 @@ def _deserialize_schema(raw: str) -> FormSchema:
         raise _configuration_error() from None
     if not isinstance(value, dict):
         raise _configuration_error()
-    return form_schema_from_dict(value)
+    try:
+        return form_schema_from_dict(value)
+    except (TypeError, ValueError):
+        raise _configuration_error() from None
 
 
 def _serialize_mapping(mapping: dict[str, str]) -> str:
@@ -592,17 +922,28 @@ def _deserialize_mapping(raw: str) -> dict[str, str]:
         value = json.loads(raw)
     except (TypeError, ValueError):
         raise _configuration_error() from None
+    return _mapping_from_value(value)
+
+
+def _mapping_from_value(value: object) -> dict[str, str]:
     if not isinstance(value, dict) or any(
         not isinstance(key, str) or not isinstance(component_id, str)
         for key, component_id in value.items()
     ):
         raise _configuration_error()
-    return value
+    return dict(value)
 
 
 def _display_mapping(raw: str) -> dict[str, str] | None:
     try:
         return _deserialize_mapping(raw)
+    except ApiError:
+        return None
+
+
+def _display_mapping_value(value: object) -> dict[str, str] | None:
+    try:
+        return _mapping_from_value(value)
     except ApiError:
         return None
 
@@ -629,77 +970,187 @@ def _deserialize_process_codes(raw: str, *, allow_empty: bool = False) -> list[s
     return value
 
 
-def _display_process_codes(raw: str) -> list[str]:
-    try:
-        return _deserialize_process_codes(raw, allow_empty=True)
-    except ApiError:
-        return []
+def _serialize_travel_profiles(profiles: list[TravelTemplateContract]) -> str:
+    value = [
+        {
+            "profileKey": profile.profile_key,
+            "displayName": profile.display_name,
+            "processCode": profile.process_code,
+            "schemaFingerprint": profile.schema.fingerprint,
+            "confirmedSchemaFingerprint": profile.schema.fingerprint,
+            "schema": profile.schema.as_dict(),
+            "mappings": profile.mappings,
+            "travelTypeOption": profile.travel_type_option.as_dict(),
+        }
+        for profile in profiles
+    ]
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
-def _profile_relationship_ready(profile: OaTemplateProfile) -> bool:
-    if not profile.related_approval_smoke_test_confirmed:
-        return False
-    try:
-        return bool(_deserialize_process_codes(profile.allowed_travel_process_codes_json))
-    except ApiError:
-        return False
-
-
-def _validated_persisted_contract(
-    profile: OaTemplateProfile,
+def _deserialize_travel_profiles(
+    raw: str,
     *,
-    schema: FormSchema | None = None,
-    mappings: dict[str, str] | None = None,
-    allowed_travel_process_codes: list[str] | None = None,
-) -> ReimbursementTemplateContract:
+    reimbursement_schema: FormSchema,
+    reimbursement_mapping: dict[str, str],
+    allow_empty: bool,
+) -> list[TravelTemplateContract]:
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        raise _configuration_error() from None
+    if not isinstance(value, list) or len(value) > _MAX_TRAVEL_PROFILES:
+        raise _configuration_error()
+    if not value and not allow_empty:
+        raise _configuration_error()
+
+    contracts: list[TravelTemplateContract] = []
+    seen_keys: set[str] = set()
+    seen_codes: set[str] = set()
+    for raw_profile in value:
+        if not isinstance(raw_profile, dict) or set(raw_profile) != _TRAVEL_PROFILE_JSON_KEYS:
+            raise _configuration_error()
+        try:
+            profile_key = raw_profile["profileKey"]
+            display_name = raw_profile["displayName"]
+            process_code = raw_profile["processCode"]
+            schema_fingerprint = raw_profile["schemaFingerprint"]
+            confirmed_fingerprint = raw_profile["confirmedSchemaFingerprint"]
+            raw_schema = raw_profile["schema"]
+            if (
+                not isinstance(profile_key, str)
+                or not isinstance(display_name, str)
+                or not isinstance(process_code, str)
+                or not isinstance(schema_fingerprint, str)
+                or not isinstance(confirmed_fingerprint, str)
+                or not isinstance(raw_schema, dict)
+            ):
+                raise TypeError
+            schema = form_schema_from_dict(raw_schema)
+            mapping = _mapping_from_value(raw_profile["mappings"])
+            option = _option_from_value(raw_profile["travelTypeOption"])
+        except (KeyError, TypeError, ValueError, ApiError):
+            raise _configuration_error() from None
+        if (
+            not _PROFILE_KEY_PATTERN.fullmatch(profile_key)
+            or not display_name.strip()
+            or len(display_name) > 128
+            or not _PROCESS_CODE_PATTERN.fullmatch(process_code)
+            or not _FINGERPRINT_PATTERN.fullmatch(schema_fingerprint)
+            or not _FINGERPRINT_PATTERN.fullmatch(confirmed_fingerprint)
+            or schema.process_code != process_code
+            or schema.fingerprint != schema_fingerprint
+            or schema_fingerprint != confirmed_fingerprint
+            or profile_key in seen_keys
+            or process_code in seen_codes
+        ):
+            raise _configuration_error()
+        normalized_mapping = validate_travel_template_mapping(schema, mapping)
+        exact_option = validate_exact_travel_type_option(
+            reimbursement_schema,
+            reimbursement_mapping,
+            option,
+        )
+        seen_keys.add(profile_key)
+        seen_codes.add(process_code)
+        contracts.append(
+            TravelTemplateContract(
+                profile_key=profile_key,
+                display_name=display_name.strip(),
+                process_code=process_code,
+                schema=schema,
+                start_date_component_id=normalized_mapping["startDate"],
+                end_date_component_id=normalized_mapping["endDate"],
+                travel_type_option=exact_option,
+            )
+        )
+    return contracts
+
+
+def _option_from_value(value: object) -> FormOption:
+    if not isinstance(value, dict) or set(value) != {"value", "label", "key"}:
+        raise _configuration_error()
+    option_value = value.get("value")
+    label = value.get("label")
+    key = value.get("key")
+    if (
+        not isinstance(option_value, str)
+        or not option_value
+        or not isinstance(label, str)
+        or not label
+        or (key is not None and (not isinstance(key, str) or not key))
+    ):
+        raise _configuration_error()
+    return FormOption(value=option_value, label=label, key=key)
+
+
+def _display_option_value(value: object) -> dict[str, str | None] | None:
+    try:
+        return _option_from_value(value).as_dict()
+    except ApiError:
+        return None
+
+
+def _display_travel_profiles(profile: OaTemplateProfile | None) -> list[dict[str, object]]:
+    if profile is None:
+        return []
+    try:
+        value = json.loads(profile.travel_profiles_json)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _validated_persisted_catalog(profile: OaTemplateProfile) -> OaTemplateCatalogContract:
     if (
         profile.compatibility_status != COMPATIBLE
         or profile.schema_fingerprint != profile.confirmed_schema_fingerprint
     ):
         raise _configuration_error()
-    schema = schema or _deserialize_schema(profile.schema_json)
+    reimbursement_schema = _deserialize_schema(profile.schema_json)
     if (
-        schema.process_code != profile.process_code
-        or schema.fingerprint != profile.schema_fingerprint
+        reimbursement_schema.process_code != profile.process_code
+        or reimbursement_schema.fingerprint != profile.schema_fingerprint
     ):
         raise _configuration_error()
-    normalized_mapping = validate_template_mapping(
-        schema,
-        mappings if mappings is not None else _deserialize_mapping(profile.mapping_json),
+    reimbursement_mapping = validate_template_mapping(
+        reimbursement_schema,
+        _deserialize_mapping(profile.mapping_json),
     )
-    normalized_process_codes = validate_related_approval_configuration(
-        schema,
-        normalized_mapping,
+    travel_profiles = _deserialize_travel_profiles(
+        profile.travel_profiles_json,
+        reimbursement_schema=reimbursement_schema,
+        reimbursement_mapping=reimbursement_mapping,
+        allow_empty=False,
+    )
+    if any(item.process_code == profile.process_code for item in travel_profiles):
+        raise _configuration_error()
+    derived_codes = tuple(item.process_code for item in travel_profiles)
+    stored_codes = tuple(_deserialize_process_codes(profile.allowed_travel_process_codes_json))
+    if stored_codes != derived_codes:
+        raise _configuration_error()
+    validate_related_approval_configuration(
+        reimbursement_schema,
+        reimbursement_mapping,
         reimbursement_process_code=profile.process_code,
-        allowed_travel_process_codes=(
-            allowed_travel_process_codes
-            if allowed_travel_process_codes is not None
-            else _deserialize_process_codes(profile.allowed_travel_process_codes_json)
-        ),
+        allowed_travel_process_codes=list(derived_codes),
         smoke_test_confirmed=profile.related_approval_smoke_test_confirmed,
     )
-    return ReimbursementTemplateContract(
-        process_code=profile.process_code,
-        schema=schema,
-        mappings=normalized_mapping,
-        allowed_travel_process_codes=normalized_process_codes,
+    return OaTemplateCatalogContract(
+        config_version=profile.config_version,
+        reimbursement=ReimbursementTemplateContract(
+            process_code=profile.process_code,
+            schema=reimbursement_schema,
+            mappings=reimbursement_mapping,
+        ),
+        travel_profiles=tuple(travel_profiles),
     )
 
 
-def _profile_submission_ready(
-    profile: OaTemplateProfile,
-    *,
-    schema: FormSchema | None = None,
-    mappings: dict[str, str] | None = None,
-    allowed_travel_process_codes: list[str] | None = None,
-) -> bool:
+def _profile_submission_ready(profile: OaTemplateProfile) -> bool:
     try:
-        _validated_persisted_contract(
-            profile,
-            schema=schema,
-            mappings=mappings,
-            allowed_travel_process_codes=allowed_travel_process_codes,
-        )
+        _validated_persisted_catalog(profile)
     except ApiError:
         return False
     return True
@@ -720,14 +1171,30 @@ def _relationship_error(detail: str) -> ApiError:
 def _configuration_error() -> ApiError:
     return ApiError(
         "INVALID_SYSTEM_CONFIGURATION",
-        "审批模板配置无效，请联系管理员重新确认",
+        "审批模板目录配置无效，请联系管理员重新确认",
         500,
+    )
+
+
+def _confirmation_required_error() -> ApiError:
+    return ApiError(
+        "OA_TEMPLATE_CONFIRMATION_REQUIRED",
+        "审批模板目录已经变化，请管理员重新检查并确认",
+        409,
+    )
+
+
+def _schema_changed_error() -> ApiError:
+    return ApiError(
+        "OA_TEMPLATE_SCHEMA_CHANGED",
+        "审批模板已更新，请重新检查字段并确认",
+        409,
     )
 
 
 def _configuration_changed_error() -> ApiError:
     return ApiError(
         "OA_TEMPLATE_CONFIGURATION_CHANGED",
-        "审批模板配置刚刚被其他管理员更新，请重试",
+        "审批模板目录刚刚被其他管理员更新，请重试",
         409,
     )

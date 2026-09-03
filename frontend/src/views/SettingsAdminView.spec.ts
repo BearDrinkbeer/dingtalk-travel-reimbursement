@@ -4,6 +4,7 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { getExpenseCategories } from '@/api/expenses'
+import { getOaTemplateCatalog } from '@/api/oaTemplates'
 import {
   createReceiptKeyword,
   listReceiptKeywords,
@@ -12,6 +13,11 @@ import { getExpenseSettings } from '@/api/settings'
 import SettingsAdminView from './SettingsAdminView.vue'
 
 vi.mock('@/api/expenses', () => ({ getExpenseCategories: vi.fn() }))
+vi.mock('@/api/oaTemplates', () => ({
+  confirmOaTemplateCatalog: vi.fn(),
+  getOaTemplateCatalog: vi.fn(),
+  inspectOaTemplateCatalog: vi.fn(),
+}))
 vi.mock('@/api/receiptKeywords', () => ({
   createReceiptKeyword: vi.fn(),
   deleteReceiptKeyword: vi.fn(),
@@ -44,6 +50,14 @@ describe('SettingsAdminView receipt keywords', () => {
         internal: '100.00',
       },
       calculationMode: 'half_day_12',
+    })
+    vi.mocked(getOaTemplateCatalog).mockResolvedValue({
+      configured: false,
+      configVersion: null,
+      compatibilityStatus: 'UNCONFIGURED',
+      isSubmissionReady: false,
+      requiresConfirmation: true,
+      catalog: null,
     })
     vi.mocked(getExpenseCategories).mockResolvedValue([
       { id: 'office', name: '办公费', order: 1, manualSelectable: true },
@@ -87,6 +101,7 @@ describe('SettingsAdminView receipt keywords', () => {
     expect(wrapper.text()).toContain('票据分类关键词')
     expect(wrapper.text()).toContain('按费用类别维护关键词')
     expect(wrapper.text()).toContain('未命中或冲突时自动归入')
+    expect(wrapper.text()).toContain('钉钉 OA 模板目录')
     expect(wrapper.text().indexOf('票据分类关键词'))
       .toBeLessThan(wrapper.text().indexOf('每日补助标准'))
     const officeGroup = wrapper.find('[aria-label="办公费分类关键词"]')

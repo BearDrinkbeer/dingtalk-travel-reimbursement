@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import date, timedelta
 
 import pytest
 from sqlalchemy import text
@@ -14,6 +14,7 @@ from app.models.reimbursement import (
     ReimbursementDraftFile,
     ReimbursementDraftFileRole,
     ReimbursementDraftFileStatus,
+    ReimbursementDraftRelatedApproval,
     ReimbursementDraftStatus,
     ReimbursementSubmission,
     ReimbursementSubmissionStatus,
@@ -120,6 +121,34 @@ def new_active_file(
     )
 
 
+def new_related_approval(
+    draft: ReimbursementDraft,
+    *,
+    sort_order: int = 0,
+    process_instance_id: str = "travel-instance-1",
+) -> ReimbursementDraftRelatedApproval:
+    now = utc_now()
+    return ReimbursementDraftRelatedApproval(
+        draft_id=draft.id,
+        corp_id=draft.corp_id,
+        owner_user_id=draft.owner_user_id,
+        sort_order=sort_order,
+        process_instance_id=process_instance_id,
+        travel_profile_key="domestic-travel",
+        process_code="PROC-DOMESTIC-TRAVEL",
+        catalog_config_version=2,
+        travel_schema_fingerprint=_HASH_B,
+        listed_from_ms=1_788_192_000_000,
+        listed_to_ms=1_799_078_400_000,
+        travel_start_date=date(2026, 8, 20),
+        travel_end_date=date(2026, 8, 22),
+        title="测试员工的境内出差申请",
+        business_id="BUSINESS-TRAVEL-1",
+        instance_created_at=now - timedelta(days=15),
+        verified_at=now,
+    )
+
+
 def new_ready_upload(
     submission: ReimbursementSubmission,
     *,
@@ -158,6 +187,92 @@ def test_create_all_installs_the_same_immutable_history_guards_as_migration(
 
     assert _IMMUTABLE_TRIGGER_NAMES <= trigger_names
     assert _SUBMITTED_MANIFEST_TRIGGER_NAMES <= trigger_names
+
+
+def test_persists_verified_related_approval_snapshot(database: Session) -> None:
+    draft = new_draft()
+    database.add(draft)
+    database.flush()
+    approval = new_related_approval(draft)
+    database.add(approval)
+    database.commit()
+    approval_id = approval.id
+    draft_id = draft.id
+    database.expunge_all()
+
+    persisted = database.get(ReimbursementDraftRelatedApproval, approval_id)
+
+    assert persisted is not None
+    assert persisted.draft_id == draft_id
+    assert persisted.travel_start_date == date(2026, 8, 20)
+    assert persisted.travel_end_date == date(2026, 8, 22)
+    assert persisted.travel_schema_fingerprint == _HASH_B
+    assert persisted.created_at.tzinfo is None
+    assert persisted.updated_at.tzinfo is None
+
+
+def test_related_approval_must_match_draft_owner(database: Session) -> None:
+    draft = new_draft()
+    database.add(draft)
+    database.flush()
+    approval = new_related_approval(draft)
+    approval.owner_user_id = "another-employee"
+    database.add(approval)
+
+    with pytest.raises(IntegrityError):
+        database.commit()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"sort_order": -1},
+        {"catalog_config_version": 0},
+        {"travel_schema_fingerprint": "short"},
+        {"listed_from_ms": -1},
+        {"listed_from_ms": 2_000, "listed_to_ms": 1_000},
+        {"travel_start_date": date(2026, 8, 23)},
+    ],
+)
+def test_related_approval_rejects_invalid_catalog_snapshot(
+    database: Session,
+    changes: dict[str, object],
+) -> None:
+    draft = new_draft()
+    database.add(draft)
+    database.flush()
+    approval = new_related_approval(draft)
+    for field, value in changes.items():
+        setattr(approval, field, value)
+    database.add(approval)
+
+    with pytest.raises(IntegrityError):
+        database.commit()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"process_instance_id": "travel-instance-1", "sort_order": 1},
+        {"process_instance_id": "travel-instance-2", "sort_order": 0},
+    ],
+)
+def test_related_approval_is_unique_by_instance_and_sort_order_within_draft(
+    database: Session,
+    changes: dict[str, object],
+) -> None:
+    draft = new_draft()
+    database.add(draft)
+    database.flush()
+    database.add(new_related_approval(draft))
+    database.flush()
+    duplicate = new_related_approval(draft)
+    for field, value in changes.items():
+        setattr(duplicate, field, value)
+    database.add(duplicate)
+
+    with pytest.raises(IntegrityError):
+        database.commit()
 
 
 def test_persists_attachment_only_and_generated_excel_manifest(database: Session) -> None:

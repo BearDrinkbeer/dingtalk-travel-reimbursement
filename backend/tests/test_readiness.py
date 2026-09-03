@@ -105,6 +105,7 @@ def test_ready_rejects_database_without_union_id_column(client_factory) -> None:
     [
         "reimbursement_drafts",
         "reimbursement_draft_files",
+        "reimbursement_draft_related_approvals",
         "reimbursement_submissions",
         "reimbursement_uploads",
     ],
@@ -133,8 +134,10 @@ def test_ready_rejects_a_missing_reimbursement_table(
 @pytest.mark.parametrize(
     ("table_name", "missing_column"),
     [
+        ("oa_template_profiles", "travel_profiles_json"),
         ("reimbursement_drafts", "owner_user_id"),
         ("reimbursement_draft_files", "file_status"),
+        ("reimbursement_draft_related_approvals", "verified_at"),
         ("reimbursement_submissions", "process_instance_id"),
         ("reimbursement_uploads", "file_id"),
     ],

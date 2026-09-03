@@ -4,6 +4,7 @@ from app.models.receipt_keyword import ReceiptKeywordMapping
 from app.models.reimbursement import (
     ReimbursementDraft,
     ReimbursementDraftFile,
+    ReimbursementDraftRelatedApproval,
     ReimbursementSubmission,
     ReimbursementUpload,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "ReceiptKeywordMapping",
     "ReimbursementDraft",
     "ReimbursementDraftFile",
+    "ReimbursementDraftRelatedApproval",
     "ReimbursementSubmission",
     "ReimbursementUpload",
     "Setting",

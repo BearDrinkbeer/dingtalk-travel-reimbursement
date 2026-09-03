@@ -34,6 +34,11 @@ class OaTemplateProfile(Base):
     mapping_json: Mapped[str] = mapped_column(Text)
     config_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     allowed_travel_process_codes_json: Mapped[str] = mapped_column(Text)
+    travel_profiles_json: Mapped[str] = mapped_column(
+        Text,
+        default="[]",
+        server_default="[]",
+    )
     related_approval_smoke_test_confirmed: Mapped[bool] = mapped_column(
         Boolean,
         default=False,

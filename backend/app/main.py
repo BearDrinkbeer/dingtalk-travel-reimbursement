@@ -14,6 +14,7 @@ from app.api.calculations import router as calculations_router
 from app.api.excel import router as excel_router
 from app.api.files import router as files_router
 from app.api.health import router as health_router
+from app.api.oa_reimbursements import router as oa_reimbursements_router
 from app.api.oa_templates import router as oa_templates_router
 from app.api.ocr import router as ocr_router
 from app.api.projects import router as projects_router
@@ -219,6 +220,7 @@ def create_app(
     application.include_router(files_router, prefix="/api")
     application.include_router(ocr_router, prefix="/api")
     application.include_router(oa_templates_router, prefix="/api")
+    application.include_router(oa_reimbursements_router, prefix="/api")
     return application
 
 

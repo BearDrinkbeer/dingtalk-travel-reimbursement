@@ -9,10 +9,12 @@ import httpx
 import pytest
 from conftest import mock_login
 
+from app.api import oa_templates
 from app.core.errors import ApiError
 from app.integrations.dingtalk.client import DingTalkOpenAPIClient
-from app.integrations.dingtalk.workflow import DingTalkWorkflowClient
+from app.integrations.dingtalk.workflow import DingTalkWorkflowClient, normalize_form_schema
 from app.models.oa_template_profile import OaTemplateProfile
+from app.services import oa_template_profiles
 from app.services.oa_template_profiles import load_fresh_submission_template
 
 PROCESS_CODE = "PROC-TEST-REIMBURSEMENT"
@@ -97,8 +99,53 @@ def schema_payload(
     }
 
 
+def travel_schema_payload(
+    process_code: str,
+    *,
+    modified_at: str = "2026-09-03T11:00:00+08:00",
+    start_component_type: str = "DDDateField",
+    start_format: str = "yyyy-MM-dd",
+) -> dict[str, object]:
+    return {
+        "result": {
+            "formCode": process_code,
+            "formUuid": f"form-uuid-{process_code.lower()}",
+            "name": f"{process_code} 出差申请",
+            "status": "PUBLISHED",
+            "gmtModified": modified_at,
+            "schemaContent": {
+                "title": f"{process_code} 出差申请",
+                "items": [
+                    component(
+                        start_component_type,
+                        "travel-start-id",
+                        "开始日期",
+                        format=start_format,
+                    ),
+                    component(
+                        "DDDateField",
+                        "travel-end-id",
+                        "结束日期",
+                        format="yyyy-MM-dd",
+                    ),
+                    component("TextField", "travel-reason-id", "出差事由"),
+                ],
+            },
+        }
+    }
+
+
+def travel_fingerprint(process_code: str) -> str:
+    return normalize_form_schema(
+        process_code,
+        travel_schema_payload(process_code),
+    ).fingerprint
+
+
 def transport_for_schema(
     response_factory: Callable[[int, httpx.Request], httpx.Response],
+    *,
+    travel_response_factory: Callable[[str, httpx.Request], httpx.Response] | None = None,
 ) -> tuple[httpx.MockTransport, dict[str, int]]:
     calls = {"token": 0, "schema": 0}
 
@@ -116,12 +163,17 @@ def transport_for_schema(
                 json={"access_token": f"access-{calls['token']}", "expires_in": 7200},
             )
 
-        calls["schema"] += 1
         assert request.method == "GET"
         assert request.url.path == "/v1.0/workflow/forms/schemas/processCodes"
-        assert dict(request.url.params) == {"processCode": PROCESS_CODE}
+        process_code = request.url.params["processCode"]
         assert "access_token" not in request.url.params
         assert request.headers["x-acs-dingtalk-access-token"].startswith("access-")
+        if process_code in TRAVEL_PROCESS_CODES:
+            if travel_response_factory is not None:
+                return travel_response_factory(process_code, request)
+            return httpx.Response(200, json=travel_schema_payload(process_code))
+        assert process_code == PROCESS_CODE
+        calls["schema"] += 1
         return response_factory(calls["schema"], request)
 
     return httpx.MockTransport(handler), calls
@@ -145,6 +197,9 @@ class GatedSchemaTransport(httpx.AsyncBaseTransport):
                 200,
                 json={"access_token": "slow-access-token", "expires_in": 7200},
             )
+        process_code = request.url.params["processCode"]
+        if process_code in TRAVEL_PROCESS_CODES:
+            return httpx.Response(200, json=travel_schema_payload(process_code))
         self.schema_calls += 1
         self.started.set()
         await self.release.wait()
@@ -165,8 +220,18 @@ def admin_client(client_factory, transport: httpx.MockTransport):
 
 def inspect(client, headers: dict[str, str]):
     return client.post(
-        "/api/admin/oa/templates/inspect",
-        json={"processCode": PROCESS_CODE},
+        "/api/admin/oa/templates/catalog/inspect",
+        json={
+            "reimbursementProcessCode": PROCESS_CODE,
+            "travelProfiles": [
+                {
+                    "profileKey": f"travel-{index}",
+                    "displayName": f"出差模板 {index}",
+                    "processCode": process_code,
+                }
+                for index, process_code in enumerate(TRAVEL_PROCESS_CODES)
+            ],
+        },
         headers=headers,
     )
 
@@ -180,19 +245,50 @@ def confirm(
     allowed_travel_process_codes=None,
     smoke_test_confirmed: bool = True,
     expected_config_version: int | None = None,
+    travel_schema_fingerprints: dict[str, str] | None = None,
+    travel_mappings: dict[str, dict[str, str]] | None = None,
+    travel_type_options: dict[str, dict[str, str | None]] | None = None,
 ):
     return client.put(
-        "/api/admin/oa/templates/reimbursement",
+        "/api/admin/oa/templates/catalog",
         json={
-            "processCode": PROCESS_CODE,
-            "schemaFingerprint": fingerprint,
             "expectedConfigVersion": expected_config_version,
-            "mappings": mappings or MAPPINGS,
-            "allowedTravelProcessCodes": (
-                allowed_travel_process_codes
-                if allowed_travel_process_codes is not None
-                else TRAVEL_PROCESS_CODES
-            ),
+            "reimbursement": {
+                "processCode": PROCESS_CODE,
+                "schemaFingerprint": fingerprint,
+                "mappings": mappings or MAPPINGS,
+            },
+            "travelProfiles": [
+                {
+                    "profileKey": f"travel-{index}",
+                    "displayName": f"出差模板 {index}",
+                    "processCode": process_code,
+                    "schemaFingerprint": (travel_schema_fingerprints or {}).get(
+                        process_code,
+                        travel_fingerprint(process_code),
+                    ),
+                    "mappings": (travel_mappings or {}).get(
+                        process_code,
+                        {
+                            "startDate": "travel-start-id",
+                            "endDate": "travel-end-id",
+                        },
+                    ),
+                    "travelTypeOption": (travel_type_options or {}).get(
+                        process_code,
+                        {
+                            "value": "商务出差",
+                            "label": "商务出差",
+                            "key": None,
+                        },
+                    ),
+                }
+                for index, process_code in enumerate(
+                    allowed_travel_process_codes
+                    if allowed_travel_process_codes is not None
+                    else TRAVEL_PROCESS_CODES
+                )
+            ],
             "relatedApprovalSmokeTestConfirmed": smoke_test_confirmed,
         },
         headers=headers,
@@ -215,18 +311,20 @@ def test_inspect_uses_official_signature_and_normalizes_safe_schema(client_facto
     data = response.json()["data"]
     assert data["compatibilityStatus"] == "UNCONFIGURED"
     assert data["isSubmissionReady"] is False
-    assert data["schema"]["formUuid"] == "form-uuid-1"
-    assert data["schema"]["modifiedAt"] == "2026-09-03T10:00:00+08:00"
-    logical_keys = {item["key"] for item in data["logicalFields"]}
+    assert data["reimbursement"]["schema"]["formUuid"] == "form-uuid-1"
+    assert data["reimbursement"]["schema"]["modifiedAt"] == "2026-09-03T10:00:00+08:00"
+    logical_keys = {item["key"] for item in data["reimbursement"]["logicalFields"]}
     assert {"startDate", "endDate"} <= logical_keys
     assert not {"startTime", "endTime"} & logical_keys
-    company = data["schema"]["components"][0]
+    company = data["reimbursement"]["schema"]["components"][0]
     assert company["options"] == [
         {"value": "北京", "label": "北京", "key": "option_0"},
         {"value": "无锡", "label": "无锡", "key": "option_1"},
     ]
     related = next(
-        item for item in data["schema"]["components"] if item["componentId"] == "related-id"
+        item
+        for item in data["reimbursement"]["schema"]["components"]
+        if item["componentId"] == "related-id"
     )
     assert related["relatedTemplatePolicy"] == {"mode": "UNKNOWN", "processCodes": []}
     assert "relatedApprovals" in related["compatibleLogicalFields"]
@@ -338,23 +436,88 @@ def test_template_administration_requires_current_admin_and_csrf(client_factory)
         lambda _number, _request: httpx.Response(200, json=schema_payload())
     )
     anonymous = client_factory(transport=transport, auth_mock_enabled=True)
-    assert anonymous.get("/api/admin/oa/templates/reimbursement").status_code == 401
+    assert anonymous.get("/api/admin/oa/templates/catalog").status_code == 401
     assert (
         anonymous.post(
-            "/api/admin/oa/templates/inspect", json={"processCode": PROCESS_CODE}
+            "/api/admin/oa/templates/catalog/inspect",
+            json={
+                "reimbursementProcessCode": PROCESS_CODE,
+                "travelProfiles": [
+                    {
+                        "profileKey": "travel-0",
+                        "displayName": "境内出差",
+                        "processCode": TRAVEL_PROCESS_CODES[0],
+                    }
+                ],
+            },
         ).status_code
         == 401
     )
 
     login = mock_login(anonymous)
-    assert anonymous.get("/api/admin/oa/templates/reimbursement").status_code == 403
+    assert anonymous.get("/api/admin/oa/templates/catalog").status_code == 403
     assert inspect(anonymous, {"X-CSRF-Token": login["csrfToken"]}).status_code == 403
 
     admin, headers = admin_client(client_factory, transport)
     assert inspect(admin, {}).status_code == 403
     inspected = inspect(admin, headers)
-    fingerprint = inspected.json()["data"]["schema"]["schemaFingerprint"]
+    fingerprint = inspected.json()["data"]["reimbursement"]["schema"]["schemaFingerprint"]
     assert confirm(admin, {}, fingerprint).status_code == 403
+
+
+def test_remote_catalog_reads_start_without_the_auth_database_transaction(
+    client_factory,
+    monkeypatch,
+) -> None:
+    transport, _calls = transport_for_schema(
+        lambda _number, _request: httpx.Response(200, json=schema_payload())
+    )
+    client, headers = admin_client(client_factory, transport)
+    observed: list[str] = []
+
+    async def fake_inspect(database, _workflow, **_kwargs):
+        assert database.in_transaction() is False
+        observed.append("inspect")
+        return {}
+
+    async def fake_confirm(database, _workflow, **kwargs):
+        assert database.in_transaction() is False
+        assert kwargs["administrator_user_id"] == "admin-1"
+        observed.append("confirm")
+        return {}
+
+    monkeypatch.setattr(oa_templates, "inspect_template_catalog", fake_inspect)
+    inspected = inspect(client, headers)
+    monkeypatch.setattr(oa_templates, "confirm_template_catalog", fake_confirm)
+    confirmed = confirm(client, headers, "a" * 64)
+
+    assert inspected.status_code == 200
+    assert confirmed.status_code == 200
+    assert observed == ["inspect", "confirm"]
+
+
+def test_inspection_never_returns_a_new_catalog_version_with_stale_mappings(
+    client_factory,
+    monkeypatch,
+) -> None:
+    transport, _calls = transport_for_schema(
+        lambda _number, _request: httpx.Response(200, json=schema_payload())
+    )
+    client, headers = admin_client(client_factory, transport)
+    fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
+    assert confirm(client, headers, fingerprint).status_code == 200
+    monkeypatch.setattr(
+        oa_template_profiles,
+        "_record_catalog_status",
+        lambda *_args, **_kwargs: False,
+    )
+
+    response = inspect(client, headers)
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "OA_TEMPLATE_CONFIGURATION_CHANGED"
 
 
 @pytest.mark.parametrize(
@@ -372,7 +535,9 @@ def test_mapping_rejects_unknown_duplicate_and_wrong_type(
         lambda _number, _request: httpx.Response(200, json=schema_payload())
     )
     client, headers = admin_client(client_factory, transport)
-    fingerprint = inspect(client, headers).json()["data"]["schema"]["schemaFingerprint"]
+    fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
 
     response = confirm(client, headers, fingerprint, MAPPINGS | mapping_change)
 
@@ -393,7 +558,9 @@ def test_mapping_rejects_unmapped_required_component_and_empty_select(client_fac
             lambda _number, _request, current=payload: httpx.Response(200, json=current)
         )
         client, headers = admin_client(client_factory, transport)
-        fingerprint = inspect(client, headers).json()["data"]["schema"]["schemaFingerprint"]
+        fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+            "schemaFingerprint"
+        ]
         response = confirm(client, headers, fingerprint)
         assert response.status_code == 400
         assert expected in response.json()["error"]["message"]
@@ -414,7 +581,9 @@ def test_mapping_rejects_unmapped_required_component_in_visible_container(
         lambda _number, _request: httpx.Response(200, json=payload)
     )
     client, headers = admin_client(client_factory, transport)
-    fingerprint = inspect(client, headers).json()["data"]["schema"]["schemaFingerprint"]
+    fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
 
     response = confirm(client, headers, fingerprint)
 
@@ -454,10 +623,12 @@ def test_mapping_rejects_an_unsupported_date_format(client_factory) -> None:
     client, headers = admin_client(client_factory, transport)
     inspected = inspect(client, headers).json()["data"]
     start_component = next(
-        item for item in inspected["schema"]["components"] if item["componentId"] == "start-id"
+        item
+        for item in inspected["reimbursement"]["schema"]["components"]
+        if item["componentId"] == "start-id"
     )
     assert "startDate" not in start_component["compatibleLogicalFields"]
-    fingerprint = inspected["schema"]["schemaFingerprint"]
+    fingerprint = inspected["reimbursement"]["schema"]["schemaFingerprint"]
 
     response = confirm(client, headers, fingerprint)
 
@@ -487,7 +658,9 @@ def test_idless_container_state_is_propagated_and_blocks_descendant_mapping(
 
     inspected = inspect(client, headers).json()["data"]
     normalized = next(
-        item for item in inspected["schema"]["components"] if item["componentId"] == "company-id"
+        item
+        for item in inspected["reimbursement"]["schema"]["components"]
+        if item["componentId"] == "company-id"
     )
     assert normalized["parentComponentId"] is None
     assert normalized["nested"] is True
@@ -497,7 +670,7 @@ def test_idless_container_state_is_propagated_and_blocks_descendant_mapping(
     response = confirm(
         client,
         headers,
-        inspected["schema"]["schemaFingerprint"],
+        inspected["reimbursement"]["schema"]["schemaFingerprint"],
     )
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "OA_TEMPLATE_MAPPING_INVALID"
@@ -519,13 +692,19 @@ def test_ordinary_field_group_allows_mapping_visible_leaf_component(client_facto
 
     inspected = inspect(client, headers).json()["data"]
     normalized = next(
-        item for item in inspected["schema"]["components"] if item["componentId"] == "company-id"
+        item
+        for item in inspected["reimbursement"]["schema"]["components"]
+        if item["componentId"] == "company-id"
     )
     assert normalized["nested"] is True
     assert normalized["unsupportedContainerAncestor"] is False
     assert "company" in normalized["compatibleLogicalFields"]
 
-    response = confirm(client, headers, inspected["schema"]["schemaFingerprint"])
+    response = confirm(
+        client,
+        headers,
+        inspected["reimbursement"]["schema"]["schemaFingerprint"],
+    )
 
     assert response.status_code == 200
 
@@ -547,7 +726,7 @@ def test_idless_table_container_marks_and_blocks_subtable_descendant(client_fact
     inspected = inspect(client, headers).json()["data"]
     normalized = next(
         item
-        for item in inspected["schema"]["components"]
+        for item in inspected["reimbursement"]["schema"]["components"]
         if item["componentId"] == "description-id"
     )
     assert normalized["parentComponentId"] is None
@@ -559,7 +738,7 @@ def test_idless_table_container_marks_and_blocks_subtable_descendant(client_fact
     response = confirm(
         client,
         headers,
-        inspected["schema"]["schemaFingerprint"],
+        inspected["reimbursement"]["schema"]["schemaFingerprint"],
     )
     assert response.status_code == 400
     assert "子控件" in response.json()["error"]["message"]
@@ -581,35 +760,43 @@ def test_unknown_business_suite_container_blocks_descendant_mapping(client_facto
 
     inspected = inspect(client, headers).json()["data"]
     normalized = next(
-        item for item in inspected["schema"]["components"] if item["componentId"] == "company-id"
+        item
+        for item in inspected["reimbursement"]["schema"]["components"]
+        if item["componentId"] == "company-id"
     )
     assert normalized["inSubtable"] is False
     assert normalized["unsupportedContainerAncestor"] is True
     assert normalized["compatibleLogicalFields"] == []
 
-    response = confirm(client, headers, inspected["schema"]["schemaFingerprint"])
+    response = confirm(
+        client,
+        headers,
+        inspected["reimbursement"]["schema"]["schemaFingerprint"],
+    )
 
     assert response.status_code == 400
     assert "复杂业务组件" in response.json()["error"]["message"]
 
 
 @pytest.mark.parametrize(
-    ("allowed_process_codes", "smoke_test_confirmed", "message"),
+    ("allowed_process_codes", "smoke_test_confirmed", "status_code", "message"),
     [
-        (TRAVEL_PROCESS_CODES, False, "冒烟测试"),
-        ([TRAVEL_PROCESS_CODES[0], TRAVEL_PROCESS_CODES[0]], True, "不能重复"),
-        ([PROCESS_CODE], True, "不能同时作为"),
-        (["invalid process code"], True, "格式无效"),
+        (TRAVEL_PROCESS_CODES, False, 400, "冒烟测试"),
+        ([TRAVEL_PROCESS_CODES[0], TRAVEL_PROCESS_CODES[0]], True, 400, "不能重复"),
+        ([PROCESS_CODE], True, 400, "不能同时作为"),
+        (["invalid process code"], True, 422, "请求参数不正确"),
     ],
 )
 def test_relationship_requires_explicit_smoke_test_and_valid_local_allowlist(
-    client_factory, allowed_process_codes, smoke_test_confirmed, message
+    client_factory, allowed_process_codes, smoke_test_confirmed, status_code, message
 ) -> None:
     transport, _calls = transport_for_schema(
         lambda _number, _request: httpx.Response(200, json=schema_payload())
     )
     client, headers = admin_client(client_factory, transport)
-    fingerprint = inspect(client, headers).json()["data"]["schema"]["schemaFingerprint"]
+    fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
 
     response = confirm(
         client,
@@ -619,9 +806,235 @@ def test_relationship_requires_explicit_smoke_test_and_valid_local_allowlist(
         smoke_test_confirmed=smoke_test_confirmed,
     )
 
+    assert response.status_code == status_code
+    assert message in response.text
+
+
+@pytest.mark.parametrize(
+    "travel_profiles",
+    [
+        [
+            {
+                "profileKey": "travel-0",
+                "displayName": "出差模板 0",
+                "processCode": TRAVEL_PROCESS_CODES[0],
+            }
+        ],
+        [
+            {
+                "profileKey": "renamed-travel",
+                "displayName": "出差模板 0",
+                "processCode": TRAVEL_PROCESS_CODES[0],
+            },
+            {
+                "profileKey": "travel-1",
+                "displayName": "出差模板 1",
+                "processCode": TRAVEL_PROCESS_CODES[1],
+            },
+        ],
+        [
+            {
+                "profileKey": "travel-0",
+                "displayName": "出差模板 0",
+                "processCode": TRAVEL_PROCESS_CODES[1],
+            },
+            {
+                "profileKey": "travel-1",
+                "displayName": "出差模板 1",
+                "processCode": TRAVEL_PROCESS_CODES[0],
+            },
+        ],
+    ],
+)
+def test_inspection_does_not_reuse_relationship_confirmation_for_a_changed_catalog(
+    client_factory,
+    travel_profiles,
+) -> None:
+    transport, _calls = transport_for_schema(
+        lambda _number, _request: httpx.Response(200, json=schema_payload())
+    )
+    client, headers = admin_client(client_factory, transport)
+    initial = inspect(client, headers).json()["data"]
+    assert (
+        confirm(
+            client,
+            headers,
+            initial["reimbursement"]["schema"]["schemaFingerprint"],
+        ).status_code
+        == 200
+    )
+
+    unchanged = inspect(client, headers)
+    changed = client.post(
+        "/api/admin/oa/templates/catalog/inspect",
+        json={
+            "reimbursementProcessCode": PROCESS_CODE,
+            "travelProfiles": travel_profiles,
+        },
+        headers=headers,
+    )
+
+    assert unchanged.status_code == 200
+    assert unchanged.json()["data"]["relatedApprovalSmokeTestConfirmed"] is True
+    assert changed.status_code == 200
+    assert changed.json()["data"]["compatibilityStatus"] == "CATALOG_CHANGED"
+    assert changed.json()["data"]["relatedApprovalSmokeTestConfirmed"] is False
+
+
+@pytest.mark.parametrize(
+    ("start_component_type", "start_format", "message"),
+    [
+        ("TextField", "yyyy-MM-dd", "不支持控件类型"),
+        ("DDDateField", "yyyy-MM-dd HH:mm", "yyyy-MM-dd"),
+    ],
+)
+def test_travel_profile_maps_only_supported_date_controls(
+    client_factory,
+    start_component_type,
+    start_format,
+    message,
+) -> None:
+    altered = travel_schema_payload(
+        TRAVEL_PROCESS_CODES[0],
+        start_component_type=start_component_type,
+        start_format=start_format,
+    )
+
+    def travel_response(process_code: str, _request: httpx.Request) -> httpx.Response:
+        payload = (
+            altered
+            if process_code == TRAVEL_PROCESS_CODES[0]
+            else travel_schema_payload(process_code)
+        )
+        return httpx.Response(200, json=payload)
+
+    transport, _calls = transport_for_schema(
+        lambda _number, _request: httpx.Response(200, json=schema_payload()),
+        travel_response_factory=travel_response,
+    )
+    client, headers = admin_client(client_factory, transport)
+    inspected = inspect(client, headers).json()["data"]
+    travel_fingerprints = {
+        item["processCode"]: item["schema"]["schemaFingerprint"]
+        for item in inspected["travelProfiles"]
+    }
+
+    response = confirm(
+        client,
+        headers,
+        inspected["reimbursement"]["schema"]["schemaFingerprint"],
+        travel_schema_fingerprints=travel_fingerprints,
+    )
+
     assert response.status_code == 400
-    assert response.json()["error"]["code"] == "OA_TEMPLATE_RELATIONSHIP_INVALID"
+    assert response.json()["error"]["code"] == "OA_TEMPLATE_MAPPING_INVALID"
     assert message in response.json()["error"]["message"]
+
+
+def test_travel_profile_requires_an_exact_reimbursement_travel_type_option(
+    client_factory,
+) -> None:
+    transport, _calls = transport_for_schema(
+        lambda _number, _request: httpx.Response(200, json=schema_payload())
+    )
+    client, headers = admin_client(client_factory, transport)
+    fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
+
+    response = confirm(
+        client,
+        headers,
+        fingerprint,
+        travel_type_options={
+            TRAVEL_PROCESS_CODES[0]: {
+                "value": "商务出差",
+                "label": "商务出差",
+                "key": "different-key",
+            }
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "OA_TEMPLATE_MAPPING_INVALID"
+    assert "选项已失效" in response.json()["error"]["message"]
+
+
+def test_catalog_confirmation_is_atomic_when_a_travel_schema_read_fails(
+    client_factory,
+) -> None:
+    def travel_response(process_code: str, _request: httpx.Request) -> httpx.Response:
+        if process_code == TRAVEL_PROCESS_CODES[1]:
+            return httpx.Response(
+                403,
+                json={"code": "Forbidden.AccessDenied.AccessTokenPermissionDenied"},
+            )
+        return httpx.Response(200, json=travel_schema_payload(process_code))
+
+    transport, _calls = transport_for_schema(
+        lambda _number, _request: httpx.Response(200, json=schema_payload()),
+        travel_response_factory=travel_response,
+    )
+    client, headers = admin_client(client_factory, transport)
+
+    response = confirm(
+        client,
+        headers,
+        normalize_form_schema(PROCESS_CODE, schema_payload()).fingerprint,
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "DINGTALK_PERMISSION_MISSING"
+    with client.app.state.database_session_factory() as database:
+        assert database.get(OaTemplateProfile, "reimbursement") is None
+
+
+def test_failed_catalog_reconfirmation_preserves_the_previous_whole_catalog(
+    client_factory,
+) -> None:
+    fail_second_travel = False
+
+    def travel_response(process_code: str, _request: httpx.Request) -> httpx.Response:
+        if fail_second_travel and process_code == TRAVEL_PROCESS_CODES[1]:
+            return httpx.Response(
+                403,
+                json={"code": "Forbidden.AccessDenied.AccessTokenPermissionDenied"},
+            )
+        return httpx.Response(200, json=travel_schema_payload(process_code))
+
+    transport, _calls = transport_for_schema(
+        lambda _number, _request: httpx.Response(200, json=schema_payload()),
+        travel_response_factory=travel_response,
+    )
+    client, headers = admin_client(client_factory, transport)
+    inspected = inspect(client, headers).json()["data"]
+    assert (
+        confirm(
+            client,
+            headers,
+            inspected["reimbursement"]["schema"]["schemaFingerprint"],
+        ).status_code
+        == 200
+    )
+    with client.app.state.database_session_factory() as database:
+        before = database.get(OaTemplateProfile, "reimbursement")
+        assert before is not None
+        before_travel_profiles = before.travel_profiles_json
+
+    fail_second_travel = True
+    response = confirm(
+        client,
+        headers,
+        inspected["reimbursement"]["schema"]["schemaFingerprint"],
+        expected_config_version=1,
+    )
+
+    assert response.status_code == 502
+    with client.app.state.database_session_factory() as database:
+        after = database.get(OaTemplateProfile, "reimbursement")
+        assert after is not None
+        assert after.config_version == 1
+        assert after.travel_profiles_json == before_travel_profiles
 
 
 def test_declared_relationship_policy_restricts_the_local_allowlist(client_factory) -> None:
@@ -636,13 +1049,15 @@ def test_declared_relationship_policy_restricts_the_local_allowlist(client_facto
     client, headers = admin_client(client_factory, transport)
     inspected = inspect(client, headers).json()["data"]
     related_component = next(
-        item for item in inspected["schema"]["components"] if item["componentId"] == "related-id"
+        item
+        for item in inspected["reimbursement"]["schema"]["components"]
+        if item["componentId"] == "related-id"
     )
     assert related_component["relatedTemplatePolicy"] == {
         "mode": "RESTRICTED",
         "processCodes": [TRAVEL_PROCESS_CODES[0]],
     }
-    fingerprint = inspected["schema"]["schemaFingerprint"]
+    fingerprint = inspected["reimbursement"]["schema"]["schemaFingerprint"]
 
     rejected = confirm(client, headers, fingerprint)
     accepted = confirm(
@@ -665,7 +1080,9 @@ def test_submission_readiness_fails_closed_if_relationship_confirmation_is_lost(
         lambda _number, _request: httpx.Response(200, json=schema_payload())
     )
     client, headers = admin_client(client_factory, transport)
-    fingerprint = inspect(client, headers).json()["data"]["schema"]["schemaFingerprint"]
+    fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
     assert confirm(client, headers, fingerprint).status_code == 200
     with client.app.state.database_session_factory() as database:
         profile = database.get(OaTemplateProfile, "reimbursement")
@@ -673,13 +1090,13 @@ def test_submission_readiness_fails_closed_if_relationship_confirmation_is_lost(
         profile.related_approval_smoke_test_confirmed = False
         database.commit()
 
-    current = client.get("/api/admin/oa/templates/reimbursement")
+    current = client.get("/api/admin/oa/templates/catalog")
 
     assert current.status_code == 200
     assert current.json()["data"]["compatibilityStatus"] == "COMPATIBLE"
     assert current.json()["data"]["isSubmissionReady"] is False
-    assert current.json()["data"]["profile"]["isSubmissionReady"] is False
-    assert current.json()["data"]["profile"]["relatedApprovalSmokeTestConfirmed"] is False
+    assert current.json()["data"]["catalog"]["isSubmissionReady"] is False
+    assert current.json()["data"]["catalog"]["relatedApprovalSmokeTestConfirmed"] is False
 
 
 def test_submission_readiness_is_false_when_travel_allowlist_is_empty(client_factory) -> None:
@@ -687,7 +1104,9 @@ def test_submission_readiness_is_false_when_travel_allowlist_is_empty(client_fac
         lambda _number, _request: httpx.Response(200, json=schema_payload())
     )
     client, headers = admin_client(client_factory, transport)
-    fingerprint = inspect(client, headers).json()["data"]["schema"]["schemaFingerprint"]
+    fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
     assert confirm(client, headers, fingerprint).status_code == 200
     with client.app.state.database_session_factory() as database:
         profile = database.get(OaTemplateProfile, "reimbursement")
@@ -695,12 +1114,37 @@ def test_submission_readiness_is_false_when_travel_allowlist_is_empty(client_fac
         profile.allowed_travel_process_codes_json = "[]"
         database.commit()
 
-    current = client.get("/api/admin/oa/templates/reimbursement")
+    current = client.get("/api/admin/oa/templates/catalog")
 
     assert current.status_code == 200
     assert current.json()["data"]["isSubmissionReady"] is False
     assert current.json()["data"]["requiresConfirmation"] is True
-    assert current.json()["data"]["profile"]["allowedTravelProcessCodes"] == []
+    assert current.json()["data"]["catalog"]["allowedTravelProcessCodes"] == []
+
+
+def test_upgraded_profile_with_no_travel_profiles_is_not_submission_ready(
+    client_factory,
+) -> None:
+    transport, _calls = transport_for_schema(
+        lambda _number, _request: httpx.Response(200, json=schema_payload())
+    )
+    client, headers = admin_client(client_factory, transport)
+    fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
+    assert confirm(client, headers, fingerprint).status_code == 200
+    with client.app.state.database_session_factory() as database:
+        profile = database.get(OaTemplateProfile, "reimbursement")
+        assert profile is not None
+        profile.travel_profiles_json = "[]"
+        database.commit()
+
+    current = client.get("/api/admin/oa/templates/catalog")
+
+    assert current.status_code == 200
+    assert current.json()["data"]["isSubmissionReady"] is False
+    assert current.json()["data"]["requiresConfirmation"] is True
+    assert current.json()["data"]["catalog"]["travelProfiles"] == []
 
 
 def test_submission_readiness_fails_closed_for_self_referential_travel_allowlist(
@@ -710,7 +1154,9 @@ def test_submission_readiness_fails_closed_for_self_referential_travel_allowlist
         lambda _number, _request: httpx.Response(200, json=schema_payload())
     )
     client, headers = admin_client(client_factory, transport)
-    fingerprint = inspect(client, headers).json()["data"]["schema"]["schemaFingerprint"]
+    fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
     assert confirm(client, headers, fingerprint).status_code == 200
     with client.app.state.database_session_factory() as database:
         profile = database.get(OaTemplateProfile, "reimbursement")
@@ -718,11 +1164,11 @@ def test_submission_readiness_fails_closed_for_self_referential_travel_allowlist
         profile.allowed_travel_process_codes_json = json.dumps([PROCESS_CODE])
         database.commit()
 
-    current = client.get("/api/admin/oa/templates/reimbursement")
+    current = client.get("/api/admin/oa/templates/catalog")
 
     assert current.status_code == 200
     assert current.json()["data"]["isSubmissionReady"] is False
-    assert current.json()["data"]["profile"]["isSubmissionReady"] is False
+    assert current.json()["data"]["catalog"]["allowedTravelProcessCodes"] == [PROCESS_CODE]
 
 
 @pytest.mark.parametrize(
@@ -737,7 +1183,9 @@ def test_submission_readiness_fails_closed_for_corrupted_travel_allowlist(
         lambda _number, _request: httpx.Response(200, json=schema_payload())
     )
     client, headers = admin_client(client_factory, transport)
-    fingerprint = inspect(client, headers).json()["data"]["schema"]["schemaFingerprint"]
+    fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
     assert confirm(client, headers, fingerprint).status_code == 200
     with client.app.state.database_session_factory() as database:
         profile = database.get(OaTemplateProfile, "reimbursement")
@@ -745,12 +1193,51 @@ def test_submission_readiness_fails_closed_for_corrupted_travel_allowlist(
         profile.allowed_travel_process_codes_json = stored_allowlist
         database.commit()
 
-    current = client.get("/api/admin/oa/templates/reimbursement")
+    current = client.get("/api/admin/oa/templates/catalog")
 
     assert current.status_code == 200
     assert current.json()["data"]["isSubmissionReady"] is False
-    assert current.json()["data"]["profile"]["isSubmissionReady"] is False
-    assert current.json()["data"]["profile"]["allowedTravelProcessCodes"] == []
+    assert current.json()["data"]["configVersion"] == 1
+    assert current.json()["data"]["catalog"] is None
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda item: item.pop("mappings"),
+        lambda item: item.update({"unexpected": True}),
+        lambda item: item.update({"profileKey": 123}),
+        lambda item: item["travelTypeOption"].update({"unexpected": True}),
+    ],
+)
+def test_submission_readiness_rejects_noncanonical_travel_profile_json(
+    client_factory,
+    mutate,
+) -> None:
+    transport, _calls = transport_for_schema(
+        lambda _number, _request: httpx.Response(200, json=schema_payload())
+    )
+    client, headers = admin_client(client_factory, transport)
+    fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
+    assert confirm(client, headers, fingerprint).status_code == 200
+    with client.app.state.database_session_factory() as database:
+        profile = database.get(OaTemplateProfile, "reimbursement")
+        assert profile is not None
+        stored = json.loads(profile.travel_profiles_json)
+        mutate(stored[0])
+        profile.travel_profiles_json = json.dumps(stored)
+        database.commit()
+
+    current = client.get("/api/admin/oa/templates/catalog")
+    submission_options = client.get("/api/oa/reimbursements/options")
+
+    assert current.status_code == 200
+    assert current.json()["data"]["configVersion"] == 1
+    assert current.json()["data"]["catalog"] is None
+    assert submission_options.status_code == 409
+    assert submission_options.json()["error"]["code"] == ("OA_TEMPLATE_CONFIRMATION_REQUIRED")
 
 
 def test_submission_readiness_revalidates_the_full_persisted_mapping(client_factory) -> None:
@@ -758,7 +1245,9 @@ def test_submission_readiness_revalidates_the_full_persisted_mapping(client_fact
         lambda _number, _request: httpx.Response(200, json=schema_payload())
     )
     client, headers = admin_client(client_factory, transport)
-    fingerprint = inspect(client, headers).json()["data"]["schema"]["schemaFingerprint"]
+    fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
     assert confirm(client, headers, fingerprint).status_code == 200
     with client.app.state.database_session_factory() as database:
         profile = database.get(OaTemplateProfile, "reimbursement")
@@ -766,11 +1255,13 @@ def test_submission_readiness_revalidates_the_full_persisted_mapping(client_fact
         profile.mapping_json = json.dumps(MAPPINGS | {"company": "missing-component"})
         database.commit()
 
-    current = client.get("/api/admin/oa/templates/reimbursement")
+    current = client.get("/api/admin/oa/templates/catalog")
 
     assert current.status_code == 200
     assert current.json()["data"]["isSubmissionReady"] is False
-    assert current.json()["data"]["profile"]["isSubmissionReady"] is False
+    assert current.json()["data"]["catalog"]["reimbursement"]["mappings"] == (
+        MAPPINGS | {"company": "missing-component"}
+    )
 
 
 def test_admin_can_reinspect_and_recover_a_malformed_persisted_mapping(client_factory) -> None:
@@ -778,7 +1269,9 @@ def test_admin_can_reinspect_and_recover_a_malformed_persisted_mapping(client_fa
         lambda _number, _request: httpx.Response(200, json=schema_payload())
     )
     client, headers = admin_client(client_factory, transport)
-    fingerprint = inspect(client, headers).json()["data"]["schema"]["schemaFingerprint"]
+    fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
     assert confirm(client, headers, fingerprint).status_code == 200
     with client.app.state.database_session_factory() as database:
         profile = database.get(OaTemplateProfile, "reimbursement")
@@ -786,15 +1279,26 @@ def test_admin_can_reinspect_and_recover_a_malformed_persisted_mapping(client_fa
         profile.mapping_json = "not-json"
         database.commit()
 
-    current = client.get("/api/admin/oa/templates/reimbursement")
+    current = client.get("/api/admin/oa/templates/catalog")
     reinspected = inspect(client, headers)
 
     assert current.status_code == 200
     assert current.json()["data"]["isSubmissionReady"] is False
-    assert current.json()["data"]["profile"]["mappings"] is None
+    assert current.json()["data"]["configVersion"] == 1
+    assert current.json()["data"]["catalog"] is None
     assert reinspected.status_code == 200
     assert reinspected.json()["data"]["isSubmissionReady"] is False
-    assert reinspected.json()["data"]["mappings"] is None
+    assert reinspected.json()["data"]["reimbursement"]["mappings"] is None
+
+    repaired = confirm(
+        client,
+        headers,
+        reinspected.json()["data"]["reimbursement"]["schema"]["schemaFingerprint"],
+        expected_config_version=current.json()["data"]["configVersion"],
+    )
+
+    assert repaired.status_code == 200
+    assert repaired.json()["data"]["configVersion"] == 2
 
 
 def test_fresh_submission_contract_allows_only_configured_travel_templates(
@@ -804,7 +1308,9 @@ def test_fresh_submission_contract_allows_only_configured_travel_templates(
         lambda _number, _request: httpx.Response(200, json=schema_payload())
     )
     client, headers = admin_client(client_factory, transport)
-    fingerprint = inspect(client, headers).json()["data"]["schema"]["schemaFingerprint"]
+    fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
     assert confirm(client, headers, fingerprint).status_code == 200
 
     async def load_contract():
@@ -815,9 +1321,10 @@ def test_fresh_submission_contract_allows_only_configured_travel_templates(
 
     contract = asyncio.run(load_contract())
 
-    contract.require_allowed_travel_process(TRAVEL_PROCESS_CODES[0])
+    assert contract.allowed_travel_process_codes == tuple(TRAVEL_PROCESS_CODES)
+    assert contract.travel_profile("travel-0").process_code == TRAVEL_PROCESS_CODES[0]
     with pytest.raises(ApiError) as rejected:
-        contract.require_allowed_travel_process("PROC-TRAVEL-NOT-CONFIGURED")
+        contract.travel_profile("travel-not-configured")
     assert rejected.value.code == "TRAVEL_APPROVAL_TEMPLATE_NOT_ALLOWED"
 
 
@@ -831,7 +1338,9 @@ def test_fresh_submission_contract_persists_remote_schema_drift(client_factory) 
         )
     )
     client, headers = admin_client(client_factory, transport)
-    fingerprint = inspect(client, headers).json()["data"]["schema"]["schemaFingerprint"]
+    fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
     assert confirm(client, headers, fingerprint).status_code == 200
 
     async def load_contract():
@@ -848,7 +1357,7 @@ def test_fresh_submission_contract_persists_remote_schema_drift(client_factory) 
         profile = database.get(OaTemplateProfile, "reimbursement")
         assert profile is not None
         assert profile.compatibility_status == "DRIFTED"
-        assert profile.schema_fingerprint != profile.confirmed_schema_fingerprint
+        assert profile.schema_fingerprint == profile.confirmed_schema_fingerprint
 
 
 def test_fresh_submission_contract_retries_after_concurrent_admin_reconfirmation(
@@ -872,7 +1381,9 @@ def test_fresh_submission_contract_retries_after_concurrent_admin_reconfirmation
         lambda _number, _request: httpx.Response(200, json=current_admin_payload["value"])
     )
     client, headers = admin_client(client_factory, initial_transport)
-    fingerprint = inspect(client, headers).json()["data"]["schema"]["schemaFingerprint"]
+    fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
     assert confirm(client, headers, fingerprint).status_code == 200
     version_two_mapping = MAPPINGS | {"description": "description-v2-id"}
 
@@ -892,9 +1403,9 @@ def test_fresh_submission_contract_retries_after_concurrent_admin_reconfirmation
             slow_load = asyncio.create_task(load_contract())
             await started.wait()
             current_admin_payload["value"] = version_two
-            version_two_fingerprint = inspect(client, headers).json()["data"]["schema"][
-                "schemaFingerprint"
-            ]
+            version_two_fingerprint = inspect(client, headers).json()["data"]["reimbursement"][
+                "schema"
+            ]["schemaFingerprint"]
             saved_response = confirm(
                 client,
                 headers,
@@ -917,8 +1428,8 @@ def test_fresh_submission_contract_retries_after_concurrent_admin_reconfirmation
     saved, contract, schema_calls, version_two_fingerprint = asyncio.run(exercise_race())
 
     assert saved["configVersion"] == 2
-    assert contract.mappings == version_two_mapping
-    assert contract.schema.fingerprint == version_two_fingerprint
+    assert contract.reimbursement.mappings == version_two_mapping
+    assert contract.reimbursement.schema.fingerprint == version_two_fingerprint
     assert schema_calls == 2
     with client.app.state.database_session_factory() as database:
         profile = database.get(OaTemplateProfile, "reimbursement")
@@ -936,10 +1447,12 @@ def test_confirmed_profile_is_persisted_and_returned_without_refetch(client_fact
         lambda _number, _request: httpx.Response(200, json=schema_payload())
     )
     client, headers = admin_client(client_factory, transport)
-    fingerprint = inspect(client, headers).json()["data"]["schema"]["schemaFingerprint"]
+    fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
 
     saved = confirm(client, headers, fingerprint)
-    current = client.get("/api/admin/oa/templates/reimbursement")
+    current = client.get("/api/admin/oa/templates/catalog")
 
     assert saved.status_code == 200
     assert current.status_code == 200
@@ -947,11 +1460,12 @@ def test_confirmed_profile_is_persisted_and_returned_without_refetch(client_fact
     assert data["configured"] is True
     assert data["compatibilityStatus"] == "COMPATIBLE"
     assert data["isSubmissionReady"] is True
-    assert data["profile"]["processCode"] == PROCESS_CODE
-    assert data["profile"]["configVersion"] == 1
-    assert data["profile"]["mappings"] == MAPPINGS
-    assert data["profile"]["allowedTravelProcessCodes"] == TRAVEL_PROCESS_CODES
-    assert data["profile"]["relatedApprovalSmokeTestConfirmed"] is True
+    catalog = data["catalog"]
+    assert catalog["reimbursement"]["processCode"] == PROCESS_CODE
+    assert catalog["configVersion"] == 1
+    assert catalog["reimbursement"]["mappings"] == MAPPINGS
+    assert catalog["allowedTravelProcessCodes"] == TRAVEL_PROCESS_CODES
+    assert catalog["relatedApprovalSmokeTestConfirmed"] is True
     assert calls == {"token": 1, "schema": 2}
     with client.app.state.database_session_factory() as database:
         profile = database.get(OaTemplateProfile, "reimbursement")
@@ -983,14 +1497,14 @@ def test_stale_unconfigured_confirmation_cannot_overwrite_first_admin(client_fac
     first = confirm(
         client,
         headers,
-        first_inspection["schema"]["schemaFingerprint"],
+        first_inspection["reimbursement"]["schema"]["schemaFingerprint"],
         MAPPINGS,
         expected_config_version=None,
     )
     stale = confirm(
         client,
         headers,
-        second_inspection["schema"]["schemaFingerprint"],
+        second_inspection["reimbursement"]["schema"]["schemaFingerprint"],
         MAPPINGS | {"description": "description-v2-id"},
         expected_config_version=None,
     )
@@ -998,9 +1512,9 @@ def test_stale_unconfigured_confirmation_cannot_overwrite_first_admin(client_fac
     assert first.status_code == 200
     assert stale.status_code == 409
     assert stale.json()["error"]["code"] == "OA_TEMPLATE_CONFIGURATION_CHANGED"
-    current = client.get("/api/admin/oa/templates/reimbursement").json()["data"]["profile"]
+    current = client.get("/api/admin/oa/templates/catalog").json()["data"]["catalog"]
     assert current["configVersion"] == 1
-    assert current["mappings"] == MAPPINGS
+    assert current["reimbursement"]["mappings"] == MAPPINGS
 
 
 def test_stale_existing_confirmation_cannot_overwrite_newer_admin_mapping(
@@ -1016,7 +1530,7 @@ def test_stale_existing_confirmation_cannot_overwrite_newer_admin_mapping(
     )
     client, headers = admin_client(client_factory, transport)
     initial = inspect(client, headers).json()["data"]
-    fingerprint = initial["schema"]["schemaFingerprint"]
+    fingerprint = initial["reimbursement"]["schema"]["schemaFingerprint"]
     assert confirm(client, headers, fingerprint).status_code == 200
     first_admin = inspect(client, headers).json()["data"]
     stale_admin = inspect(client, headers).json()["data"]
@@ -1043,9 +1557,9 @@ def test_stale_existing_confirmation_cannot_overwrite_newer_admin_mapping(
     assert newer.json()["data"]["configVersion"] == 2
     assert stale.status_code == 409
     assert stale.json()["error"]["code"] == "OA_TEMPLATE_CONFIGURATION_CHANGED"
-    current = client.get("/api/admin/oa/templates/reimbursement").json()["data"]["profile"]
+    current = client.get("/api/admin/oa/templates/catalog").json()["data"]["catalog"]
     assert current["configVersion"] == 2
-    assert current["mappings"] == version_two_mapping
+    assert current["reimbursement"]["mappings"] == version_two_mapping
 
 
 def test_schema_drift_is_durable_and_blocks_readiness_until_reconfirmed(client_factory) -> None:
@@ -1060,23 +1574,25 @@ def test_schema_drift_is_durable_and_blocks_readiness_until_reconfirmed(client_f
 
     transport, _calls = transport_for_schema(response_factory)
     client, headers = admin_client(client_factory, transport)
-    original_fingerprint = inspect(client, headers).json()["data"]["schema"]["schemaFingerprint"]
+    original_fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
     assert confirm(client, headers, original_fingerprint).status_code == 200
 
     drift = inspect(client, headers)
-    current = client.get("/api/admin/oa/templates/reimbursement")
+    current = client.get("/api/admin/oa/templates/catalog")
 
     assert drift.status_code == 200
     drift_data = drift.json()["data"]
     assert drift_data["compatibilityStatus"] == "DRIFTED"
     assert drift_data["requiresConfirmation"] is True
     assert drift_data["isSubmissionReady"] is False
-    changed_fingerprint = drift_data["schema"]["schemaFingerprint"]
+    changed_fingerprint = drift_data["reimbursement"]["schema"]["schemaFingerprint"]
     assert changed_fingerprint != original_fingerprint
     assert current.json()["data"]["compatibilityStatus"] == "DRIFTED"
     assert current.json()["data"]["isSubmissionReady"] is False
-    assert current.json()["data"]["profile"]["confirmedSchemaFingerprint"] == (original_fingerprint)
-    assert current.json()["data"]["profile"]["configVersion"] == 1
+    assert current.json()["data"]["catalog"]["confirmedSchemaFingerprint"] == (original_fingerprint)
+    assert current.json()["data"]["catalog"]["configVersion"] == 1
 
     stale_confirmation = confirm(client, headers, original_fingerprint)
     assert stale_confirmation.status_code == 409
@@ -1094,6 +1610,61 @@ def test_schema_drift_is_durable_and_blocks_readiness_until_reconfirmed(client_f
     assert reconfirmed.json()["data"]["configVersion"] == 2
 
 
+def test_travel_schema_drift_marks_the_whole_catalog_not_ready(client_factory) -> None:
+    travel_calls: dict[str, int] = {}
+
+    def travel_response(process_code: str, _request: httpx.Request) -> httpx.Response:
+        travel_calls[process_code] = travel_calls.get(process_code, 0) + 1
+        modified_at = (
+            "2026-09-04T12:00:00+08:00"
+            if process_code == TRAVEL_PROCESS_CODES[0] and travel_calls[process_code] >= 3
+            else "2026-09-03T11:00:00+08:00"
+        )
+        return httpx.Response(
+            200,
+            json=travel_schema_payload(process_code, modified_at=modified_at),
+        )
+
+    transport, _calls = transport_for_schema(
+        lambda _number, _request: httpx.Response(200, json=schema_payload()),
+        travel_response_factory=travel_response,
+    )
+    client, headers = admin_client(client_factory, transport)
+    inspected = inspect(client, headers).json()["data"]
+    assert (
+        confirm(
+            client,
+            headers,
+            inspected["reimbursement"]["schema"]["schemaFingerprint"],
+        ).status_code
+        == 200
+    )
+
+    async def load_contract():
+        return await load_fresh_submission_template(
+            client.app.state.database_session_factory,
+            client.app.state.dingtalk_workflow,
+        )
+
+    with pytest.raises(ApiError) as caught:
+        asyncio.run(load_contract())
+
+    drift = inspect(client, headers)
+    current = client.get("/api/admin/oa/templates/catalog")
+    blocked = client.get("/api/oa/reimbursements/options")
+
+    assert drift.status_code == 200
+    assert caught.value.code == "OA_TEMPLATE_CONFIRMATION_REQUIRED"
+    assert drift.json()["data"]["compatibilityStatus"] == "DRIFTED"
+    assert drift.json()["data"]["isSubmissionReady"] is False
+    assert drift.json()["data"]["relatedApprovalSmokeTestConfirmed"] is False
+    assert current.json()["data"]["compatibilityStatus"] == "DRIFTED"
+    assert current.json()["data"]["isSubmissionReady"] is False
+    assert current.json()["data"]["catalog"]["configVersion"] == 1
+    assert blocked.status_code == 409
+    assert blocked.json()["error"]["code"] == "OA_TEMPLATE_CONFIRMATION_REQUIRED"
+
+
 def test_fingerprint_is_stable_across_json_key_and_component_order(client_factory) -> None:
     first = schema_payload()
     reordered = copy.deepcopy(first)
@@ -1104,7 +1675,11 @@ def test_fingerprint_is_stable_across_json_key_and_component_order(client_factor
     )
     client, headers = admin_client(client_factory, transport)
 
-    first_hash = inspect(client, headers).json()["data"]["schema"]["schemaFingerprint"]
-    second_hash = inspect(client, headers).json()["data"]["schema"]["schemaFingerprint"]
+    first_hash = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
+    second_hash = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
+        "schemaFingerprint"
+    ]
 
     assert first_hash == second_hash

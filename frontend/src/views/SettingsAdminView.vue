@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import OaTemplateSettingsCard from '@/components/settings/OaTemplateSettingsCard.vue'
 import ReceiptKeywordSettingsCard from '@/components/settings/ReceiptKeywordSettingsCard.vue'
 import SubsidyRateSettingsCard from '@/components/settings/SubsidyRateSettingsCard.vue'
 </script>
@@ -30,5 +31,6 @@ import SubsidyRateSettingsCard from '@/components/settings/SubsidyRateSettingsCa
 
     <ReceiptKeywordSettingsCard />
     <SubsidyRateSettingsCard />
+    <OaTemplateSettingsCard />
   </main>
 </template>
