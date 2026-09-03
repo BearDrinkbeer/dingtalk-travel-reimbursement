@@ -534,7 +534,19 @@ async def test_unclassified_non_transport_pdf_text_does_not_use_paddle(
     assert parsed.category.value == "other"
 
 
-def test_production_rejects_fake_and_missing_models(settings_factory, tmp_path: Path) -> None:
+def test_production_rejects_fake_and_missing_models(
+    settings_factory,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database_engine_created = False
+
+    def unexpected_database_engine(_database_url: str):
+        nonlocal database_engine_created
+        database_engine_created = True
+        raise AssertionError("production fake OCR must fail before resources are created")
+
+    monkeypatch.setattr("app.main.create_database_engine", unexpected_database_engine)
     with pytest.raises(ValueError, match="fake OCR"):
         from app.main import create_app
 
@@ -547,6 +559,7 @@ def test_production_rejects_fake_and_missing_models(settings_factory, tmp_path: 
             ),
             ocr_engine=FakeOcrEngine(),
         )
+    assert database_engine_created is False
 
     settings = settings_factory(
         ocr_enabled=True,

@@ -6,11 +6,13 @@ from pathlib import Path
 from time import monotonic
 from typing import Annotated
 
+import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi import Depends
 from fastapi.testclient import TestClient
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
@@ -27,7 +29,35 @@ def make_settings(tmp_path: Path, database_name: str) -> Settings:
         app_env="test",
         database_url=f"sqlite:///{tmp_path / database_name}",
         temp_dir=tmp_path / f"{database_name}-temp",
+        reimbursement_staging_dir=tmp_path / f"{database_name}-staging",
     )
+
+
+def test_sqlite_engine_configures_every_connection_for_integrity_and_contention(
+    tmp_path: Path,
+) -> None:
+    engine = create_database_engine(f"sqlite:///{tmp_path / 'pragmas.db'}")
+    try:
+        with engine.connect() as first, engine.connect() as second:
+            for connection in (first, second):
+                assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+                assert connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one() == 5000
+                assert (
+                    connection.exec_driver_sql("PRAGMA journal_mode").scalar_one().lower() == "wal"
+                )
+
+            first.exec_driver_sql("CREATE TABLE pragma_parent (id INTEGER PRIMARY KEY)")
+            first.exec_driver_sql(
+                "CREATE TABLE pragma_child ("
+                "id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL "
+                "REFERENCES pragma_parent(id))"
+            )
+            first.commit()
+            with pytest.raises(IntegrityError):
+                second.exec_driver_sql("INSERT INTO pragma_child (id, parent_id) VALUES (1, 999)")
+            second.rollback()
+    finally:
+        engine.dispose()
 
 
 def app_with_setting(settings: Settings, value: str):
@@ -257,7 +287,7 @@ def test_alembic_0003_preserves_legacy_rate_for_old_automatic_types(
                 row[1]
                 for row in connection.execute("PRAGMA table_info(oa_template_profiles)").fetchall()
             }
-        assert revision == ("20260904_0008",)
+        assert revision == ("20260904_0009",)
         assert keyword_count == (18,)
         assert keyword_columns == {
             "id",
@@ -349,7 +379,7 @@ def test_alembic_0008_adds_nullable_union_id_without_fabricating_legacy_identity
                 ("legacy-session",),
             ).fetchone()
 
-        assert revision == ("20260904_0008",)
+        assert revision == ("20260904_0009",)
         assert "dingtalk_union_id" in session_columns
         assert union_id == (None,)
     finally:

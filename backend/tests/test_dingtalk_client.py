@@ -194,3 +194,89 @@ async def test_non_idempotent_post_does_not_retry_transient_failure(
     assert calls == {"token": 1, "openapi": 1}
     assert caught.value.http_status == expected_status
     assert caught.value.upstream_code == expected_code
+
+
+@pytest.mark.asyncio
+async def test_non_replayed_401_evicts_cached_token_for_the_next_request(
+    settings_factory,
+) -> None:
+    calls = {"token": 0, "mutation": 0, "query": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/token"):
+            calls["token"] += 1
+            return httpx.Response(
+                200,
+                json={"access_token": f"private-token-{calls['token']}"},
+            )
+        if request.url.path.endswith("/mutation"):
+            calls["mutation"] += 1
+            assert request.headers["x-acs-dingtalk-access-token"] == "private-token-1"
+            return httpx.Response(401, json={"code": "InvalidAuthentication"})
+        calls["query"] += 1
+        assert request.url.path.endswith("/query")
+        assert request.headers["x-acs-dingtalk-access-token"] == "private-token-2"
+        return httpx.Response(200, json={"success": True})
+
+    client = DingTalkOpenAPIClient(
+        settings_factory(),
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(DingTalkOpenAPIError) as caught:
+            await client.request_openapi_json(
+                "POST",
+                "/v1.0/mutation",
+                retry_invalid_token=False,
+                retry_transient=False,
+            )
+        result = await client.request_openapi_json("GET", "/v1.0/query")
+    finally:
+        await client.close()
+
+    assert caught.value.http_status == 401
+    assert result == {"success": True}
+    assert calls == {"token": 2, "mutation": 1, "query": 1}
+
+
+@pytest.mark.asyncio
+async def test_non_replayed_oapi_401_evicts_cached_token_for_the_next_request(
+    settings_factory,
+) -> None:
+    calls = {"token": 0, "mutation": 0, "query": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/token"):
+            calls["token"] += 1
+            return httpx.Response(
+                200,
+                json={"access_token": f"private-token-{calls['token']}"},
+            )
+        if request.url.path.endswith("/mutation"):
+            calls["mutation"] += 1
+            assert request.url.params["access_token"] == "private-token-1"
+            return httpx.Response(401, json={"errcode": 40014})
+        calls["query"] += 1
+        assert request.url.path.endswith("/query")
+        assert request.url.params["access_token"] == "private-token-2"
+        return httpx.Response(200, json={"errcode": 0})
+
+    client = DingTalkOpenAPIClient(
+        settings_factory(),
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(DingTalkOpenAPIError) as caught:
+            await client.request_oapi_json(
+                "POST",
+                "/mutation",
+                retry_invalid_token=False,
+                retry_transient=False,
+            )
+        result = await client.request_oapi_json("GET", "/query")
+    finally:
+        await client.close()
+
+    assert caught.value.http_status == 401
+    assert result == {"errcode": 0}
+    assert calls == {"token": 2, "mutation": 1, "query": 1}

@@ -65,6 +65,9 @@ export AUTH_MOCK_ENABLED=false
 export SESSION_COOKIE_SECURE="$DINGTALK_DEV_COOKIE_SECURE"
 export DATABASE_URL=sqlite:///./data/dev-dingtalk.db
 export TEMP_DIR=/tmp/dingtalk-expense-dingtalk-dev
+REIMBURSEMENT_STAGING_DIR=${REIMBURSEMENT_STAGING_DIR:-"$PROJECT_DIR/backend/data/reimbursement-staging"}
+export REIMBURSEMENT_STAGING_DIR
+export REIMBURSEMENT_STAGING_MAX_BYTES=${REIMBURSEMENT_STAGING_MAX_BYTES:-4294967296}
 export EXCEL_TEMPLATE_PATH=app/templates/expense_template.xlsx
 export OCR_ENABLED=true
 export OCR_FAKE_ENABLED=false
@@ -73,7 +76,7 @@ export OCR_DETECTION_MODEL_DIR="$DETECTION_MODEL_DIR"
 export OCR_RECOGNITION_MODEL_DIR="$RECOGNITION_MODEL_DIR"
 export PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=1
 
-mkdir -p data "$TEMP_DIR"
+mkdir -p data "$TEMP_DIR" "$REIMBURSEMENT_STAGING_DIR"
 uv run --frozen --extra dev --extra ocr alembic upgrade head
 exec uv run --frozen --extra dev --extra ocr uvicorn app.main:app \
     --host 127.0.0.1 \

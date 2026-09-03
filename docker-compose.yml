@@ -12,11 +12,17 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/app.db}
       TEMP_DIR: ${TEMP_DIR:-/tmp/expense}
+      # The volume target is intentionally fixed: overriding this inside Compose
+      # would redirect durable files onto the container's read-only root.
+      REIMBURSEMENT_STAGING_DIR: /app/staging
+      REIMBURSEMENT_STAGING_MAX_BYTES: ${REIMBURSEMENT_STAGING_MAX_BYTES:-4294967296}
       EXCEL_TEMPLATE_PATH: ${EXCEL_TEMPLATE_PATH:-/app/app/templates/expense_template.xlsx}
       DINGTALK_CLIENT_ID: ${DINGTALK_CLIENT_ID:-}
       DINGTALK_CLIENT_SECRET: ${DINGTALK_CLIENT_SECRET:-}
       DINGTALK_CORP_ID: ${DINGTALK_CORP_ID:-}
       DINGTALK_AGENT_ID: ${DINGTALK_AGENT_ID:-}
+      DINGTALK_STORAGE_UPLOAD_TIMEOUT_SECONDS: ${DINGTALK_STORAGE_UPLOAD_TIMEOUT_SECONDS:-120}
+      DINGTALK_STORAGE_UPLOAD_HOST_SUFFIXES: ${DINGTALK_STORAGE_UPLOAD_HOST_SUFFIXES:-trans.dingtalk.com}
       SESSION_SECRET: ${SESSION_SECRET:-}
       ADMIN_USER_IDS: ${ADMIN_USER_IDS:-}
       SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME:-expense_session}
@@ -69,6 +75,7 @@ services:
       OCR_RECOGNITION_MODEL_DIR: ${OCR_RECOGNITION_MODEL_DIR:-/opt/expense/models/PP-OCRv6_small_rec}
     volumes:
       - sqlite_data:/app/data
+      - reimbursement_staging:/app/staging
       - ./backend/app/templates/expense_template.xlsx:/app/app/templates/expense_template.xlsx:ro
       # Production OCR models are externally verified deployment inputs and mounted read-only.
       - ${OCR_MODEL_HOST_DIR:-./backend/models}:/opt/expense/models:ro
@@ -134,3 +141,4 @@ services:
 
 volumes:
   sqlite_data:
+  reimbursement_staging:

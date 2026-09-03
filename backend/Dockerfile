@@ -37,9 +37,9 @@ COPY docker-entrypoint.sh ./docker-entrypoint.sh
 RUN groupadd --gid 10001 expense \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin expense \
     && chmod 0755 /app/docker-entrypoint.sh \
-    && mkdir -p /app/data /tmp/expense/.spool /opt/expense/models \
-    && chown expense:expense /app/data /tmp/expense /tmp/expense/.spool \
-    && chmod 0700 /app/data /tmp/expense /tmp/expense/.spool \
+    && mkdir -p /app/data /app/staging /tmp/expense/.spool /opt/expense/models \
+    && chown expense:expense /app/data /tmp/expense /tmp/expense/.spool /app/staging \
+    && chmod 0700 /app/data /app/staging /tmp/expense /tmp/expense/.spool \
     && chmod -R a-w /app/app /app/migrations /app/alembic.ini /app/docker-entrypoint.sh
 
 USER 10001:10001

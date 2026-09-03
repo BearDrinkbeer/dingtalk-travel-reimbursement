@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ipaddress
+import os
 import platform
+import re
 import sys
 from functools import lru_cache
 from pathlib import Path
@@ -23,6 +26,8 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     database_url: str = "sqlite:///./data/app.db"
     temp_dir: Path = Path("/tmp/expense")
+    reimbursement_staging_dir: Path = Path("/app/staging")
+    reimbursement_staging_max_bytes: int = 4 * 1024 * 1024 * 1024
     excel_template_path: Path = Path("app/templates/expense_template.xlsx")
     ocr_mode: Literal["local"] = "local"
 
@@ -71,6 +76,8 @@ class Settings(BaseSettings):
     dingtalk_client_secret: str = ""
     dingtalk_corp_id: str = ""
     dingtalk_agent_id: int | None = None
+    dingtalk_storage_upload_timeout_seconds: float = 120.0
+    dingtalk_storage_upload_host_suffixes: str = "trans.dingtalk.com"
     session_secret: str = ""
     admin_user_ids: str = ""
     session_cookie_name: str = "expense_session"
@@ -98,6 +105,14 @@ class Settings(BaseSettings):
             raise ValueError("V1 DATABASE_URL must use SQLite")
         return value
 
+    @field_validator("reimbursement_staging_dir")
+    @classmethod
+    def normalize_reimbursement_staging_dir(cls, value: Path) -> Path:
+        normalized = Path(os.path.normpath(str(value)))
+        if not normalized.is_absolute() or normalized == Path(normalized.anchor):
+            raise ValueError("REIMBURSEMENT_STAGING_DIR must be an absolute non-root path")
+        return normalized
+
     @field_validator("dingtalk_agent_id", mode="before")
     @classmethod
     def validate_dingtalk_agent_id(cls, value: object) -> int | None:
@@ -117,6 +132,52 @@ class Settings(BaseSettings):
         if agent_id <= 0:
             raise ValueError("DINGTALK_AGENT_ID must be a positive numeric AgentId")
         return agent_id
+
+    @field_validator("dingtalk_storage_upload_timeout_seconds")
+    @classmethod
+    def validate_dingtalk_storage_upload_timeout(cls, value: float) -> float:
+        if not 5 <= value <= 900:
+            raise ValueError("DINGTALK_STORAGE_UPLOAD_TIMEOUT_SECONDS must be between 5 and 900")
+        return value
+
+    @field_validator("dingtalk_storage_upload_host_suffixes")
+    @classmethod
+    def validate_dingtalk_storage_upload_hosts(cls, value: str) -> str:
+        if len(value) > 4096:
+            raise ValueError(
+                "DINGTALK_STORAGE_UPLOAD_HOST_SUFFIXES must contain comma-separated hosts"
+            )
+        host_pattern = re.compile(
+            r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+        )
+        suffixes: list[str] = []
+        for raw_suffix in value.split(","):
+            suffix = raw_suffix.strip().lower().lstrip(".")
+            if (
+                not suffix
+                or len(suffix) > 253
+                or not suffix.isascii()
+                or not host_pattern.fullmatch(suffix)
+            ):
+                raise ValueError(
+                    "DINGTALK_STORAGE_UPLOAD_HOST_SUFFIXES must contain comma-separated hosts"
+                )
+            try:
+                ipaddress.ip_address(suffix)
+            except ValueError:
+                pass
+            else:
+                raise ValueError(
+                    "DINGTALK_STORAGE_UPLOAD_HOST_SUFFIXES must contain comma-separated hosts"
+                )
+            if suffix not in suffixes:
+                suffixes.append(suffix)
+        if not suffixes or len(suffixes) > 20:
+            raise ValueError(
+                "DINGTALK_STORAGE_UPLOAD_HOST_SUFFIXES must contain between 1 and 20 hosts"
+            )
+        return ",".join(suffixes)
 
     @field_validator("session_ttl_minutes")
     @classmethod
@@ -155,6 +216,7 @@ class Settings(BaseSettings):
         "expense_max_items",
         "temp_storage_max_bytes",
         "temp_storage_reserve_bytes",
+        "reimbursement_staging_max_bytes",
         "image_max_pixels",
         "image_max_dimension",
         "pdf_render_dpi",
@@ -256,6 +318,26 @@ class Settings(BaseSettings):
             raise ValueError(
                 "TEMP_STORAGE_MAX_BYTES plus transfer and reserve must stay below the 1 GiB tmpfs"
             )
+        minimum_staging_bytes = self.session_max_bytes + self.upload_max_file_bytes
+        if self.reimbursement_staging_max_bytes < minimum_staging_bytes:
+            raise ValueError(
+                "REIMBURSEMENT_STAGING_MAX_BYTES must cover one session plus generated output"
+            )
+        if self.reimbursement_staging_max_bytes > 1024 * 1024 * 1024 * 1024:
+            raise ValueError("REIMBURSEMENT_STAGING_MAX_BYTES must not exceed 1 TiB")
+        if self.app_env == "production":
+            if not self.temp_dir.is_absolute():
+                raise ValueError("TEMP_DIR must be absolute in production")
+            staging_path = self.reimbursement_staging_dir.resolve(strict=False)
+            temp_path = self.temp_dir.resolve(strict=False)
+            if (
+                staging_path == temp_path
+                or staging_path in temp_path.parents
+                or temp_path in staging_path.parents
+            ):
+                raise ValueError(
+                    "REIMBURSEMENT_STAGING_DIR must be separate from temporary storage"
+                )
         if self.ocr_concurrency != 1:
             raise ValueError("V1 OCR_CONCURRENCY must be exactly 1")
         if self.file_worker_memory_limit_bytes < 256 * 1024 * 1024:
@@ -317,6 +399,14 @@ class Settings(BaseSettings):
             if separator and department_id and name.strip():
                 departments.append((department_id, name.strip()))
         return tuple(departments)
+
+    @property
+    def storage_upload_host_suffixes(self) -> tuple[str, ...]:
+        return tuple(self.dingtalk_storage_upload_host_suffixes.split(","))
+
+    @property
+    def reimbursement_staging_minimum_free_bytes(self) -> int:
+        return self.session_max_bytes + self.upload_max_file_bytes
 
 
 @lru_cache

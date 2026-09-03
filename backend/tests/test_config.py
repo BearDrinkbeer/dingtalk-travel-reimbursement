@@ -50,6 +50,41 @@ def test_global_temp_quota_must_reserve_tmpfs_headroom() -> None:
         Settings(temp_storage_max_bytes=1024 * 1024 * 1024)
 
 
+def test_reimbursement_staging_quota_covers_one_complete_submission() -> None:
+    with pytest.raises(ValidationError, match="REIMBURSEMENT_STAGING_MAX_BYTES"):
+        Settings(
+            session_max_bytes=100 * 1024 * 1024,
+            upload_max_file_bytes=20 * 1024 * 1024,
+            reimbursement_staging_max_bytes=119 * 1024 * 1024,
+        )
+
+    with pytest.raises(ValidationError, match="REIMBURSEMENT_STAGING_DIR"):
+        Settings(reimbursement_staging_dir=Path("/tmp/.."))
+
+
+@pytest.mark.parametrize(
+    ("temp_suffix", "staging_suffix"),
+    [
+        ("runtime", "runtime"),
+        ("runtime", "runtime/reimbursements"),
+        ("runtime/receipts", "runtime"),
+    ],
+)
+def test_production_requires_staging_outside_temporary_storage(
+    settings_factory,
+    tmp_path: Path,
+    temp_suffix: str,
+    staging_suffix: str,
+) -> None:
+    with pytest.raises(ValidationError, match="REIMBURSEMENT_STAGING_DIR"):
+        settings_factory(
+            app_env="production",
+            session_cookie_secure=True,
+            temp_dir=tmp_path / temp_suffix,
+            reimbursement_staging_dir=tmp_path / staging_suffix,
+        )
+
+
 def test_file_and_ocr_workers_have_distinct_memory_limits() -> None:
     settings = Settings()
     assert settings.file_worker_limits["memory_bytes"] == 512 * 1024 * 1024
@@ -113,3 +148,67 @@ def test_agent_id_is_wired_through_deployment_and_development_entrypoints() -> N
     frontend_script = (REPOSITORY_ROOT / "scripts" / "dev-dingtalk-frontend.sh").read_text()
     unset_line = next(line for line in frontend_script.splitlines() if line.startswith("unset "))
     assert "DINGTALK_AGENT_ID" in unset_line
+
+
+def test_storage_upload_boundary_settings_are_normalized_and_bounded() -> None:
+    settings = Settings(
+        dingtalk_storage_upload_timeout_seconds=5,
+        dingtalk_storage_upload_host_suffixes=(
+            " .TRANS.DINGTALK.COM,upload.example.com,trans.dingtalk.com "
+        ),
+    )
+    assert settings.dingtalk_storage_upload_timeout_seconds == 5
+    assert settings.storage_upload_host_suffixes == (
+        "trans.dingtalk.com",
+        "upload.example.com",
+    )
+    assert Settings(dingtalk_storage_upload_timeout_seconds=900)
+
+    for timeout in (4.99, 901):
+        with pytest.raises(ValidationError, match="UPLOAD_TIMEOUT_SECONDS"):
+            Settings(dingtalk_storage_upload_timeout_seconds=timeout)
+    for hosts in ("", "localhost", "127.0.0.1", "*.dingtalk.com", "a" * 4097):
+        with pytest.raises(ValidationError, match="UPLOAD_HOST_SUFFIXES"):
+            Settings(dingtalk_storage_upload_host_suffixes=hosts)
+
+
+def test_storage_upload_settings_are_wired_through_deployment_entrypoints() -> None:
+    required = (
+        "DINGTALK_STORAGE_UPLOAD_TIMEOUT_SECONDS=120",
+        "DINGTALK_STORAGE_UPLOAD_HOST_SUFFIXES=trans.dingtalk.com",
+    )
+    for env_name in (".env.example", ".env.production.example", ".env.dingtalk-dev.example"):
+        content = (REPOSITORY_ROOT / env_name).read_text()
+        for expected in required:
+            assert expected in content
+
+    compose = (REPOSITORY_ROOT / "docker-compose.yml").read_text()
+    assert (
+        "DINGTALK_STORAGE_UPLOAD_TIMEOUT_SECONDS: ${DINGTALK_STORAGE_UPLOAD_TIMEOUT_SECONDS:-120}"
+    ) in compose
+    assert (
+        "DINGTALK_STORAGE_UPLOAD_HOST_SUFFIXES: "
+        "${DINGTALK_STORAGE_UPLOAD_HOST_SUFFIXES:-trans.dingtalk.com}"
+    ) in compose
+
+
+def test_reimbursement_staging_is_wired_to_a_persistent_compose_volume() -> None:
+    for env_name in (".env.example", ".env.production.example", ".env.dingtalk-dev.example"):
+        content = (REPOSITORY_ROOT / env_name).read_text()
+        assert "REIMBURSEMENT_STAGING_DIR=" in content
+        assert "REIMBURSEMENT_STAGING_MAX_BYTES=4294967296" in content
+    for env_name in (".env.example", ".env.production.example"):
+        assert "REIMBURSEMENT_STAGING_DIR=/app/staging" in (REPOSITORY_ROOT / env_name).read_text()
+
+    compose = (REPOSITORY_ROOT / "docker-compose.yml").read_text()
+    assert "REIMBURSEMENT_STAGING_DIR: /app/staging" in compose
+    assert "REIMBURSEMENT_STAGING_DIR: ${" not in compose
+    assert (
+        "REIMBURSEMENT_STAGING_MAX_BYTES: ${REIMBURSEMENT_STAGING_MAX_BYTES:-4294967296}" in compose
+    )
+    assert "- reimbursement_staging:/app/staging" in compose
+    assert "\n  reimbursement_staging:\n" in compose
+    assert (
+        "/app/staging:"
+        not in compose.split("tmpfs:", maxsplit=1)[1].split("healthcheck:", maxsplit=1)[0]
+    )

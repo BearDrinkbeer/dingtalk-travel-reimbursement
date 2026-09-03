@@ -286,7 +286,8 @@ make dev
 ## 存活、就绪与部署边界
 
 - `GET /api/health` 只表示 FastAPI 进程存活，不访问依赖。
-- `GET /api/ready` 以只读方式检查 SQLite 连接、当前 Alembic revision 与关键表字段、Excel 模板完整契约、临时目录可写性，以及
+- `GET /api/ready` 检查 SQLite 连接、当前 Alembic revision 与关键表字段、Excel 模板完整契约、临时目录可写性，以及
+  报销持久暂存目录的受控权限、写入/删除能力和最小可用空间，并检查
   已启用 OCR 的模型精确文件集合、固定 SHA 清单和锁定包版本；返回内容只有组件状态，不包含路径、Secret 或异常细节。模型内容校验按文件 stat 指纹缓存，文件变化才重新计算 SHA；就绪检查不会初始化或加载 Paddle 模型。
 - 模板严格校验结果按文件 stat 指纹缓存在最多 8 个条目的进程内缓存中；模板文件变化会重新
   执行完整 ZIP 与工作簿契约校验，常规 10 秒 readiness 轮询不会重复解析不变的 `.xlsx`。
@@ -323,6 +324,11 @@ Compose 要求显式提供 `APP_ENV`，没有该值会在配置展开阶段失�
 `.env.example` 后得到明确的 `APP_ENV=development`；生产必须显式设置 `APP_ENV=production`，
 随后后端启动校验还会拒绝 Mock、非 Secure Cookie、占位凭据或短 Secret，不能把 Compose
 开发默认误当成生产配置。
+
+Compose 将短期解析文件保留在 `/tmp/expense` 的 tmpfs，同时把报销原始附件和待提交 Excel
+保存在独立的 `reimbursement_staging` named volume（容器内固定为 `/app/staging`）。两者不能
+相同或互相嵌套；不要把持久暂存路径改回 tmpfs。默认逻辑容量上限为 4 GiB，实际总量预留由
+报销状态服务在数据库事务中执行。
 
 ### 最短生产部署路径
 

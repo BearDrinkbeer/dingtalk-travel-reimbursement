@@ -92,6 +92,7 @@ class DingTalkOpenAPIClient:
         *,
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
+        retry_invalid_token: bool = True,
         retry_transient: bool | None = None,
     ) -> dict[str, Any]:
         _validate_path(path)
@@ -111,9 +112,10 @@ class DingTalkOpenAPIClient:
                 error = exc
 
             if error is not None:
-                if error.http_status == 401 and token_attempt == 0:
+                if error.http_status == 401:
                     self.evict_token()
-                    continue
+                    if retry_invalid_token and token_attempt == 0:
+                        continue
                 if error.http_status == 403:
                     raise DingTalkOpenAPIError._permission_denied(
                         http_status=error.http_status,
@@ -161,9 +163,10 @@ class DingTalkOpenAPIClient:
                 error = exc
 
             if error is not None:
-                if error.http_status == 401 and token_attempt == 0:
+                if error.http_status == 401:
                     self.evict_token()
-                    continue
+                    if retry_invalid_token and token_attempt == 0:
+                        continue
                 raise error
 
             error_code = _integer_error_code(payload)

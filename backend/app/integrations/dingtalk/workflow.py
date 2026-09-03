@@ -10,9 +10,127 @@ from app.core.errors import ApiError
 from app.integrations.dingtalk.client import DingTalkOpenAPIClient, DingTalkOpenAPIError
 
 FORM_SCHEMA_PATH = "/v1.0/workflow/forms/schemas/processCodes"
+PROCESS_INSTANCE_IDS_PATH = "/v1.0/workflow/processes/instanceIds/query"
+PROCESS_INSTANCES_PATH = "/v1.0/workflow/processInstances"
 _LAYOUT_CONTAINER_TYPES = frozenset({"FieldGroup"})
 _SUBTABLE_CONTAINER_TYPES = frozenset({"DDTableField", "TableField"})
 _INVALID_PROCESS_CODE_NAMES = frozenset({"formnotexist", "aflowprocesscodeiserror"})
+_CREATE_REJECTED_UPSTREAM_CODES = frozenset(
+    {
+        "formconvertererror",
+        "illegalcomponent",
+        "invalidagentid",
+        "invalidparameter",
+        "needauth",
+        "processcodeerror",
+        "processinstanceinvalidparameter",
+        "processsetupnopermission",
+        "targetselectapprovermissing",
+        "targetselectapproverscopeerror",
+    }
+)
+_SAFE_UPSTREAM_CODE = re.compile(r"[A-Za-z0-9_.:-]{1,256}")
+_PROCESS_CODE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+_PROCESS_INSTANCE_STATUSES = frozenset({"RUNNING", "TERMINATED", "COMPLETED"})
+_SIGNED_INT64_MAX = 9_223_372_036_854_775_807
+_MAX_INSTANCE_QUERY_SPAN_MILLIS = 120 * 24 * 60 * 60 * 1000
+_MAX_PROCESS_CODE_LENGTH = 128
+_MAX_WORKFLOW_IDENTIFIER_LENGTH = 512
+_MAX_FORM_COMPONENT_NAME_LENGTH = 255
+_MAX_FORM_COMPONENT_VALUE_LENGTH = 2 * 1024 * 1024
+
+
+class DingTalkProcessInstanceCreateRejected(ApiError):
+    """A mutation that DingTalk definitively rejected before creating an OA."""
+
+    __slots__ = ("http_status", "upstream_code")
+
+    def __init__(
+        self,
+        *,
+        http_status: int | None,
+        upstream_code: str | None,
+    ) -> None:
+        self.http_status = http_status
+        self.upstream_code = upstream_code
+        super().__init__(
+            "OA_CREATE_REJECTED",
+            "钉钉拒绝发起审批，请检查审批模板、表单内容和发起人权限",
+            502,
+        )
+
+
+class DingTalkProcessInstanceCreateOutcomeUnknown(ApiError):
+    """A mutation may have succeeded and therefore must never be retried blindly."""
+
+    __slots__ = ("http_status", "upstream_code")
+
+    def __init__(
+        self,
+        *,
+        http_status: int | None,
+        upstream_code: str | None,
+    ) -> None:
+        self.http_status = http_status
+        self.upstream_code = upstream_code
+        super().__init__(
+            "OA_CREATE_OUTCOME_UNKNOWN",
+            "审批提交结果正在确认，请勿重复提交",
+            503,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowInstanceIdPage:
+    instance_ids: tuple[str, ...]
+    next_token: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowFormValue:
+    component_id: str | None
+    name: str
+    component_type: str | None
+    value: str | None
+    ext_value: str | None
+    biz_alias: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowProcessInstance:
+    instance_id: str
+    title: str
+    business_id: str
+    originator_user_id: str
+    originator_department_id: str
+    status: str
+    result: str | None
+    created_at: str
+    finished_at: str | None
+    form_values: tuple[WorkflowFormValue, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CreateWorkflowFormValue:
+    name: str
+    value: str
+    component_id: str | None = None
+    component_type: str | None = None
+    biz_alias: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CreateProcessInstanceCommand:
+    process_code: str
+    originator_user_id: str
+    department_id: int
+    microapp_agent_id: int
+    form_values: tuple[CreateWorkflowFormValue, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CreatedProcessInstance:
+    instance_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +246,344 @@ class DingTalkWorkflowClient:
         if _is_invalid_process_code(payload.get("code")):
             raise _process_code_error()
         return normalize_form_schema(process_code, payload)
+
+    async def list_process_instance_ids(
+        self,
+        *,
+        process_code: str,
+        start_time: int,
+        end_time: int,
+        next_token: int,
+        max_results: int,
+        user_ids: tuple[str, ...],
+        statuses: tuple[str, ...],
+    ) -> WorkflowInstanceIdPage:
+        request_body = _instance_id_query_body(
+            process_code=process_code,
+            start_time=start_time,
+            end_time=end_time,
+            next_token=next_token,
+            max_results=max_results,
+            user_ids=user_ids,
+            statuses=statuses,
+        )
+        try:
+            payload = await self._client.request_openapi_json(
+                "POST",
+                PROCESS_INSTANCE_IDS_PATH,
+                json=request_body,
+                # Although this endpoint is POST, it is a read-only cursor
+                # query. Retrying bounded transient failures is safe.
+                retry_transient=True,
+            )
+        except DingTalkOpenAPIError as exc:
+            if _is_invalid_instance_list_process_code(exc.upstream_code):
+                raise _process_code_error() from None
+            raise
+        if _is_invalid_instance_list_process_code(payload.get("code")):
+            raise _process_code_error()
+        return normalize_instance_id_page(payload, requested_next_token=next_token)
+
+    async def get_process_instance(self, process_instance_id: str) -> WorkflowProcessInstance:
+        instance_id = _required_identifier(
+            process_instance_id,
+            field_name="process_instance_id",
+        )
+        payload = await self._client.request_openapi_json(
+            "GET",
+            PROCESS_INSTANCES_PATH,
+            params={"processInstanceId": instance_id},
+        )
+        return normalize_process_instance(instance_id, payload)
+
+    async def create_process_instance(
+        self,
+        command: CreateProcessInstanceCommand,
+    ) -> CreatedProcessInstance:
+        request_body = _create_process_instance_body(command)
+        create_error: ApiError | None = None
+        payload: dict[str, Any] | None = None
+        try:
+            payload = await self._client.request_openapi_json(
+                "POST",
+                PROCESS_INSTANCES_PATH,
+                json=request_body,
+                # This mutation has no idempotency token at the upstream API.
+                # A retry could create a second approval instance.
+                retry_invalid_token=False,
+                retry_transient=False,
+            )
+        except DingTalkOpenAPIError as exc:
+            if exc.http_status == 401 or exc.code == "DINGTALK_PERMISSION_MISSING":
+                create_error = exc
+            elif _is_definitive_create_rejection(
+                http_status=exc.http_status,
+                upstream_code=exc.upstream_code,
+            ):
+                create_error = DingTalkProcessInstanceCreateRejected(
+                    http_status=exc.http_status,
+                    upstream_code=exc.upstream_code,
+                )
+            else:
+                create_error = DingTalkProcessInstanceCreateOutcomeUnknown(
+                    http_status=exc.http_status,
+                    upstream_code=exc.upstream_code,
+                )
+
+        # Raise outside the exception handler so no upstream exception context
+        # is retained by the public error object.
+        if create_error is not None:
+            raise create_error
+        if payload is None:
+            raise DingTalkProcessInstanceCreateOutcomeUnknown(
+                http_status=None,
+                upstream_code=None,
+            )
+        return normalize_created_process_instance(payload)
+
+
+def normalize_instance_id_page(
+    payload: dict[str, Any],
+    *,
+    requested_next_token: int,
+) -> WorkflowInstanceIdPage:
+    if payload.get("success") is not True:
+        raise _instance_list_error()
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        raise _instance_list_error()
+    raw_ids = result.get("list")
+    if not isinstance(raw_ids, list):
+        raise _instance_list_error()
+
+    instance_ids: list[str] = []
+    seen: set[str] = set()
+    try:
+        for raw_id in raw_ids:
+            instance_id = _required_identifier(raw_id, field_name="process_instance_id")
+            if instance_id in seen:
+                raise ValueError
+            seen.add(instance_id)
+            instance_ids.append(instance_id)
+        next_token = _response_next_token(result)
+        if next_token is not None and next_token <= requested_next_token:
+            raise ValueError
+    except ValueError:
+        raise _instance_list_error() from None
+    return WorkflowInstanceIdPage(
+        instance_ids=tuple(instance_ids),
+        next_token=next_token,
+    )
+
+
+def normalize_process_instance(
+    process_instance_id: str,
+    payload: dict[str, Any],
+) -> WorkflowProcessInstance:
+    if not _successful_read_response(payload.get("success")):
+        raise _instance_detail_error()
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        raise _instance_detail_error()
+
+    raw_values = result.get("formComponentValues")
+    if not isinstance(raw_values, list):
+        raise _instance_detail_error()
+    form_values: list[WorkflowFormValue] = []
+    seen_component_ids: set[str] = set()
+    try:
+        for raw_value in raw_values:
+            if not isinstance(raw_value, dict):
+                raise ValueError
+            component_id = _optional_bounded_text(
+                raw_value.get("id"),
+                max_length=_MAX_WORKFLOW_IDENTIFIER_LENGTH,
+            )
+            if component_id is not None:
+                if component_id in seen_component_ids:
+                    raise ValueError
+                seen_component_ids.add(component_id)
+            form_values.append(
+                WorkflowFormValue(
+                    component_id=component_id,
+                    name=_required_bounded_text(
+                        raw_value.get("name"),
+                        max_length=_MAX_FORM_COMPONENT_NAME_LENGTH,
+                    ),
+                    component_type=_optional_bounded_text(
+                        raw_value.get("componentType"),
+                        max_length=128,
+                    ),
+                    value=_optional_form_value(raw_value.get("value")),
+                    ext_value=_optional_form_value(raw_value.get("extValue")),
+                    biz_alias=_optional_bounded_text(
+                        raw_value.get("bizAlias"),
+                        max_length=255,
+                    ),
+                )
+            )
+
+        status = _required_bounded_text(result.get("status"), max_length=64).upper()
+        approval_result = _optional_bounded_text(result.get("result"), max_length=64)
+        return WorkflowProcessInstance(
+            instance_id=_required_identifier(
+                process_instance_id,
+                field_name="process_instance_id",
+            ),
+            title=_required_bounded_text(result.get("title"), max_length=1024),
+            business_id=_required_identifier(
+                result.get("businessId"),
+                field_name="business_id",
+            ),
+            originator_user_id=_required_identifier(
+                result.get("originatorUserId"),
+                field_name="originator_user_id",
+            ),
+            originator_department_id=_required_identifier(
+                result.get("originatorDeptId"),
+                field_name="originator_department_id",
+            ),
+            status=status,
+            result=approval_result.lower() if approval_result is not None else None,
+            created_at=_required_bounded_text(result.get("createTime"), max_length=128),
+            finished_at=_optional_bounded_text(result.get("finishTime"), max_length=128),
+            form_values=tuple(form_values),
+        )
+    except ValueError:
+        raise _instance_detail_error() from None
+
+
+def normalize_created_process_instance(
+    payload: dict[str, Any],
+) -> CreatedProcessInstance:
+    try:
+        instance_id = _required_identifier(
+            payload.get("instanceId"),
+            field_name="process_instance_id",
+        )
+    except ValueError:
+        upstream_code = _safe_payload_code(payload)
+        if _is_known_create_rejection_code(upstream_code):
+            raise DingTalkProcessInstanceCreateRejected(
+                http_status=200,
+                upstream_code=upstream_code,
+            ) from None
+        # A successful mutation response with no usable ID cannot prove that
+        # DingTalk did not create the approval.
+        raise DingTalkProcessInstanceCreateOutcomeUnknown(
+            http_status=200,
+            upstream_code=upstream_code,
+        ) from None
+    return CreatedProcessInstance(instance_id=instance_id)
+
+
+def _instance_id_query_body(
+    *,
+    process_code: str,
+    start_time: int,
+    end_time: int,
+    next_token: int,
+    max_results: int,
+    user_ids: tuple[str, ...],
+    statuses: tuple[str, ...],
+) -> dict[str, object]:
+    normalized_process_code = _required_process_code(process_code)
+    for name, value in (
+        ("start_time", start_time),
+        ("end_time", end_time),
+        ("next_token", next_token),
+        ("max_results", max_results),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be an integer")
+    if start_time < 0 or end_time < start_time:
+        raise ValueError("invalid process instance query time range")
+    if start_time > _SIGNED_INT64_MAX or end_time > _SIGNED_INT64_MAX:
+        raise ValueError("process instance query timestamps exceed signed int64")
+    if end_time - start_time > _MAX_INSTANCE_QUERY_SPAN_MILLIS:
+        raise ValueError("process instance query time range exceeds 120 days")
+    if next_token < 0 or next_token > _SIGNED_INT64_MAX:
+        raise ValueError("next_token must be a non-negative signed int64")
+    if not 1 <= max_results <= 20:
+        raise ValueError("max_results must be between 1 and 20")
+    normalized_user_ids = _identifier_tuple(user_ids, field_name="user_id", maximum=10)
+    normalized_statuses = tuple(
+        item.upper() for item in _identifier_tuple(statuses, field_name="status", maximum=3)
+    )
+    if not set(normalized_statuses) <= _PROCESS_INSTANCE_STATUSES:
+        raise ValueError("statuses contains an unsupported value")
+    return {
+        "processCode": normalized_process_code,
+        "startTime": start_time,
+        "endTime": end_time,
+        "nextToken": next_token,
+        "maxResults": max_results,
+        "userIds": list(normalized_user_ids),
+        "statuses": list(normalized_statuses),
+    }
+
+
+def _create_process_instance_body(
+    command: CreateProcessInstanceCommand,
+) -> dict[str, object]:
+    process_code = _required_process_code(command.process_code)
+    originator_user_id = _required_identifier(
+        command.originator_user_id,
+        field_name="originator_user_id",
+    )
+    if (
+        isinstance(command.department_id, bool)
+        or not isinstance(command.department_id, int)
+        or command.department_id <= 0
+        or command.department_id > _SIGNED_INT64_MAX
+    ):
+        raise ValueError("department_id must be a positive integer")
+    if (
+        isinstance(command.microapp_agent_id, bool)
+        or not isinstance(command.microapp_agent_id, int)
+        or command.microapp_agent_id <= 0
+        or command.microapp_agent_id > _SIGNED_INT64_MAX
+    ):
+        raise ValueError("microapp_agent_id must be a positive integer")
+    if not isinstance(command.form_values, tuple) or not command.form_values:
+        raise ValueError("form_values must be a non-empty tuple")
+
+    values: list[dict[str, str]] = []
+    seen_component_ids: set[str] = set()
+    for item in command.form_values:
+        if not isinstance(item, CreateWorkflowFormValue):
+            raise ValueError("form_values contains an invalid item")
+        name = _required_bounded_text(
+            item.name,
+            max_length=_MAX_FORM_COMPONENT_NAME_LENGTH,
+        )
+        if not isinstance(item.value, str) or len(item.value) > _MAX_FORM_COMPONENT_VALUE_LENGTH:
+            raise ValueError("form component value is invalid")
+        value: dict[str, str] = {"name": name, "value": item.value}
+        component_id = _optional_bounded_text(
+            item.component_id,
+            max_length=_MAX_WORKFLOW_IDENTIFIER_LENGTH,
+        )
+        if component_id is not None:
+            if component_id in seen_component_ids:
+                raise ValueError("form component ids must be unique")
+            seen_component_ids.add(component_id)
+            value["id"] = component_id
+        component_type = _optional_bounded_text(item.component_type, max_length=128)
+        if component_type is not None:
+            value["componentType"] = component_type
+        biz_alias = _optional_bounded_text(item.biz_alias, max_length=255)
+        if biz_alias is not None:
+            value["bizAlias"] = biz_alias
+        values.append(value)
+
+    return {
+        "processCode": process_code,
+        "originatorUserId": originator_user_id,
+        "deptId": command.department_id,
+        "microappAgentId": command.microapp_agent_id,
+        "formComponentValues": values,
+    }
 
 
 def normalize_form_schema(process_code: str, payload: dict[str, Any]) -> FormSchema:
@@ -520,6 +976,114 @@ def _stored_related_template_policy(raw: object) -> RelatedTemplatePolicy | None
     return RelatedTemplatePolicy(mode=mode, process_codes=codes)
 
 
+def _response_next_token(result: dict[str, Any]) -> int | None:
+    if "nextToken" not in result or result["nextToken"] is None:
+        return None
+    raw_token = result["nextToken"]
+    if not isinstance(raw_token, str):
+        raise ValueError
+    token = raw_token.strip()
+    if not token or not token.isascii() or not token.isdecimal():
+        raise ValueError
+    parsed = int(token)
+    if parsed > _SIGNED_INT64_MAX:
+        raise ValueError
+    return parsed
+
+
+def _successful_read_response(value: object) -> bool:
+    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
+
+
+def _identifier_tuple(
+    values: tuple[str, ...],
+    *,
+    field_name: str,
+    maximum: int,
+) -> tuple[str, ...]:
+    if not isinstance(values, tuple) or not values or len(values) > maximum:
+        raise ValueError(f"{field_name}s must be a non-empty bounded tuple")
+    normalized = tuple(_required_identifier(item, field_name=field_name) for item in values)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"{field_name}s must be unique")
+    return normalized
+
+
+def _required_identifier(value: object, *, field_name: str) -> str:
+    try:
+        normalized = _required_bounded_text(
+            value,
+            max_length=_MAX_WORKFLOW_IDENTIFIER_LENGTH,
+        )
+        if any(ord(character) < 32 or ord(character) == 127 for character in normalized):
+            raise ValueError
+        return normalized
+    except ValueError:
+        raise ValueError(f"{field_name} is invalid") from None
+
+
+def _required_process_code(value: object) -> str:
+    process_code = _required_bounded_text(value, max_length=_MAX_PROCESS_CODE_LENGTH)
+    if not _PROCESS_CODE.fullmatch(process_code):
+        raise ValueError("process_code is invalid")
+    return process_code
+
+
+def _required_bounded_text(value: object, *, max_length: int) -> str:
+    normalized = _optional_bounded_text(value, max_length=max_length)
+    if normalized is None:
+        raise ValueError
+    return normalized
+
+
+def _optional_bounded_text(value: object, *, max_length: int) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if len(normalized) > max_length:
+        raise ValueError
+    return normalized
+
+
+def _optional_form_value(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > _MAX_FORM_COMPONENT_VALUE_LENGTH:
+        raise ValueError
+    return value
+
+
+def _is_definitive_create_rejection(
+    *,
+    http_status: int | None,
+    upstream_code: str | None,
+) -> bool:
+    return bool(
+        http_status is not None
+        and 400 <= http_status < 500
+        and http_status not in {401, 403, 408, 425, 429}
+        and _is_known_create_rejection_code(upstream_code)
+    )
+
+
+def _is_known_create_rejection_code(value: object) -> bool:
+    return bool(
+        isinstance(value, str) and value.strip().casefold() in _CREATE_REJECTED_UPSTREAM_CODES
+    )
+
+
+def _safe_payload_code(payload: dict[str, Any]) -> str | None:
+    value = payload.get("code", payload.get("errcode"))
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    normalized = str(value).strip()
+    return normalized if _SAFE_UPSTREAM_CODE.fullmatch(normalized) else None
+
+
 def _required_text(value: object) -> str:
     normalized = _optional_text(value)
     if not normalized:
@@ -541,6 +1105,10 @@ def _is_invalid_process_code(value: object) -> bool:
     return normalized in _INVALID_PROCESS_CODE_NAMES or normalized.startswith("invalidparameter")
 
 
+def _is_invalid_instance_list_process_code(value: object) -> bool:
+    return bool(isinstance(value, str) and value.strip().casefold() == "invalidprocesscode")
+
+
 def _process_code_error() -> ApiError:
     return ApiError(
         "OA_TEMPLATE_PROCESS_CODE_INVALID",
@@ -553,6 +1121,22 @@ def _schema_error() -> ApiError:
     return ApiError(
         "DINGTALK_FORM_SCHEMA_INVALID",
         "钉钉审批模板返回的数据无效，请联系管理员",
+        502,
+    )
+
+
+def _instance_list_error() -> ApiError:
+    return ApiError(
+        "DINGTALK_WORKFLOW_LIST_INVALID",
+        "钉钉返回的审批列表数据无效，请稍后重试",
+        502,
+    )
+
+
+def _instance_detail_error() -> ApiError:
+    return ApiError(
+        "DINGTALK_WORKFLOW_INSTANCE_INVALID",
+        "钉钉返回的审批详情数据无效，请稍后重试",
         502,
     )
 

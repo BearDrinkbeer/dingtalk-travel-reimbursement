@@ -20,6 +20,7 @@ def settings_factory(tmp_path: Path):
             "app_env": "test",
             "database_url": f"sqlite:///{tmp_path / 'phase2.db'}",
             "temp_dir": tmp_path / "receipts",
+            "reimbursement_staging_dir": tmp_path / "reimbursement-staging",
             "excel_template_path": Path(__file__).parents[1]
             / "app"
             / "templates"
@@ -47,12 +48,14 @@ def client_factory(settings_factory):
     def factory(
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        upload_transport: httpx.AsyncBaseTransport | None = None,
         ocr_engine: LocalOcrEngine | None = None,
         **settings_overrides: object,
     ) -> TestClient:
         application = create_app(
             settings_factory(**settings_overrides),
             dingtalk_transport=transport,
+            dingtalk_upload_transport=upload_transport,
             ocr_engine=ocr_engine,
         )
         Base.metadata.create_all(application.state.database_engine)
@@ -65,7 +68,7 @@ def client_factory(settings_factory):
             )
             connection.execute(text("DELETE FROM alembic_version"))
             connection.execute(
-                text("INSERT INTO alembic_version (version_num) VALUES ('20260904_0008')")
+                text("INSERT INTO alembic_version (version_num) VALUES ('20260904_0009')")
             )
         client = TestClient(application)
         client.__enter__()

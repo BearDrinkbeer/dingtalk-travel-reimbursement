@@ -6,12 +6,14 @@ from dataclasses import dataclass
 from functools import lru_cache
 from importlib import metadata
 from pathlib import Path
+from uuid import uuid4
 
 from sqlalchemy import Engine, inspect, text
 
 from app.core.config import Settings
 from app.ocr.model_artifacts import model_directory_ready
 from app.services.excel_generator import load_validated_template
+from app.services.reimbursement_staging import StagingArea
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,7 +22,7 @@ class ReadinessReport:
     checks: dict[str, str]
 
 
-_EXPECTED_ALEMBIC_REVISION = "20260904_0008"
+_EXPECTED_ALEMBIC_REVISION = "20260904_0009"
 _REQUIRED_COLUMNS = {
     "oa_template_profiles": {
         "profile_key",
@@ -62,6 +64,64 @@ _REQUIRED_COLUMNS = {
         "created_at",
         "expires_at",
         "last_seen_at",
+    },
+    "reimbursement_drafts": {
+        "id",
+        "corp_id",
+        "owner_user_id",
+        "status",
+        "revision",
+        "template_process_code",
+        "template_config_version",
+        "schema_fingerprint",
+        "expires_at",
+        "locked_at",
+    },
+    "reimbursement_draft_files": {
+        "id",
+        "draft_id",
+        "processing_role",
+        "file_status",
+        "storage_key",
+        "part_storage_key",
+        "reserved_bytes",
+        "reservation_expires_at",
+        "size_bytes",
+        "sha256",
+        "ocr_status",
+    },
+    "reimbursement_submissions": {
+        "id",
+        "draft_id",
+        "corp_id",
+        "originator_user_id",
+        "idempotency_key_hash",
+        "status",
+        "resume_status",
+        "status_version",
+        "oa_create_started_at",
+        "oa_request_hash",
+        "process_instance_id",
+        "business_id",
+        "approval_url",
+        "submitted_at",
+    },
+    "reimbursement_uploads": {
+        "id",
+        "submission_id",
+        "draft_id",
+        "source_draft_file_id",
+        "role",
+        "local_storage_key",
+        "local_part_storage_key",
+        "local_status",
+        "upload_status",
+        "status_version",
+        "space_id",
+        "file_id",
+        "linked_at",
+        "cleaned_at",
+        "local_deleted_at",
     },
 }
 
@@ -135,6 +195,101 @@ def _temp_storage_ready(temp_dir: Path) -> bool:
     return os.access(temp_dir, os.W_OK | os.X_OK)
 
 
+def _open_directory_no_follow(directory: Path) -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    if no_follow == 0 or not directory.is_absolute():
+        raise OSError("safe directory traversal is unavailable")
+    descriptor = os.open(directory.anchor, os.O_RDONLY | directory_flag | no_follow)
+    try:
+        for component in directory.parts[1:]:
+            next_descriptor = os.open(
+                component,
+                os.O_RDONLY | directory_flag | no_follow,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _reimbursement_staging_ready(settings: Settings) -> bool:
+    root_descriptor: int | None = None
+    probe_descriptor: int | None = None
+    probe_name = f".readiness-{uuid4().hex}.probe"
+    probe_created = False
+    try:
+        root_descriptor = _open_directory_no_follow(settings.reimbursement_staging_dir)
+        root_stat = os.fstat(root_descriptor)
+        effective_user_id = getattr(os, "geteuid", lambda: root_stat.st_uid)()
+        if (
+            not stat.S_ISDIR(root_stat.st_mode)
+            or root_stat.st_uid != effective_user_id
+            or stat.S_IMODE(root_stat.st_mode) != 0o700
+        ):
+            return False
+
+        area_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        for area in StagingArea:
+            area_descriptor = os.open(area.value, area_flags, dir_fd=root_descriptor)
+            try:
+                area_stat = os.fstat(area_descriptor)
+                if (
+                    not stat.S_ISDIR(area_stat.st_mode)
+                    or area_stat.st_uid != effective_user_id
+                    or stat.S_IMODE(area_stat.st_mode) != 0o700
+                ):
+                    return False
+            finally:
+                os.close(area_descriptor)
+
+        probe_descriptor = os.open(
+            probe_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=root_descriptor,
+        )
+        probe_created = True
+        if os.write(probe_descriptor, b"ready") != 5:
+            return False
+        os.fsync(probe_descriptor)
+        os.close(probe_descriptor)
+        probe_descriptor = None
+        os.unlink(probe_name, dir_fd=root_descriptor)
+        probe_created = False
+        os.fsync(root_descriptor)
+
+        filesystem = os.fstatvfs(root_descriptor)
+        available_bytes = filesystem.f_bavail * filesystem.f_frsize
+        minimum_bytes = settings.reimbursement_staging_minimum_free_bytes
+        return (
+            settings.reimbursement_staging_max_bytes >= minimum_bytes
+            and available_bytes >= minimum_bytes
+        )
+    except OSError:
+        return False
+    finally:
+        if probe_descriptor is not None:
+            try:
+                os.close(probe_descriptor)
+            except OSError:
+                pass
+        if probe_created and root_descriptor is not None:
+            try:
+                os.unlink(probe_name, dir_fd=root_descriptor)
+                os.fsync(root_descriptor)
+            except OSError:
+                pass
+        if root_descriptor is not None:
+            try:
+                os.close(root_descriptor)
+            except OSError:
+                pass
+
+
 def _ocr_readiness(settings: Settings) -> tuple[bool, str]:
     # Local OCR is enabled by default and participates in readiness. An explicit
     # disable remains available only for diagnosis and focused tests.
@@ -179,16 +334,18 @@ def check_readiness(settings: Settings, engine: Engine) -> ReadinessReport:
     database_ok = _database_ready(engine)
     template_ok = _template_ready(settings.excel_template_path)
     temp_ok = _temp_storage_ready(settings.temp_dir)
+    staging_ok = _reimbursement_staging_ready(settings)
     ocr_ok, ocr_status = _ocr_readiness(settings)
     dingtalk_ok, dingtalk_status = _dingtalk_configuration_readiness(settings)
     checks = {
         "database": "ok" if database_ok else "not_ready",
         "excelTemplate": "ok" if template_ok else "not_ready",
         "tempStorage": "ok" if temp_ok else "not_ready",
+        "reimbursementStaging": "ok" if staging_ok else "not_ready",
         "ocr": ocr_status,
         "dingtalkConfiguration": dingtalk_status,
     }
     return ReadinessReport(
-        ready=database_ok and template_ok and temp_ok and ocr_ok and dingtalk_ok,
+        ready=database_ok and template_ok and temp_ok and staging_ok and ocr_ok and dingtalk_ok,
         checks=checks,
     )

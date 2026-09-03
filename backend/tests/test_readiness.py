@@ -3,12 +3,37 @@ from __future__ import annotations
 from pathlib import Path
 from shutil import copyfile
 
+import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import inspect as sqlalchemy_inspect
 from sqlalchemy import text
 
 from app.database.session import create_database_engine
 from app.main import create_app
 from app.services import readiness
+from app.services.reimbursement_staging import ReimbursementStaging
+
+
+class _SchemaWithout:
+    def __init__(
+        self,
+        delegate,
+        *,
+        table_name: str | None = None,
+        column: tuple[str, str] | None = None,
+    ) -> None:
+        self._delegate = delegate
+        self._table_name = table_name
+        self._column = column
+
+    def get_table_names(self):
+        return [table for table in self._delegate.get_table_names() if table != self._table_name]
+
+    def get_columns(self, table_name: str):
+        columns = self._delegate.get_columns(table_name)
+        if self._column is None or self._column[0] != table_name:
+            return columns
+        return [column for column in columns if column["name"] != self._column[1]]
 
 
 def test_ready_reports_required_components_without_paths(client_factory) -> None:
@@ -25,6 +50,7 @@ def test_ready_reports_required_components_without_paths(client_factory) -> None
                 "database": "ok",
                 "excelTemplate": "ok",
                 "tempStorage": "ok",
+                "reimbursementStaging": "ok",
                 "ocr": "disabled",
                 "dingtalkConfiguration": "configured",
             },
@@ -67,6 +93,67 @@ def test_ready_rejects_database_without_union_id_column(client_factory) -> None:
     client = client_factory()
     with client.app.state.database_engine.begin() as connection:
         connection.execute(text("ALTER TABLE sessions DROP COLUMN dingtalk_union_id"))
+
+    response = client.get("/api/ready")
+
+    assert response.status_code == 503
+    assert response.json()["data"]["checks"]["database"] == "not_ready"
+
+
+@pytest.mark.parametrize(
+    "missing_table",
+    [
+        "reimbursement_drafts",
+        "reimbursement_draft_files",
+        "reimbursement_submissions",
+        "reimbursement_uploads",
+    ],
+)
+def test_ready_rejects_a_missing_reimbursement_table(
+    client_factory,
+    monkeypatch,
+    missing_table: str,
+) -> None:
+    client = client_factory()
+    monkeypatch.setattr(
+        readiness,
+        "inspect",
+        lambda connection: _SchemaWithout(
+            sqlalchemy_inspect(connection),
+            table_name=missing_table,
+        ),
+    )
+
+    response = client.get("/api/ready")
+
+    assert response.status_code == 503
+    assert response.json()["data"]["checks"]["database"] == "not_ready"
+
+
+@pytest.mark.parametrize(
+    ("table_name", "missing_column"),
+    [
+        ("reimbursement_drafts", "owner_user_id"),
+        ("reimbursement_draft_files", "file_status"),
+        ("reimbursement_submissions", "process_instance_id"),
+        ("reimbursement_uploads", "file_id"),
+    ],
+)
+def test_ready_rejects_a_missing_critical_reimbursement_column(
+    client_factory,
+    monkeypatch,
+    table_name: str,
+    missing_column: str,
+) -> None:
+    client = client_factory()
+    monkeypatch.setattr(
+        readiness,
+        "inspect",
+        lambda connection: _SchemaWithout(
+            sqlalchemy_inspect(connection),
+            column=(table_name, missing_column),
+        ),
+    )
 
     response = client.get("/api/ready")
 
@@ -161,6 +248,138 @@ def test_temp_storage_check_rejects_symlink(settings_factory, tmp_path: Path) ->
 
     assert report.ready is False
     assert report.checks["tempStorage"] == "not_ready"
+
+
+def test_reimbursement_staging_check_rejects_symlink(
+    settings_factory,
+    tmp_path: Path,
+) -> None:
+    real_directory = tmp_path / "real-staging"
+    real_directory.mkdir(mode=0o700)
+    linked_directory = tmp_path / "linked-staging"
+    linked_directory.symlink_to(real_directory, target_is_directory=True)
+    settings = settings_factory(reimbursement_staging_dir=linked_directory)
+
+    engine = create_database_engine(settings.database_url)
+    try:
+        report = readiness.check_readiness(settings, engine)
+    finally:
+        engine.dispose()
+
+    assert report.ready is False
+    assert report.checks["reimbursementStaging"] == "not_ready"
+
+
+def test_reimbursement_staging_check_rejects_read_only_directory(
+    settings_factory,
+    tmp_path: Path,
+) -> None:
+    staging = tmp_path / "read-only-staging"
+    staging.mkdir(mode=0o700)
+    staging.chmod(0o500)
+    settings = settings_factory(reimbursement_staging_dir=staging)
+
+    engine = create_database_engine(settings.database_url)
+    try:
+        report = readiness.check_readiness(settings, engine)
+    finally:
+        staging.chmod(0o700)
+        engine.dispose()
+
+    assert report.ready is False
+    assert report.checks["reimbursementStaging"] == "not_ready"
+
+
+@pytest.mark.parametrize(
+    ("available_delta", "expected_status"),
+    [(-1, "not_ready"), (0, "ok")],
+)
+def test_reimbursement_staging_check_enforces_minimum_free_space_boundary(
+    settings_factory,
+    tmp_path: Path,
+    monkeypatch,
+    available_delta: int,
+    expected_status: str,
+) -> None:
+    staging = tmp_path / "small-staging"
+    settings = settings_factory(reimbursement_staging_dir=staging)
+    ReimbursementStaging(
+        staging,
+        max_object_bytes=settings.upload_max_file_bytes,
+    ).prepare()
+
+    minimum_bytes = settings.reimbursement_staging_minimum_free_bytes
+
+    class LimitedFreeSpace:
+        f_bavail = minimum_bytes + available_delta
+        f_frsize = 1
+
+    monkeypatch.setattr(readiness.os, "fstatvfs", lambda _descriptor: LimitedFreeSpace())
+    engine = create_database_engine(settings.database_url)
+    try:
+        report = readiness.check_readiness(settings, engine)
+    finally:
+        engine.dispose()
+
+    assert report.checks["reimbursementStaging"] == expected_status
+
+
+def test_reimbursement_staging_readiness_probe_leaves_no_file(
+    settings_factory,
+    tmp_path: Path,
+) -> None:
+    staging = tmp_path / "probed-staging"
+    settings = settings_factory(reimbursement_staging_dir=staging)
+    ReimbursementStaging(
+        staging,
+        max_object_bytes=settings.upload_max_file_bytes,
+    ).prepare()
+
+    engine = create_database_engine(settings.database_url)
+    try:
+        report = readiness.check_readiness(settings, engine)
+    finally:
+        engine.dispose()
+
+    assert report.checks["reimbursementStaging"] == "ok"
+    assert {path.name for path in staging.iterdir()} == {"drafts", "generated"}
+    assert all(not any(area.iterdir()) for area in staging.iterdir())
+
+
+def test_ready_fails_closed_without_leaking_unwritable_staging_path(client_factory) -> None:
+    client = client_factory()
+    staging = client.app.state.reimbursement_staging.root
+    staging.chmod(0o500)
+    try:
+        response = client.get("/api/ready")
+    finally:
+        staging.chmod(0o700)
+
+    assert response.status_code == 503
+    assert response.json()["data"]["checks"]["reimbursementStaging"] == "not_ready"
+    assert str(staging) not in response.text
+
+
+def test_ready_rejects_unsafe_reimbursement_staging_area(
+    client_factory,
+    tmp_path: Path,
+) -> None:
+    client = client_factory()
+    staging = client.app.state.reimbursement_staging.root
+    drafts = staging / "drafts"
+    outside = tmp_path / "outside-staging-area"
+    outside.mkdir(mode=0o700)
+    drafts.rmdir()
+    drafts.symlink_to(outside, target_is_directory=True)
+    try:
+        response = client.get("/api/ready")
+    finally:
+        drafts.unlink()
+        drafts.mkdir(mode=0o700)
+
+    assert response.status_code == 503
+    assert response.json()["data"]["checks"]["reimbursementStaging"] == "not_ready"
+    assert str(outside) not in response.text
 
 
 def test_database_check_rejects_missing_migration_revision(client_factory) -> None:
