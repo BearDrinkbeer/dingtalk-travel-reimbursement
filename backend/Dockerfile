@@ -5,6 +5,7 @@ FROM python:3.13.15-slim-trixie AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=1 \
+    PADDLE_PDX_CACHE_HOME=/tmp/expense/.paddlex \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     TMPDIR=/tmp/expense/.spool \
@@ -13,6 +14,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY --from=uv /uv /usr/local/bin/uv
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --yes \
+        libgl1 \
+        libglib2.0-0t64 \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml uv.lock ./
 ARG INSTALL_OCR=true
 RUN if [ "$INSTALL_OCR" = "true" ]; then \

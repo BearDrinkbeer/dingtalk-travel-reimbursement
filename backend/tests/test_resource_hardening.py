@@ -172,7 +172,7 @@ async def test_fresh_process_isolates_ocr_then_file_worker_profiles(settings_fac
     assert ocr["profile"] == "ocr"
     assert file_validation["profile"] == "file"
     assert ocr["pid"] != file_validation["pid"]
-    assert ocr["requestedMemory"] == 2 * 1024 * 1024 * 1024
+    assert ocr["requestedMemory"] == 5 * 1024 * 1024 * 1024
     assert file_validation["requestedMemory"] == 512 * 1024 * 1024
     if sys.platform == "linux":
         assert ocr["addressSpaceSoft"] == ocr["requestedMemory"]

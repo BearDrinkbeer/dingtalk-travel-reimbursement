@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     process_job_admission_wait_seconds: float = 1.0
     logout_file_wait_seconds: float = 130.0
     file_worker_memory_limit_bytes: int = 512 * 1024 * 1024
-    ocr_worker_memory_limit_bytes: int = 2 * 1024 * 1024 * 1024
+    ocr_worker_memory_limit_bytes: int = 5 * 1024 * 1024 * 1024
     worker_file_size_limit_bytes: int = 64 * 1024 * 1024
     worker_open_files_limit: int = 128
     worker_cpu_seconds: int = 180

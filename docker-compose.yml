@@ -2,7 +2,7 @@ name: dingtalk-expense
 
 services:
   backend:
-    platform: ${BACKEND_PLATFORM:-linux/amd64}
+    platform: ${TARGET_PLATFORM:-linux/amd64}
     build:
       context: ./backend
       args:
@@ -52,7 +52,7 @@ services:
       PROCESS_JOB_ADMISSION_WAIT_SECONDS: ${PROCESS_JOB_ADMISSION_WAIT_SECONDS:-1}
       LOGOUT_FILE_WAIT_SECONDS: ${LOGOUT_FILE_WAIT_SECONDS:-130}
       FILE_WORKER_MEMORY_LIMIT_BYTES: ${FILE_WORKER_MEMORY_LIMIT_BYTES:-536870912}
-      OCR_WORKER_MEMORY_LIMIT_BYTES: ${OCR_WORKER_MEMORY_LIMIT_BYTES:-2147483648}
+      OCR_WORKER_MEMORY_LIMIT_BYTES: ${OCR_WORKER_MEMORY_LIMIT_BYTES:-5368709120}
       WORKER_FILE_SIZE_LIMIT_BYTES: ${WORKER_FILE_SIZE_LIMIT_BYTES:-67108864}
       WORKER_OPEN_FILES_LIMIT: ${WORKER_OPEN_FILES_LIMIT:-128}
       WORKER_CPU_SECONDS: ${WORKER_CPU_SECONDS:-180}
@@ -63,6 +63,7 @@ services:
       OCR_CPU_THREADS: ${OCR_CPU_THREADS:-4}
       OCR_ENGINE: paddle_static
       PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "1"
+      PADDLE_PDX_CACHE_HOME: /tmp/expense/.paddlex
       OCR_DETECTION_MODEL_DIR: ${OCR_DETECTION_MODEL_DIR:-/opt/expense/models/PP-OCRv6_small_det}
       OCR_RECOGNITION_MODEL_DIR: ${OCR_RECOGNITION_MODEL_DIR:-/opt/expense/models/PP-OCRv6_small_rec}
     volumes:
@@ -93,6 +94,7 @@ services:
     restart: unless-stopped
 
   web:
+    platform: ${TARGET_PLATFORM:-linux/amd64}
     build:
       context: ./frontend
     depends_on:

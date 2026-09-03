@@ -62,10 +62,14 @@ class PaddleLocalOcrEngine:
                 raise OcrRuntimeError("本地 OCR 运行依赖无法加载") from exc
             try:
                 self._pipeline = PaddleOCR(
-                    lang="ch",
                     device="cpu",
                     engine=self._settings.ocr_engine,
                     cpu_threads=self._settings.ocr_cpu_threads,
+                    # PaddleOCR/PaddleX enables oneDNN on x86 CPUs by default.
+                    # PP-OCRv6 static models currently hit an unsupported PIR
+                    # attribute conversion in that execution path, while the
+                    # regular Paddle CPU path supports the same models.
+                    enable_mkldnn=False,
                     text_detection_model_name="PP-OCRv6_small_det",
                     text_detection_model_dir=str(detection),
                     text_recognition_model_name="PP-OCRv6_small_rec",

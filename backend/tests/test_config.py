@@ -51,7 +51,7 @@ def test_global_temp_quota_must_reserve_tmpfs_headroom() -> None:
 def test_file_and_ocr_workers_have_distinct_memory_limits() -> None:
     settings = Settings()
     assert settings.file_worker_limits["memory_bytes"] == 512 * 1024 * 1024
-    assert settings.ocr_worker_limits["memory_bytes"] == 2 * 1024 * 1024 * 1024
+    assert settings.ocr_worker_limits["memory_bytes"] == 5 * 1024 * 1024 * 1024
 
 
 def test_production_ocr_requires_linux_limits(

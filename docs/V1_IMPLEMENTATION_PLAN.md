@@ -351,7 +351,7 @@ interface TripInput {
   -> 用户确认
 ```
 
-OCR 是 CPU 密集同步工作，不直接放在 `async def` 事件循环中。V1 用标准库 `multiprocessing` 为每个图片验证、PDF 处理或 OCR 任务创建一个全新的 `spawn` 子进程，全局准入容量固定为 1 且不建立应用队列。每任务独立进程避免已加载 Paddle 的 2 GiB OCR 地址空间被后续 512 MiB 文件验证复用；V1 接受模型不跨请求缓存的启动成本。超时或取消会终止并回收该进程，完成后才释放准入令牌。
+OCR 是 CPU 密集同步工作，不直接放在 `async def` 事件循环中。V1 用标准库 `multiprocessing` 为每个图片验证、PDF 处理或 OCR 任务创建一个全新的 `spawn` 子进程，全局准入容量固定为 1 且不建立应用队列。每任务独立进程避免已加载 Paddle 的 5 GiB OCR 地址空间被后续 512 MiB 文件验证复用；V1 接受模型不跨请求缓存的启动成本。超时或取消会终止并回收该进程，完成后才释放准入令牌。
 
 ### 7.4 前端票据交互
 
@@ -519,8 +519,10 @@ dingtalk-expense/
 │   ├── src/
 │   │   ├── api/
 │   │   ├── components/
+│   │   │   ├── reimbursement/   # 补助、费用明细与 Excel 下载业务组件
+│   │   │   └── settings/        # 分类关键词与补助标准管理组件
 │   │   ├── router/
-│   │   ├── stores/
+│   │   ├── stores/              # Session、项目和当前报销单内存状态
 │   │   ├── types/
 │   │   ├── utils/
 │   │   └── views/
@@ -531,48 +533,24 @@ dingtalk-expense/
 │   └── vite.config.ts
 ├── backend/
 │   ├── app/
-│   │   ├── api/
-│   │   │   ├── auth.py
-│   │   │   ├── files.py
-│   │   │   ├── projects.py
-│   │   │   ├── receipts.py
-│   │   │   ├── excel.py
-│   │   │   └── settings.py
-│   │   ├── core/
-│   │   │   ├── config.py
-│   │   │   ├── errors.py
-│   │   │   ├── security.py
-│   │   │   └── logging.py
+│   │   ├── api/                 # 薄 HTTP 路由与鉴权依赖
+│   │   ├── core/                # 配置、错误、日志与安全基础设施
 │   │   ├── database/
+│   │   ├── domain/              # 金额、补助和费用汇总纯业务规则
+│   │   ├── excel/               # 公司模板契约和坐标映射
 │   │   ├── models/
+│   │   ├── ocr/                 # 本地 OCR、PDF/二维码证据和 Parser
 │   │   ├── schemas/
-│   │   ├── parsers/
-│   │   │   ├── base.py
-│   │   │   ├── rail_ticket.py
-│   │   │   ├── passenger_transport_invoice.py
-│   │   │   └── generic_invoice.py
-│   │   ├── services/
-│   │   │   ├── dingtalk.py
-│   │   │   ├── session.py
-│   │   │   ├── temp_files.py
-│   │   │   ├── pdf_text.py
-│   │   │   ├── ocr.py
-│   │   │   ├── recognition.py
-│   │   │   ├── subsidy.py
-│   │   │   └── excel.py
+│   │   ├── services/            # 钉钉、Session、临时文件、OCR 与 Excel 用例
 │   │   ├── templates/
 │   │   │   └── expense_template.xlsx
-│   │   ├── utils/
-│   │   │   ├── dates.py
-│   │   │   ├── money.py
-│   │   │   └── filenames.py
 │   │   └── main.py
 │   ├── migrations/
+│   ├── models/                  # 不入库的本地 OCR 模型目录
 │   ├── tests/
-│   │   ├── fixtures/
-│   │   ├── unit/
-│   │   └── integration/
 │   └── pyproject.toml
+├── scripts/
+│   └── research/                # 不进入生产运行链路的一次性评测脚本
 ├── nginx/
 ├── docs/
 ├── docker-compose.yml
@@ -739,7 +717,7 @@ dingtalk-expense/
 - Session 隔离的随机路径、仅供内部生命周期使用的删除 API、启动清理和周期清理。
 - 前端逐文件状态和重试入口，不向员工暴露服务器文件删除操作。
 - Nginx 上传限制和超时与后端一致。
-- 图片/PDF 解码只在可终止进程中运行；页面内容流数量与 XObject 数量使用独立限额，并限制每页 PDF 解压后内容总字节；为文件处理与 OCR 分别设置 512 MiB / 2 GiB 默认内存上限。
+- 图片/PDF 解码只在可终止进程中运行；页面内容流数量与 XObject 数量使用独立限额，并限制每页 PDF 解压后内容总字节；为文件处理与 OCR 分别设置 512 MiB / 5 GiB 默认地址空间上限，并由容器单独限制实际内存。
 - 上传、Session 文件操作和本地处理准入均为 asyncio 有界等待，超时返回 `UPLOAD_BUSY`、`FILE_OPERATION_BUSY` 或 `OCR_BUSY`，不建立队列。
 - 请求取消后必须等工作进程确认终止再释放准入，同步关闭 spool 并删除 `.part`/最终文件；退出等待上限覆盖 OCR 超时和清理宽限。
 - 生产启用 OCR 必须使用 Linux 进程限额，不提供绕过开关。Compose 必须同时设置容器内存和 PID 上限。macOS arm64 仅允许通过默认的 `dev-backend` 命令、本地 CPU 和预置模型做开发 smoke，不能作为生产部署路径。

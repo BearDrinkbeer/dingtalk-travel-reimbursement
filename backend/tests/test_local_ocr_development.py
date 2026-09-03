@@ -144,10 +144,13 @@ def test_normal_install_and_compose_enable_local_ocr_by_default() -> None:
     backend_install = makefile.split("backend-install:", maxsplit=1)[1].split("\n\n", maxsplit=1)[0]
     assert "--extra dev --extra ocr" in backend_install
     assert "ARG INSTALL_OCR=true" in dockerfile
+    assert all(package in dockerfile for package in ("libgl1", "libglib2.0-0t64", "libgomp1"))
+    assert "PADDLE_PDX_CACHE_HOME=/tmp/expense/.paddlex" in dockerfile
     assert "INSTALL_OCR: ${INSTALL_OCR:-true}" in compose
-    assert "platform: ${BACKEND_PLATFORM:-linux/amd64}" in compose
+    assert compose.count("platform: ${TARGET_PLATFORM:-linux/amd64}") == 2
     assert "OCR_ENABLED: ${OCR_ENABLED:-true}" in compose
     assert 'PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "1"' in compose
+    assert "PADDLE_PDX_CACHE_HOME: /tmp/expense/.paddlex" in compose
     assert (
         "OCR_DETECTION_MODEL_DIR: "
         "${OCR_DETECTION_MODEL_DIR:-/opt/expense/models/PP-OCRv6_small_det}"
@@ -158,4 +161,4 @@ def test_normal_install_and_compose_enable_local_ocr_by_default() -> None:
     ) in compose
     assert "OCR_ENABLED=true" in example_env
     assert "INSTALL_OCR=true" in example_env
-    assert "BACKEND_PLATFORM=linux/amd64" in example_env
+    assert "TARGET_PLATFORM=linux/amd64" in example_env

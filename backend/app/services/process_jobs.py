@@ -195,7 +195,7 @@ class KillableProcessRunner:
     """Admit one local job and execute it in a fresh, killable process.
 
     There is no business queue in V1. Callers get a short bounded admission
-    wait. Every admitted job receives a new process, preventing the 2 GiB OCR
+    wait. Every admitted job receives a new process, preventing the 5 GiB OCR
     profile (and its retained model state) from crossing into the 512 MiB
     image/PDF validation profile.
     """

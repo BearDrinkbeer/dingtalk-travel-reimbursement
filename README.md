@@ -186,7 +186,7 @@ PC 钉钉本机调试时，不配置 `DINGTALK_DEV_PUBLIC_HOST`，保持
 
 - `POST /api/files/upload` 使用 multipart 字段 `files[]`，要求 Session、已选择部门和 CSRF。每个请求必须且只能携带一个文件；前端多选后按选择顺序逐个请求，一张失败仍继续处理下一张。后端先取得全局准入和 Session 上传租约，再流式解析正文；普通字段必须为 0，单文件最多 20 MiB，请求体上限 25 MiB（含 multipart 余量）。`Content-Length` 只用于提前拒绝，流式计数才是权威限制。Session 默认最多保留 200 个文件、合计 100 MiB；数量是可配置的技术保护值，实际更常先受总容量约束。
 - Nginx 的 `client_max_body_size` 设为 25 MiB，只为一个 20 MiB 文件的 multipart 边界和请求头预留余量；200 个文件/100 MiB 是跨请求的两个独立 Session 保留额度，不是单次请求额度。
-- 文件扩展名、magic bytes 和实际解析结果必须一致。Pillow 图片解码、PDF 预检/文本提取和 OCR 每次都在全新的标准库 `spawn` 工作进程中执行；进程准入容量为 1，仅有有界等待，不建立业务队列。每任务新进程确保 2 GiB OCR 配置不会被后续 512 MiB 图片/PDF 验证复用；代价是 V1 不跨 OCR 请求缓存模型。文件验证超时或资源终止返回稳定的 `IMAGE_VALIDATION_TIMEOUT` / `PDF_VALIDATION_TIMEOUT` / `PROCESS_RESOURCE_LIMIT`；OCR 对应返回 `OCR_BUSY` / `OCR_TIMEOUT` / `OCR_FAILED`。取消请求时，准入令牌会一直保留到该子进程终止并回收，然后同步关闭 spool 并删除 `.part`/最终文件。PDF 资源检查递归覆盖 Form XObject 及图片遮罩，并分别限制页面内容流数量（默认 512）和 XObject 总数（默认 100），同时限制嵌套深度、MediaBox/渲染像素、全部内嵌图片累计像素和每页解压后内容流字节数。HEIC、汇总 PDF、多页拆分和行程单均不支持。
+- 文件扩展名、magic bytes 和实际解析结果必须一致。Pillow 图片解码、PDF 预检/文本提取和 OCR 每次都在全新的标准库 `spawn` 工作进程中执行；进程准入容量为 1，仅有有界等待，不建立业务队列。每任务新进程确保 5 GiB OCR 地址空间配置不会被后续 512 MiB 图片/PDF 验证复用；代价是 V1 不跨 OCR 请求缓存模型。文件验证超时或资源终止返回稳定的 `IMAGE_VALIDATION_TIMEOUT` / `PDF_VALIDATION_TIMEOUT` / `PROCESS_RESOURCE_LIMIT`；OCR 对应返回 `OCR_BUSY` / `OCR_TIMEOUT` / `OCR_FAILED`。取消请求时，准入令牌会一直保留到该子进程终止并回收，然后同步关闭 spool 并删除 `.part`/最终文件。PDF 资源检查递归覆盖 Form XObject 及图片遮罩，并分别限制页面内容流数量（默认 512）和 XObject 总数（默认 100），同时限制嵌套深度、MediaBox/渲染像素、全部内嵌图片累计像素和每页解压后内容流字节数。HEIC、汇总 PDF、多页拆分和行程单均不支持。
 - 磁盘路径只使用服务端 Session 哈希与随机 UUID；前端只看到不透明 `tempId` 和原始显示名，不返回真实路径。员工页面不暴露服务器文件概念；删除 OCR 费用行时由应用调用 `DELETE /api/files/{tempId}` 同步清理关联文件，登出也会清理 Session 目录。
 - 上传文件超过 30 分钟未使用后进入清理范围；服务启动时先清理、运行期每 10 分钟扫描，因此通常会在未使用约 30～40 分钟内删除。实现不跟随符号链接，不建立票据数据库清单，不写 OCR 原文或 sidecar。
 - `POST /api/ocr` 每次只接收一个 `fileId`（兼容请求体形式为 `fileIds: [id]`）和可选 `tripYear`。一个独立文件只产生一个结果；前端逐文件串行调用，并直接将结果写入与该文件关联的可编辑 `ExpenseItem`。金额使用两位十进制字符串；用户明确点击“重新识别”时更新同一条明细，不生成重复行。
@@ -194,13 +194,13 @@ PC 钉钉本机调试时，不配置 `DINGTALK_DEV_PUBLIC_HOST`，保持
 - 普通发票金额依次优先使用票面数字“价税合计”、大写“价税合计”、或明确的“合计 + 税额”；单独的未税“合计”不会被当成最终报销额。旧版增值税发票二维码只作为补充证据。二维码金额与票面总额一致，或“二维码金额 + 税额 = 票面价税合计”时可提高可靠性；冲突时保留票面总额并提示人工核对；票面缺少金额而只从二维码取得候选时也必须提示核对。二维码中的开票日期不覆盖火车票乘车日期或旅客运输发生日期。动态二维码和未知格式会被安全忽略，不上传、不访问二维码链接、不记录原始载荷。
 - 管理员在“系统设置 → 票据分类关键词”按费用类别分组维护全部分类词；该区域显示在每日补助设置之前。设置页与报销页共用 `GET /api/expense-categories` 返回的后端类别契约：系统生成的“出差补助”不显示，“其他”显示为自动兜底且不能添加关键词。关键词按 OCR/PDF 文本的字面子串匹配，至少 2 个字符；所有词始终生效，均可新增、修改、移动类别或删除，不区分来源或启停状态，最多 500 条。不同费用类别同时命中时保留为“其他”；旅客运输发票只在票面“交通工具类型”或明确客运税目中匹配类别，不用起终点、酒店或公司名称作分类证据。火车票等专用票据仍结合版式结构识别，不会只因删除分类词而失去基础识别能力。`GET/POST/PUT/DELETE /api/admin/receipt-keywords` 均由后端管理员权限保护，写操作同时校验 CSRF。
 - 本地 OCR 依赖精确锁定为 PaddleOCR 3.7.0、PaddlePaddle 3.3.1、OpenCV 4.10.0.84 和 pypdfium2 5.13.0；后两项用于本地二维码识别和单页 PDF 渲染。开发安装和正式镜像均默认包含 OCR。Linux/amd64 是正式部署路径并要求 AVX CPU；macOS/arm64 仅作为本机 CPU 开发测试路径。模型二进制不入库，必须先在受控流程中校验来源、许可证与 SHA-256，再只读挂载 `PP-OCRv6_small_det` 和 `PP-OCRv6_small_rec`。运行时不会下载模型或回退云服务。
-- 2026-09-01 已在当前 Apple Silicon Mac 用固定 SHA 清单中的两份官方模型完成本地 CPU 运行时检查和两张独立票据 smoke；模型二进制由 `.gitignore` 排除，因此其他检出仍须按清单自行预置。Linux/amd64 生产机、资源上限和断网验收仍未完成。OCR 默认启用，依赖或模型不完整时 readiness 失败。
+- 2026-09-03 已在当前 Apple Silicon Mac 用固定 SHA 清单中的两份官方模型完成本地 CPU 检查，并通过 Docker 的 Linux/amd64 模拟环境完成完整镜像构建、production 冷启动、资源上限和真实票据 OCR smoke。模型二进制由 `.gitignore` 排除，因此其他检出仍须按清单自行预置；原生 Linux/amd64 目标机和断网部署仍需上线前复验。OCR 默认启用，依赖或模型不完整时 readiness 失败。
 
 前端只提供一个“费用明细”区域，右上角统一放置“手动添加”和“选择票据”。用户一次选择多个独立票据后，上传中/识别中的文件先显示在同一区域，OCR 完成或失败后直接成为带来源与警告标记的可编辑费用行。前端从后端公开配置读取技术保护上限，默认可处理 200 条费用明细；Excel 不再受模板行数限制。删除 OCR 费用行会同时移除关联临时文件；文件超过 30 分钟未使用后仍由后台周期清理，退出登录时立即清理。页面不展示 OCR 原文，不使用浏览器持久化，也不提供云 OCR 或付费 API 配置。
 
 上传票据默认按文件修改时间保留 30 分钟。每个 Session 跨多次请求默认最多保留 200 个文件、100 MiB；解析缓存位于 `<TEMP_DIR>/.spool`，单文件只允许 256 KiB 留在内存，超过后转为可计量的磁盘缓存。最终文件按缓存逐个转存并立即关闭删除缓存。全局临时文件默认限制为 768 MiB，包含活动/残留 spool 和 `.part`；再为单文件转存峰值预留 20 MiB、为运行时预留 200 MiB，使最坏配置低于 1 GiB tmpfs。上传、识别和删除在取得与退出相同的 Session 租约后，会用独立 SQLite 查询重新确认 Session、公司和有效期；租约持续覆盖文件操作，因此退出要么先删除并使等待操作返回 401，要么等待已准入操作完成后删除其文件。清理会跳过正在使用的文件和活动 spool。生产容器以固定非 root 用户运行，后端不直接发布端口，只由 Nginx 反向代理访问。
 
-工作进程在 Linux 上保留宿主硬限额，只调整可恢复的软限额：文件/PDF 验证默认 512 MiB，OCR 默认 2 GiB，每页 PDF 解压后内容流默认最多 32 MiB，同时限制生成文件大小、打开文件数、CPU 时间并禁止 core dump。Compose 额外使用 3 GiB 容器内存和 128 PID 上限。正式 OCR 必须运行在支持这些限额的 Linux x86_64/amd64 环境，不提供绕过生产限额的开关。
+工作进程在 Linux 上保留宿主硬限额，只调整可恢复的软限额：文件/PDF 验证默认 512 MiB，OCR 默认 5 GiB 虚拟地址空间（Paddle/OpenCV 会预留较大虚拟映射，常驻内存显著低于此值），每页 PDF 解压后内容流默认最多 32 MiB，同时限制生成文件大小、打开文件数、CPU 时间并禁止 core dump。Compose 额外使用 3 GiB 容器实际内存和 128 PID 上限。正式 OCR 必须运行在支持这些限额的 Linux x86_64/amd64 环境，不提供绕过生产限额的开关。
 
 ## 开工前业务确认
 
@@ -217,6 +217,7 @@ PC 钉钉本机调试时，不配置 `DINGTALK_DEV_PUBLIC_HOST`，保持
 - 前端提交 npm v3 `package-lock.json`，本地安装与容器构建统一使用 `npm ci`，不允许在构建阶段改写锁文件；当前锁已通过全新 `npm ci`、测试、类型检查、Lint 和构建验证。
 - 前端使用 TypeScript 官方的 7/6 并行过渡方案：`@typescript/native` 提供 TypeScript 7 原生 `tsc`，`typescript` 别名指向 TypeScript 6 API，供尚未兼容原生编译器 API 的 `vue-tsc` 和 `typescript-eslint` 使用。`npm run typecheck` 会同时运行两条检查链，不能删除其中任一依赖后只验证另一条。
 - 容器构建使用 Node 24 LTS，后端运行时使用 Python 3.13.15；uv 固定为 0.12.9，入口使用 Nginx 1.30.4 stable。Python 3.14 尚无当前 PaddlePaddle 版本的 wheel，Node 26 仍为 Current，因此暂不采用。
+- 本地 Python 由 `backend/.python-version` 固定为 3.13.15 并交给 uv 管理，不要求通过 Homebrew 安装 Python；macOS 自带 Python 不参与后端运行。
 - 后端业务调用钉钉和 PaddlePaddle 依赖继续使用 `httpx` 0.28.1；测试环境另外锁定 `httpx2` 2.12.0，专供新版 Starlette `TestClient` 使用，不混用两套客户端处理业务请求。
 - 当前 npm 11 标准生成结果并未为全部依赖条目写入 `resolved`/`integrity`。这里不手工拼接 URL 或哈希，也不宣称具备完整的锁文件校验和覆盖；若上线环境把完整哈希作为供应链硬性要求，应在干净 npm 环境中重新生成并单独复核后再发布。
 - 后端已使用 uv 生成并提交 `uv.lock`；本地安装、检查与容器构建统一使用 `--frozen`，确保声明与锁文件不一致时立即失败。
@@ -324,7 +325,8 @@ Compose 要求显式提供 `APP_ENV`，没有该值会在配置展开阶段失�
 ### 最短生产部署路径
 
 目标服务器使用 Linux x86_64/amd64。Apple Silicon Mac 上的 Docker Compose 会通过
-`BACKEND_PLATFORM=linux/amd64` 使用模拟架构，只适合构建/联调，不建议承担正式 OCR：
+`TARGET_PLATFORM=linux/amd64` 将前后端统一构建为目标架构；本机运行时使用模拟架构，适合
+构建和联调，不建议承担正式 OCR：
 
 ```bash
 cp .env.production.example .env
@@ -372,6 +374,5 @@ make deploy
   只证明开发闭环。
 - Paddle 模型制品以及公司脱敏 JPG/PNG/独立单页 PDF 样本，用于 Linux 目标机准确率、资源
   上限和断网 smoke test。
-- 可用 Docker daemon 上的 `docker compose build` / `up`、容器 readiness、持久卷恢复和外层
-  HTTPS 反代验收。
+- 原生 Linux/amd64 生产机上的断网冷启动、持久卷恢复和公司外层 HTTPS 反代验收。
 - 公司确认现行补助制度、12:00 整点归属、项目清单和管理员钉钉 userId。

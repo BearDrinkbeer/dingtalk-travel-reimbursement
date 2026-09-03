@@ -168,11 +168,11 @@ Python、Paddle、openpyxl 或容器基础镜像变化时，还要运行真实�
 
 ## 升级后快速复核
 
-复核日期：2026-09-02。再次以 `frontend/package.json`、`backend/pyproject.toml`、两个 Dockerfile 和锁文件为准，对 npm/PyPI 官方索引及各项目官方发布页复核。结论是：**运行依赖没有新的常规升级项；唯一遗漏的直接依赖是构建后端 Hatchling 1.27.0 → 1.32.0。**
+复核日期：2026-09-03。再次以 `frontend/package.json`、`backend/pyproject.toml`、两个 Dockerfile 和锁文件为准，对 npm/PyPI 官方索引及各项目官方发布页复核。结论是：**运行依赖没有新的常规升级项；遗漏的构建依赖 Hatchling 已从 1.27.0 升级到 1.32.0。**
 
 | 分类 | 组件 | 当前 → 最新稳定版 | 复核结论 |
 |---|---|---|---|
-| **建议现在升级** | [Hatchling](https://pypi.org/project/hatchling/) | 1.27.0 → **1.32.0** | 这是本轮唯一落后的直接依赖。它只用于构建 wheel，建议单独升级、检查 `uv.lock`，再执行 `uv build`/frozen sync；不必与运行时升级混在一起。 |
+| **已完成** | [Hatchling](https://pypi.org/project/hatchling/) | **1.32.0** | 仅用于构建 wheel；升级后已完成 `uv lock --check`、`uv build`、frozen sync 与整仓测试。 |
 | **因上游兼容应锁定** | [TypeScript 7 原生编译器 / TS6 桥接](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/) | `typescript` 7.0.2 / `@typescript/typescript6` 6.0.2，均为最新 | 当前别名布局正是 TypeScript 官方推荐的并行方案：`@typescript/native: npm:typescript@7.0.2` 提供原生 `tsc`，`typescript: npm:@typescript/typescript6@6.0.2` 为依赖编译器 API 的工具保留 TS6。实测 `tsc` 为 7.0.2，`tsc6` 为 6.0.3（桥接包内部允许的 TS6 补丁版）。[typescript-eslint 官方支持范围](https://typescript-eslint.io/users/dependency-versions/)仍是 TypeScript `>=4.8.4 <6.1.0`，所以桥接暂不能删除。 |
 | **因上游兼容应锁定** | [OpenCV](https://pypi.org/project/opencv-contrib-python/) | 4.10.0.84 → 全局最新 **5.0.0.93** | 不升级。PaddleOCR 3.7.0 带入的 PaddleX 3.7.2 精确要求 `opencv-contrib-python==4.10.0.84`，当前锁文件也解析到该版本；绕过它升级 4.14/5.0 只能作为隔离 A/B 实验，不能进入主环境。上游精确约束见 [PaddleX 官方源码](https://github.com/PaddlePaddle/PaddleX/blob/v3.7.2/setup.py)。 |
 | **因上游兼容应锁定** | [Python](https://www.python.org/downloads/release/python-3147/) | 镜像 3.13.15；全局最新 **3.14.7** | 继续保留 `>=3.11,<3.14`。PaddlePaddle 3.3.1 的 [PyPI 官方文件](https://pypi.org/project/paddlepaddle/3.3.1/#files)没有 CPython 3.14 wheel；3.13.15 已是当前 OCR 组合能采用的最新 Python。 |
@@ -185,6 +185,6 @@ Python、Paddle、openpyxl 或容器基础镜像变化时，还要运行真实�
 | **已最新** | OCR、文件与测试工具 | PaddleOCR 3.7.0、PaddlePaddle 3.3.1、pypdf 6.16.2、openpyxl 3.1.5、Pillow 12.3.0、pytest 9.1.1、Ruff 0.16.5 | 除上表有意锁定的 OpenCV 外，直接依赖均为 PyPI 最新稳定版。来源：[PaddleOCR](https://pypi.org/project/paddleocr/)、[PaddlePaddle](https://pypi.org/project/paddlepaddle/)、[pypdf](https://pypi.org/project/pypdf/)、[openpyxl](https://pypi.org/project/openpyxl/)、[Pillow](https://pypi.org/project/pillow/)、[pytest](https://pypi.org/project/pytest/)、[Ruff](https://pypi.org/project/ruff/)。 |
 | **已最新** | [uv 容器工具](https://docs.astral.sh/uv/guides/integration/docker/) | 镜像 **0.12.9** | Docker 构建使用的 uv 已是最新稳定版。 |
 
-本机开发环境与容器还有轻微偏差：mise Node 是 26.5.0，而前端镜像是 Node 24.20.0；本机 uv 是 0.11.21，而后端镜像是 0.12.9；现有 `backend/.venv` 是 Python 3.13.14，而后端镜像是 3.13.15。它们不构成仓库运行依赖升级，但建议后续增加项目级 mise 配置，将本机默认 Node 固定到 24.20.0，并把 Python/uv 对齐容器，避免“本机通过、镜像失败”的工具链差异。
+本机开发环境与容器只剩 Node 版本有意不同：mise Node 是 26.5.0，前端镜像固定为 Node 24.20.0 LTS。本机与容器的 uv 均为 0.12.9，`backend/.python-version` 和后端镜像均固定 Python 3.13.15；后端 `.venv` 已由 uv 重新创建并使用该解释器。Node 26 当前仅用于额外兼容验证，生产构建仍以容器内 Node 24 的结果为准。
 
-本次只复核并记录，没有修改代码、依赖或锁文件。
+本次已同步依赖声明、Python 版本文件和开发文档；`uv.lock` 的解析结果无需变化。

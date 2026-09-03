@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import io
 import os
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import ModuleType
 from uuid import uuid4
 
 import pytest
 from PIL import Image
 from pypdf import PdfWriter
 
+from app.ocr import engine as engine_module
 from app.ocr.engine import FakeOcrEngine, OcrRuntimeError, PaddleLocalOcrEngine
 from app.ocr.types import OcrLine
 from app.ocr.workers import verify_ocr_runtime_worker
@@ -552,6 +555,37 @@ def test_production_rejects_fake_and_missing_models(settings_factory, tmp_path: 
     )
     with pytest.raises(OcrRuntimeError, match="模型目录不可用"):
         PaddleLocalOcrEngine(settings).ensure_ready()
+
+
+def test_paddle_static_cpu_runtime_disables_mkldnn(
+    monkeypatch,
+    settings_factory,
+    tmp_path: Path,
+) -> None:
+    received: dict[str, object] = {}
+
+    class FakePaddleOcr:
+        def __init__(self, **kwargs: object) -> None:
+            received.update(kwargs)
+
+    fake_module = ModuleType("paddleocr")
+    fake_module.PaddleOCR = FakePaddleOcr  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "paddleocr", fake_module)
+    monkeypatch.setattr(engine_module, "model_directory_ready", lambda *_args: True)
+    monkeypatch.setattr(
+        engine_module.metadata,
+        "version",
+        lambda package: {"paddleocr": "3.7.0", "paddlepaddle": "3.3.1"}[package],
+    )
+
+    PaddleLocalOcrEngine(
+        settings_factory(
+            ocr_detection_model_dir=tmp_path / "det",
+            ocr_recognition_model_dir=tmp_path / "rec",
+        )
+    ).ensure_ready()
+
+    assert received["enable_mkldnn"] is False
 
 
 def test_paddle_result_contract_rejects_mismatch_without_runtime(
