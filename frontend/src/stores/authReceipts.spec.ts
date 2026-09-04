@@ -10,6 +10,7 @@ import { getOaReimbursementOptions } from '@/api/reimbursements'
 import { useAuthStore } from '@/stores/auth'
 import { useExpenseStore } from '@/stores/expense'
 import { useReimbursementDraftStore } from '@/stores/reimbursementDraft'
+import { useReimbursementSubmissionStore } from '@/stores/reimbursementSubmission'
 
 const callbacks = vi.hoisted(() => ({ unauthorized: null as (() => void) | null }))
 
@@ -45,6 +46,7 @@ vi.mock('@/api/reimbursements', () => ({
   deleteReimbursementDraft: vi.fn(),
   deleteReimbursementDraftFile: vi.fn(),
   getOaReimbursementOptions: vi.fn(),
+  getOaReimbursementSubmission: vi.fn(),
   getReimbursementDraft: vi.fn(),
   getReimbursementDraftExcelPreview: vi.fn(),
   listOaTravelApprovals: vi.fn(),
@@ -53,6 +55,7 @@ vi.mock('@/api/reimbursements', () => ({
   markReimbursementDraftReviewReady: vi.fn(),
   recognizeReimbursementDraftFile: vi.fn(),
   replaceReimbursementRelatedApprovals: vi.fn(),
+  submitOaReimbursement: vi.fn(),
   updateReimbursementDraft: vi.fn(),
   updateReimbursementDraftFile: vi.fn(),
   uploadReimbursementDraftFile: vi.fn(),
@@ -132,6 +135,22 @@ describe('authentication clears scoped client memory', () => {
     useAuthStore()
     const expense = seedReceiptMemory()
     const drafts = seedDraftMemory()
+    const submission = useReimbursementSubmissionStore()
+    submission.submission = {
+      submissionId: 'submission-a',
+      draftId: 'draft-a',
+      status: 'QUEUED',
+      statusVersion: 1,
+      attemptCount: 0,
+      processInstanceId: null,
+      businessId: null,
+      approvalUrl: null,
+      error: null,
+      pollAfterMs: 1_500,
+      createdAt: '2026-09-04T00:00:00Z',
+      updatedAt: '2026-09-04T00:00:00Z',
+      submittedAt: null,
+    }
     let signal: AbortSignal | undefined
     vi.mocked(getOaReimbursementOptions).mockImplementation((options) => {
       signal = options?.signal
@@ -146,6 +165,7 @@ describe('authentication clears scoped client memory', () => {
     expect(expense.items).toEqual([])
     expect(drafts.drafts).toEqual([])
     expect(drafts.reimbursementOptions).toBeNull()
+    expect(submission.submission).toBeNull()
   })
 
   it('clears files, OCR candidates and reimbursement state after logout', async () => {

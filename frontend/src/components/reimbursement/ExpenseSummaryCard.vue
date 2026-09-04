@@ -1,37 +1,39 @@
 <script setup lang="ts">
 import { ElMessage } from 'element-plus'
-import { computed, ref } from 'vue'
+import { computed } from 'vue'
 
-import {
-  excelDownloadErrorMessage,
-  generateAndDownloadExpenseExcel,
-} from '@/api/excel'
-import { useAuthStore } from '@/stores/auth'
 import { useExpenseStore } from '@/stores/expense'
+import { useReimbursementDraftStore } from '@/stores/reimbursementDraft'
 
-const auth = useAuthStore()
+const props = withDefaults(defineProps<{
+  previewDisabledReason?: string
+}>(), {
+  previewDisabledReason: '',
+})
+
 const expense = useExpenseStore()
-const excelDownloading = ref(false)
+const drafts = useReimbursementDraftStore()
 
-const excelDisabledReason = computed(() => {
-  if (!auth.session?.selectedDepartment) return '请先选择本次报销部门'
-  return expense.excelDisabledReason
+const disabledReason = computed(() => {
+  if (!drafts.currentDraft) return '请先创建或打开报销草稿'
+  if (props.previewDisabledReason) return props.previewDisabledReason
+  if (drafts.pendingMutations > 0) return '请等待草稿保存完成'
+  return ''
 })
 
 async function downloadExcel(): Promise<void> {
-  const payload = expense.buildExcelPayload()
-  if (!payload || excelDisabledReason.value) {
-    ElMessage.warning(excelDisabledReason.value || '请先完成报销信息')
+  if (disabledReason.value) {
+    ElMessage.warning(disabledReason.value)
     return
   }
-  excelDownloading.value = true
   try {
-    await generateAndDownloadExpenseExcel(payload)
-    ElMessage.success('Excel 已生成并开始下载')
+    await drafts.downloadExcelPreview()
+    ElMessage.success('已生成当前已保存草稿的 Excel 预览')
   } catch (error) {
-    ElMessage.error(await excelDownloadErrorMessage(error))
-  } finally {
-    excelDownloading.value = false
+    ElMessage.error(
+      drafts.mutationError
+      || (error instanceof Error && error.message ? error.message : 'Excel 预览生成失败，请重试'),
+    )
   }
 }
 </script>
@@ -55,20 +57,37 @@ async function downloadExcel(): Promise<void> {
     </p>
     <div class="excel-download-action">
       <el-button
-        type="primary"
-        size="large"
-        :loading="excelDownloading"
-        :disabled="Boolean(excelDisabledReason)"
+        :loading="drafts.downloadingPreview"
+        :disabled="Boolean(disabledReason)"
         @click="downloadExcel"
       >
-        生成并下载 Excel
+        预览 Excel
       </el-button>
       <p
-        v-if="excelDisabledReason"
+        v-if="disabledReason"
         class="field-error"
       >
-        {{ excelDisabledReason }}
+        {{ disabledReason }}
+      </p>
+      <p
+        v-else
+        class="field-help excel-preview-help"
+      >
+        这里只预览已保存的内容；正式提交时服务器会重新生成最终 Excel，并直接加入钉钉 OA 附件。
       </p>
     </div>
   </el-card>
 </template>
+
+<style scoped>
+.excel-preview-help {
+  max-width: 520px;
+  text-align: right;
+}
+
+@media (max-width: 600px) {
+  .excel-preview-help {
+    text-align: left;
+  }
+}
+</style>

@@ -3,11 +3,102 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { calculateTotals, getExpenseCategories } from '@/api/expenses'
 import { useExpenseStore } from '@/stores/expense'
+import type {
+  ReimbursementDraft,
+  ReimbursementDraftFile,
+} from '@/types/reimbursements'
 
 const MANUAL_CATEGORIES = [
   { id: 'local_transport', name: '市内交通费', order: 1, manualSelectable: true },
   { id: 'rail_fare', name: '火车票', order: 2, manualSelectable: true },
 ]
+
+function durableDraft(
+  items: ReimbursementDraft['input']['items'],
+  dismissedOcrFileIds: string[] = [],
+  ocrDispositionVersion: 0 | 1 = 1,
+): ReimbursementDraft {
+  return {
+    id: 'draft-1',
+    status: 'DRAFT',
+    revision: 7,
+    department: { id: '100', name: '测试部门' },
+    templateConfigVersion: 3,
+    relatedApprovalCount: 0,
+    expiresAt: '2026-10-04T00:00:00Z',
+    createdAt: '2026-09-04T00:00:00Z',
+    updatedAt: '2026-09-04T00:01:00Z',
+    lockedAt: null,
+    template: {
+      processCode: 'PROC-REIMBURSEMENT',
+      configVersion: 3,
+      schemaFingerprint: 'a'.repeat(64),
+    },
+    input: {
+      ocrDispositionVersion,
+      companyValue: '北京',
+      budgetCodeValue: '26007',
+      project: { mode: 'manual', text: '测试项目' },
+      trip: {
+        tripType: 'business',
+        startDate: '2026-09-01',
+        startTime: '09:00',
+        endDate: '2026-09-02',
+        endTime: '18:00',
+      },
+      items,
+      dismissedOcrFileIds,
+    },
+    totals: {
+      expenseTotal: '474.00',
+      subsidyTotal: '200.00',
+      totalAmount: '674.00',
+      receiptCount: 2,
+      uppercaseAmount: '陆佰柒拾肆元整',
+      subsidy: {
+        tripType: 'business',
+        calendarDays: 2,
+        effectiveDays: '2.0',
+        dailyRate: '100.00',
+        total: '200.00',
+      },
+    },
+    relatedApprovals: [],
+    relatedApprovalSummary: null,
+  }
+}
+
+function durableFile(
+  id: string,
+  overrides: Partial<ReimbursementDraftFile> = {},
+): ReimbursementDraftFile {
+  return {
+    id,
+    name: `${id}.pdf`,
+    role: 'EXPENSE_SOURCE',
+    sortOrder: 0,
+    status: 'ACTIVE',
+    mediaType: 'application/pdf',
+    sizeBytes: 1024,
+    ocrStatus: 'COMPLETE',
+    ocrResult: {
+      fileId: id,
+      type: 'train',
+      categoryId: 'rail_fare',
+      categoryName: '火车票',
+      date: '2026-09-01',
+      description: '北京南-合肥南',
+      amount: '454.00',
+      receiptCount: 1,
+      source: 'ocr',
+      confidence: '0.93',
+      warnings: [],
+      status: 'recognized',
+      error: null,
+    },
+    ...overrides,
+  }
+}
 
 vi.mock('@/api/expenses', () => ({
   calculateTotals: vi.fn(),
@@ -19,6 +110,307 @@ describe('expense store', () => {
     setActivePinia(createPinia())
     vi.mocked(calculateTotals).mockReset()
     vi.mocked(getExpenseCategories).mockReset()
+  })
+
+  it('hydrates persisted OCR lines by source file id without overwriting user edits', () => {
+    const store = useExpenseStore()
+    store.categories = MANUAL_CATEGORIES
+    const files = [
+      durableFile('file-exact'),
+      durableFile('file-edited', {
+        sortOrder: 1,
+        ocrResult: {
+          ...durableFile('file-edited').ocrResult!,
+          fileId: 'file-edited',
+          description: 'OCR 原说明',
+          amount: '20.00',
+        },
+      }),
+    ]
+    const draft = durableDraft([
+      {
+        sourceFileId: 'file-exact',
+        category: 'rail_fare',
+        date: '2026-09-01',
+        displayDate: '2026-09-01',
+        description: '北京南-合肥南',
+        amount: '454.00',
+        receiptCount: 1,
+      },
+      {
+        sourceFileId: 'file-edited',
+        category: 'rail_fare',
+        date: '2026-09-02',
+        displayDate: '2026-09-02',
+        description: '用户修改后的说明',
+        amount: '20.00',
+        receiptCount: 1,
+      },
+    ])
+
+    store.hydrateFromDraft(draft, files)
+    store.hydrateFromDraft(draft, files)
+
+    expect(store.manualProject).toBe(true)
+    expect(store.manualProjectText).toBe('测试项目')
+    expect(store.includeSubsidy).toBe(true)
+    expect(store.trip.startDate).toBe('2026-09-01')
+    expect(store.items).toHaveLength(2)
+    expect(store.items[0]).toMatchObject({
+      id: 'ocr-file-exact',
+      source: 'ocr',
+      description: '北京南-合肥南',
+      confidence: '0.93',
+    })
+    expect(store.items[1]).toMatchObject({
+      id: 'ocr-file-edited',
+      source: 'ocr',
+      sourceFileId: 'file-edited',
+      description: '用户修改后的说明',
+    })
+    expect(store.items).toHaveLength(2)
+    expect(store.totals?.totalAmount).toBe('674.00')
+  })
+
+  it('recovers a persisted OCR candidate that never reached the draft input', () => {
+    const store = useExpenseStore()
+    store.categories = MANUAL_CATEGORIES
+    const source = durableFile('file-response-lost')
+
+    store.hydrateFromDraft(durableDraft([]), [source])
+
+    expect(store.items).toEqual([
+      expect.objectContaining({
+        id: 'ocr-file-response-lost',
+        sourceFileId: 'file-response-lost',
+        description: '北京南-合肥南',
+        amount: '454.00',
+      }),
+    ])
+    expect(store.totals).toBeNull()
+    expect(store.calculationsCurrent).toBe(false)
+  })
+
+  it('binds only a unique exact legacy OCR match and leaves an edited match unresolved', () => {
+    const store = useExpenseStore()
+    store.categories = MANUAL_CATEGORIES
+    const exact = durableFile('file-exact')
+    const edited = durableFile('file-edited', {
+      sortOrder: 1,
+      ocrResult: {
+        ...durableFile('file-edited').ocrResult!,
+        fileId: 'file-edited',
+        description: 'OCR 原说明',
+        amount: '20.00',
+      },
+    })
+    const legacy = durableDraft([
+      {
+        category: 'rail_fare',
+        date: '2026-09-01',
+        displayDate: '2026-09-01',
+        description: '北京南-合肥南',
+        amount: '454.00',
+        receiptCount: 1,
+      },
+      {
+        category: 'rail_fare',
+        date: '2026-09-02',
+        displayDate: '2026-09-02',
+        description: '用户修改后的说明',
+        amount: '20.00',
+        receiptCount: 1,
+      },
+    ], [], 0)
+
+    store.hydrateFromDraft(legacy, [exact, edited])
+
+    expect(store.items).toHaveLength(2)
+    expect(store.items[0]).toMatchObject({
+      sourceFileId: 'file-exact',
+      source: 'ocr',
+      amount: '454.00',
+    })
+    expect(store.items[1]?.sourceFileId).toBeUndefined()
+    expect(store.items.reduce((sum, item) => sum + Number(item.amount), 0)).toBe(474)
+    expect(store.dismissedOcrFileIds).toEqual([])
+  })
+
+  it('does not revive or ignore a legacy OCR line that may have been explicitly deleted', () => {
+    const store = useExpenseStore()
+    store.categories = MANUAL_CATEGORIES
+    const source = durableFile('file-deleted-before-provenance')
+
+    store.hydrateFromDraft(durableDraft([], [], 0), [source])
+
+    expect(store.items).toEqual([])
+    expect(store.dismissedOcrFileIds).toEqual([])
+
+    store.dismissDraftOcrFile('file-deleted-before-provenance')
+
+    expect(store.items).toEqual([])
+    expect(store.dismissedOcrFileIds).toEqual(['file-deleted-before-provenance'])
+  })
+
+  it('does not auto-bind an ambiguous many-to-one legacy OCR match', () => {
+    const store = useExpenseStore()
+    store.categories = MANUAL_CATEGORIES
+    const duplicatedLine = {
+      category: 'rail_fare' as const,
+      date: '2026-09-01',
+      displayDate: '2026-09-01',
+      description: '北京南-合肥南',
+      amount: '454.00',
+      receiptCount: 1,
+    }
+
+    store.hydrateFromDraft(
+      durableDraft([duplicatedLine, { ...duplicatedLine }], [], 0),
+      [durableFile('file-ambiguous')],
+    )
+
+    expect(store.items).toHaveLength(2)
+    expect(store.items.every((item) => item.sourceFileId === undefined)).toBe(true)
+    expect(store.dismissedOcrFileIds).toEqual([])
+  })
+
+  it('does not recover a non-terminal OCR candidate', () => {
+    const store = useExpenseStore()
+    store.categories = MANUAL_CATEGORIES
+    const running = durableFile('file-running', { ocrStatus: 'RUNNING' })
+
+    store.hydrateFromDraft(durableDraft([]), [running])
+
+    expect(store.items).toEqual([])
+  })
+
+  it('persists an OCR-line dismissal and only revives it after explicit adoption', () => {
+    const store = useExpenseStore()
+    store.categories = MANUAL_CATEGORIES
+    const source = durableFile('file-dismissed')
+    store.upsertDraftOcrItem(source)
+
+    store.removeItem('ocr-file-dismissed')
+
+    expect(store.items).toEqual([])
+    expect(store.dismissedOcrFileIds).toEqual(['file-dismissed'])
+
+    store.hydrateFromDraft(durableDraft([], ['file-dismissed']), [source])
+    store.hydrateFromDraft(durableDraft([], ['file-dismissed']), [source])
+    expect(store.items).toEqual([])
+
+    expect(store.upsertDraftOcrItem(source)).toBe(true)
+    expect(store.items).toEqual([
+      expect.objectContaining({ sourceFileId: 'file-dismissed' }),
+    ])
+    expect(store.dismissedOcrFileIds).toEqual([])
+  })
+
+  it('clears both an OCR item and its disposition when the source file is deleted', () => {
+    const store = useExpenseStore()
+    store.categories = MANUAL_CATEGORIES
+    const deleted = durableFile('file-deleted')
+    const kept = durableFile('file-kept')
+    store.upsertDraftOcrItem(deleted)
+    store.upsertDraftOcrItem(kept)
+    store.removeItem('ocr-file-deleted')
+
+    store.removeDraftFileAssociation('file-deleted')
+
+    expect(store.dismissedOcrFileIds).toEqual([])
+    expect(store.items).toEqual([
+      expect.objectContaining({ sourceFileId: 'file-kept' }),
+    ])
+  })
+
+  it('keeps source-file provenance when an OCR line is edited and builds draft-only items', () => {
+    const store = useExpenseStore()
+    store.categories = MANUAL_CATEGORIES
+    store.upsertDraftOcrItem(durableFile('file-edited'))
+
+    store.upsertManualItem({
+      id: 'ocr-file-edited',
+      category: 'rail_fare',
+      date: '2026-09-02',
+      displayDate: '2026-09-02',
+      description: '人工修改后的行程',
+      amount: '455.00',
+      receiptCount: 2,
+    })
+
+    expect(store.items[0]).toMatchObject({
+      id: 'ocr-file-edited',
+      source: 'ocr',
+      sourceFileId: 'file-edited',
+      description: '人工修改后的行程',
+      amount: '455.00',
+    })
+    expect(store.buildDraftExpenseItems()).toEqual([{
+      sourceFileId: 'file-edited',
+      category: 'rail_fare',
+      date: '2026-09-02',
+      displayDate: '2026-09-02',
+      description: '人工修改后的行程',
+      amount: '455.00',
+      receiptCount: 2,
+    }])
+  })
+
+  it('strips draft provenance from totals and Excel payloads', async () => {
+    vi.mocked(calculateTotals).mockResolvedValue({
+      expenseTotal: '454.00',
+      subsidyTotal: '0.00',
+      totalAmount: '454.00',
+      receiptCount: 1,
+      uppercaseAmount: '肆佰伍拾肆元整',
+      subsidy: null,
+    })
+    const store = useExpenseStore()
+    store.categories = MANUAL_CATEGORIES
+    store.manualProject = true
+    store.manualProjectText = '测试项目'
+    store.upsertDraftOcrItem(durableFile('file-calculation'))
+
+    await store.refreshCalculations()
+
+    expect(calculateTotals).toHaveBeenCalledWith(null, [{
+      category: 'rail_fare',
+      date: '2026-09-01',
+      displayDate: '2026-09-01',
+      description: '北京南-合肥南',
+      amount: '454.00',
+      receiptCount: 1,
+    }])
+    expect(store.buildExcelPayload()?.items[0]).not.toHaveProperty('sourceFileId')
+    expect(store.buildDraftExpenseItems()[0]).toHaveProperty(
+      'sourceFileId',
+      'file-calculation',
+    )
+  })
+
+  it('upserts durable OCR by file id so a retry never duplicates the item', () => {
+    const store = useExpenseStore()
+    store.categories = MANUAL_CATEGORIES
+    const first = durableFile('file-1')
+
+    expect(store.upsertDraftOcrItem(first)).toBe(true)
+    expect(store.upsertDraftOcrItem({
+      ...first,
+      ocrResult: {
+        ...first.ocrResult!,
+        amount: '455.00',
+        confidence: '0.96',
+      },
+    })).toBe(true)
+
+    expect(store.items).toEqual([
+      expect.objectContaining({
+        id: 'ocr-file-1',
+        source: 'ocr',
+        amount: '455.00',
+        confidence: '0.96',
+      }),
+    ])
   })
 
   it('keeps integer-cent totals exact and supports item CRUD', () => {

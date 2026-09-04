@@ -15,6 +15,7 @@ import type { AuthSession } from '@/types/auth'
 import { requestDingTalkAuthCode } from '@/utils/dingtalk'
 import { useExpenseStore } from '@/stores/expense'
 import { useReimbursementDraftStore } from '@/stores/reimbursementDraft'
+import { useReimbursementSubmissionStore } from '@/stores/reimbursementSubmission'
 
 export type AuthStatus =
   | 'idle'
@@ -42,7 +43,10 @@ export const useAuthStore = defineStore('auth', () => {
   function applySession(value: AuthSession): void {
     if (!sameSessionScope(session.value, value)) {
       useReimbursementDraftStore().reset()
-      if (session.value !== null) useExpenseStore().reset()
+      if (session.value !== null) {
+        useExpenseStore().reset()
+        useReimbursementSubmissionStore().reset()
+      }
     }
     session.value = value
     setCsrfToken(value.csrfToken)
@@ -53,6 +57,7 @@ export const useAuthStore = defineStore('auth', () => {
   function clearAsUnauthorized(): void {
     useExpenseStore().reset()
     useReimbursementDraftStore().reset()
+    useReimbursementSubmissionStore().reset()
     session.value = null
     setCsrfToken(null)
     if (status.value !== 'loading') status.value = 'unauthorized'
@@ -118,6 +123,7 @@ export const useAuthStore = defineStore('auth', () => {
     if (!session.value) return
     useExpenseStore().reset()
     useReimbursementDraftStore().reset()
+    useReimbursementSubmissionStore().reset()
     session.value.selectedDepartment = await selectDepartmentRequest(departmentId)
     status.value = 'authenticated'
   }
@@ -125,6 +131,7 @@ export const useAuthStore = defineStore('auth', () => {
   async function logout(): Promise<void> {
     useExpenseStore().reset()
     useReimbursementDraftStore().reset()
+    useReimbursementSubmissionStore().reset()
     try {
       await logoutRequest()
     } finally {

@@ -18,6 +18,8 @@ import type {
   ReimbursementDraftOcrInput,
   ReimbursementExcelPreview,
   ReimbursementRelatedApprovalSelection,
+  ReimbursementSubmission,
+  SubmitReimbursementInput,
 } from '@/types/reimbursements'
 
 const DRAFT_EXCEL_PREVIEW_FILENAME = '差旅费报销单预览.xlsx'
@@ -306,4 +308,44 @@ export async function downloadReimbursementDraftExcelPreview(
     options,
   )
   downloadBlob(preview.blob, preview.filename)
+}
+
+export async function submitOaReimbursement(
+  draftId: string,
+  expectedRevision: number,
+  idempotencyKey: string,
+  options: ReimbursementRequestOptions = {},
+): Promise<ReimbursementSubmission> {
+  const body: SubmitReimbursementInput = { expectedRevision }
+  const response = await http.post<ApiEnvelope<ReimbursementSubmission>>(
+    `/oa/reimbursements/${encodeURIComponent(draftId)}/submit`,
+    body,
+    {
+      headers: { 'Idempotency-Key': idempotencyKey },
+      signal: options.signal,
+    },
+  )
+  return response.data.data
+}
+
+export async function getOaReimbursementSubmission(
+  submissionId: string,
+  options: ReimbursementRequestOptions = {},
+): Promise<ReimbursementSubmission> {
+  const response = await http.get<ApiEnvelope<ReimbursementSubmission>>(
+    `/oa/reimbursements/submissions/${encodeURIComponent(submissionId)}`,
+    { signal: options.signal },
+  )
+  return response.data.data
+}
+
+export async function getOaReimbursementSubmissionForDraft(
+  draftId: string,
+  options: ReimbursementRequestOptions = {},
+): Promise<ReimbursementSubmission> {
+  const response = await http.get<ApiEnvelope<ReimbursementSubmission>>(
+    `/oa/reimbursements/drafts/${encodeURIComponent(draftId)}/submission`,
+    { signal: options.signal },
+  )
+  return response.data.data
 }

@@ -6,6 +6,8 @@ import {
   createReimbursementDraft,
   deleteReimbursementDraft,
   deleteReimbursementDraftFile,
+  getOaReimbursementSubmission,
+  getOaReimbursementSubmissionForDraft,
   getReimbursementDraft,
   getReimbursementDraftExcelPreview,
   getOaReimbursementOptions,
@@ -15,6 +17,7 @@ import {
   markReimbursementDraftReviewReady,
   recognizeReimbursementDraftFile,
   replaceReimbursementRelatedApprovals,
+  submitOaReimbursement,
   updateReimbursementDraft,
   updateReimbursementDraftFile,
   uploadReimbursementDraftFile,
@@ -32,10 +35,12 @@ vi.mock('@/api/http', () => ({
 }))
 
 const input: ReimbursementDraftInput = {
+  ocrDispositionVersion: 1,
   companyValue: '北京',
   budgetCodeValue: '26007',
   project: { mode: 'manual', text: '示例项目' },
   trip: null,
+  dismissedOcrFileIds: [],
   items: [{
     category: 'other',
     date: '2026-09-01',
@@ -304,5 +309,54 @@ describe('persistent reimbursement API', () => {
 
     expect(caught).toBe(conflict)
     expect(apiErrorCode(caught)).toBe('REIMBURSEMENT_DRAFT_REVISION_CONFLICT')
+  })
+
+  it('submits one exact draft revision with a UUID key and reads its task', async () => {
+    const signal = new AbortController().signal
+    const queued = {
+      submissionId: 'submission/一',
+      draftId: 'draft/一',
+      status: 'QUEUED',
+      statusVersion: 1,
+      attemptCount: 0,
+      processInstanceId: null,
+      businessId: null,
+      approvalUrl: null,
+      error: null,
+      pollAfterMs: 1_500,
+      createdAt: '2026-09-04T00:00:00Z',
+      updatedAt: '2026-09-04T00:00:00Z',
+      submittedAt: null,
+    } as const
+    vi.mocked(http.post).mockResolvedValue({ data: { data: queued } })
+    vi.mocked(http.get).mockResolvedValue({ data: { data: queued } })
+
+    await expect(submitOaReimbursement(
+      'draft/一',
+      7,
+      '123e4567-e89b-42d3-a456-426614174000',
+      { signal },
+    )).resolves.toBe(queued)
+    await expect(getOaReimbursementSubmission('submission/一', { signal }))
+      .resolves.toBe(queued)
+    await expect(getOaReimbursementSubmissionForDraft('draft/一', { signal }))
+      .resolves.toBe(queued)
+
+    expect(http.post).toHaveBeenCalledWith(
+      '/oa/reimbursements/draft%2F%E4%B8%80/submit',
+      { expectedRevision: 7 },
+      {
+        headers: { 'Idempotency-Key': '123e4567-e89b-42d3-a456-426614174000' },
+        signal,
+      },
+    )
+    expect(http.get).toHaveBeenCalledWith(
+      '/oa/reimbursements/submissions/submission%2F%E4%B8%80',
+      { signal },
+    )
+    expect(http.get).toHaveBeenCalledWith(
+      '/oa/reimbursements/drafts/draft%2F%E4%B8%80/submission',
+      { signal },
+    )
   })
 })

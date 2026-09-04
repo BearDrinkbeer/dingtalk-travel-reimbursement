@@ -1,4 +1,5 @@
 import type {
+  ExcelExpenseItemInput,
   ExcelGeneratePayload,
   ExpenseTotals,
 } from '@/types/expenses'
@@ -11,9 +12,16 @@ export type ReimbursementDraftStatus =
   | 'LOCKED'
   | 'EXPIRED'
 
-export interface ReimbursementDraftInput extends ExcelGeneratePayload {
+export interface ReimbursementDraftExpenseItemInput extends ExcelExpenseItemInput {
+  sourceFileId?: string
+}
+
+export interface ReimbursementDraftInput extends Omit<ExcelGeneratePayload, 'items'> {
+  ocrDispositionVersion: 0 | 1
   companyValue: string
   budgetCodeValue: string
+  items: ReimbursementDraftExpenseItemInput[]
+  dismissedOcrFileIds: string[]
 }
 
 export interface ReimbursementDraftDepartment {
@@ -194,4 +202,43 @@ export interface ReimbursementDraftOcrInput {
 export interface ReimbursementExcelPreview {
   blob: Blob
   filename: string
+}
+
+export type ReimbursementSubmissionStatus =
+  | 'QUEUED'
+  | 'VALIDATING'
+  | 'GENERATING_EXCEL'
+  | 'UPLOADING'
+  | 'OA_CREATING'
+  | 'VERIFYING'
+  | 'FAILED_RETRYABLE'
+  | 'RECONCILING'
+  | 'ORPHAN_CLEANUP'
+  | 'SUBMITTED'
+  | 'FAILED_FINAL'
+  | 'MANUAL_REVIEW'
+
+export interface ReimbursementSubmissionError {
+  code: string
+  message: string
+}
+
+export interface ReimbursementSubmission {
+  submissionId: string
+  draftId: string
+  status: ReimbursementSubmissionStatus
+  statusVersion: number
+  attemptCount: number
+  processInstanceId: string | null
+  businessId: string | null
+  approvalUrl: string | null
+  error: ReimbursementSubmissionError | null
+  pollAfterMs: number
+  createdAt: string
+  updatedAt: string
+  submittedAt: string | null
+}
+
+export interface SubmitReimbursementInput {
+  expectedRevision: number
 }

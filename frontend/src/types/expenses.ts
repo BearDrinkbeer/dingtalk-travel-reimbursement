@@ -35,6 +35,8 @@ export interface TripInput {
 
 export interface ExpenseItem {
   id: string
+  /** Stable provenance for a line created from a persisted reimbursement draft file. */
+  sourceFileId?: string
   category: ExpenseCategoryId
   date?: string
   displayDate: string

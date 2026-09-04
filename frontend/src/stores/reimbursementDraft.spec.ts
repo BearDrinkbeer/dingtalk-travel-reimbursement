@@ -46,10 +46,12 @@ vi.mock('@/api/reimbursements', () => ({
 }))
 
 const input: ReimbursementDraftInput = {
+  ocrDispositionVersion: 1,
   companyValue: '北京',
   budgetCodeValue: '26007',
   project: { mode: 'manual', text: '示例项目' },
   trip: null,
+  dismissedOcrFileIds: [],
   items: [{
     category: 'other',
     date: '2026-09-01',

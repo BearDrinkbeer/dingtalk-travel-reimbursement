@@ -372,8 +372,9 @@ describe('expense receipt flow', () => {
 
     expect(calculateTotals).toHaveBeenLastCalledWith(
       expect.anything(),
-      [expect.objectContaining({ amount: '454.00', source: 'ocr' })],
+      [expect.objectContaining({ amount: '454.00', category: 'rail_fare' })],
     )
+    expect(vi.mocked(calculateTotals).mock.lastCall?.[1]?.[0]).not.toHaveProperty('source')
 
     const payload = store.buildExcelPayload()
     expect(payload?.items).toEqual([{

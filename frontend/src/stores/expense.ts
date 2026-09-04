@@ -11,6 +11,7 @@ import {
 } from '@/api/receipts'
 import type {
   ExpenseCategoryMetadata,
+  ExcelExpenseItemInput,
   ExcelGeneratePayload,
   ExcelProjectInput,
   ExpenseItem,
@@ -20,6 +21,11 @@ import type {
 } from '@/types/expenses'
 import type { OcrReceiptCandidate, ReceiptFileState } from '@/types/receipts'
 import type { ReceiptUploadLimits } from '@/types/auth'
+import type {
+  ReimbursementDraft,
+  ReimbursementDraftExpenseItemInput,
+  ReimbursementDraftFile,
+} from '@/types/reimbursements'
 import { centsToMoney, moneyToCents } from '@/utils/money'
 import { DEFAULT_RECEIPT_LIMITS, validateReceiptFiles } from '@/utils/receiptFiles'
 
@@ -70,6 +76,18 @@ function calendarDays(startDate: string, endDate: string): number | null {
   return days > 0 ? days : null
 }
 
+function legacyOcrMatchKey(item: ExpenseItem): string | null {
+  if (!item.date || !item.displayDate || !item.description || !item.amount) return null
+  return JSON.stringify({
+    category: item.category,
+    date: item.date,
+    displayDate: item.displayDate,
+    description: item.description,
+    amount: item.amount,
+    receiptCount: item.receiptCount,
+  })
+}
+
 export const useExpenseStore = defineStore('expense', () => {
   const manualProject = ref(false)
   const selectedProjectId = ref<number | null>(null)
@@ -85,6 +103,7 @@ export const useExpenseStore = defineStore('expense', () => {
     noSubsidyException: false,
   })
   const items = ref<ExpenseItem[]>([])
+  const dismissedOcrFileIds = ref<string[]>([])
   const includeSubsidy = ref(false)
   const receiptFiles = ref<ReceiptFileState[]>([])
   const receiptUploadLimits = ref<ReceiptUploadLimits>({ ...DEFAULT_RECEIPT_LIMITS })
@@ -250,6 +269,7 @@ export const useExpenseStore = defineStore('expense', () => {
       ...input,
       id,
       source,
+      sourceFileId: existing?.sourceFileId,
       amount: centsToMoney(amountCents),
       displayDate: input.displayDate.trim(),
       description: input.description.trim(),
@@ -330,7 +350,210 @@ export const useExpenseStore = defineStore('expense', () => {
     return true
   }
 
+  function draftOcrExpenseItem(file: ReimbursementDraftFile): ExpenseItem | null {
+    const candidate = file.ocrResult
+    if (
+      file.role !== 'EXPENSE_SOURCE'
+      || file.status !== 'ACTIVE'
+      || !['COMPLETE', 'FAILED'].includes(file.ocrStatus)
+      || !candidate
+      || candidate.fileId !== file.id
+    ) return null
+
+    const categoryId = typeof candidate.categoryId === 'string'
+      ? candidate.categoryId.trim()
+      : ''
+    if (!categoryId) return null
+    const confidenceNumber = Number(candidate.confidence)
+    const confidence = Number.isFinite(confidenceNumber)
+      ? Math.min(1, Math.max(0, confidenceNumber)).toFixed(2)
+      : '0.00'
+    const warnings = new Set(
+      (Array.isArray(candidate.warnings) ? candidate.warnings : [])
+        .filter((warning): warning is string => typeof warning === 'string' && Boolean(warning.trim())),
+    )
+    const validDate = isCalendarDate(candidate.date) ? candidate.date : undefined
+    if (!validDate) warnings.add('MISSING_DATE')
+    const amountCents = candidate.amount === null ? null : moneyToCents(candidate.amount)
+    if (amountCents === null) warnings.add('MISSING_AMOUNT')
+    const description = candidate.description?.trim()
+      || (candidate.status === 'failed' ? file.name : candidate.categoryName.trim())
+    if (!candidate.description?.trim()) warnings.add('MISSING_DESCRIPTION')
+    if (warnings.size || candidate.status === 'failed') warnings.add('MANUAL_REVIEW_REQUIRED')
+    return {
+      id: `ocr-${file.id}`,
+      sourceFileId: file.id,
+      category: categoryId,
+      date: validDate,
+      displayDate: validDate ?? '',
+      description,
+      amount: amountCents === null ? '' : centsToMoney(amountCents),
+      receiptCount: 1,
+      source: 'ocr',
+      confidence,
+      warnings: [...warnings],
+    }
+  }
+
+  function upsertDraftOcrItem(file: ReimbursementDraftFile): boolean {
+    const item = draftOcrExpenseItem(file)
+    if (!item) return false
+    const index = items.value.findIndex((existing) => existing.id === item.id)
+    if (index < 0 && items.value.length >= maxExpenseItems.value) return false
+    if (index >= 0) items.value[index] = item
+    else items.value.push(item)
+    dismissedOcrFileIds.value = dismissedOcrFileIds.value.filter((id) => id !== file.id)
+    if (file.ocrResult?.error?.code === 'OCR_DISABLED') ocrUnavailable.value = true
+    totals.value = null
+    calculatedSignature.value = ''
+    return true
+  }
+
+  function hydrateFromDraft(
+    draft: ReimbursementDraft,
+    draftFiles: readonly ReimbursementDraftFile[],
+  ): void {
+    abortReceiptOperations()
+    receiptFiles.value = []
+    ocrUnavailable.value = false
+
+    const project = draft.input.project
+    manualProject.value = project.mode === 'manual'
+    manualProjectText.value = project.mode === 'manual' ? project.text : ''
+    selectedProjectId.value = project.mode === 'selected'
+      && Number.isSafeInteger(project.id)
+      && project.id > 0
+      ? project.id
+      : null
+
+    const persistedTrip = draft.input.trip
+    includeSubsidy.value = persistedTrip !== null
+    Object.assign(trip, {
+      tripType: persistedTrip?.tripType ?? 'business',
+      startDate: persistedTrip?.startDate ?? '',
+      startTime: persistedTrip?.startTime ?? '09:00',
+      endDate: persistedTrip?.endDate ?? '',
+      endTime: persistedTrip?.endTime ?? '18:00',
+      policyConfirmed: persistedTrip?.policyConfirmed ?? false,
+      confirmedEffectiveDays: persistedTrip?.confirmedEffectiveDays ?? '',
+      noSubsidyException: persistedTrip?.noSubsidyException ?? false,
+    })
+
+    const candidates = draftFiles
+      .map((file) => ({ file, item: draftOcrExpenseItem(file) }))
+      .filter((entry): entry is { file: ReimbursementDraftFile; item: ExpenseItem } =>
+        entry.item !== null,
+      )
+      .sort((left, right) => left.file.sortOrder - right.file.sortOrder)
+    const candidateByFileId = new Map(candidates.map((entry) => [entry.file.id, entry]))
+    const legacyDisposition = draft.input.ocrDispositionVersion !== 1
+    const dismissed = new Set(
+      (Array.isArray(draft.input.dismissedOcrFileIds)
+        ? draft.input.dismissedOcrFileIds
+        : [])
+        .filter((id): id is string => typeof id === 'string' && Boolean(id.trim()))
+        .map((id) => id.trim()),
+    )
+    const linkedFileIds = new Set<string>()
+    const persistedItems = Array.isArray(draft.input.items) ? draft.input.items : []
+    items.value = persistedItems.map((persisted, index) => {
+      const amountCents = moneyToCents(persisted.amount)
+      const validDate = isCalendarDate(persisted.date) ? persisted.date : undefined
+      const sourceFileId = typeof persisted.sourceFileId === 'string'
+        ? persisted.sourceFileId.trim()
+        : ''
+      if (sourceFileId) linkedFileIds.add(sourceFileId)
+      const candidate = sourceFileId ? candidateByFileId.get(sourceFileId)?.item : undefined
+      return {
+        id: sourceFileId ? `ocr-${sourceFileId}` : `draft-${draft.id}-item-${index}`,
+        ...(sourceFileId ? { sourceFileId } : {}),
+        category: typeof persisted.category === 'string' ? persisted.category : '',
+        date: validDate,
+        displayDate: typeof persisted.displayDate === 'string'
+          ? persisted.displayDate.trim()
+          : '',
+        description: typeof persisted.description === 'string'
+          ? persisted.description.trim()
+          : '',
+        amount: amountCents === null ? '' : centsToMoney(amountCents),
+        receiptCount: Number.isSafeInteger(persisted.receiptCount)
+          && persisted.receiptCount > 0
+          ? persisted.receiptCount
+          : 1,
+        source: sourceFileId ? 'ocr' : 'manual',
+        confidence: candidate?.confidence,
+        warnings: candidate?.warnings ?? [],
+      }
+    })
+    if (legacyDisposition) {
+      // v0 did not record provenance. Only bind a strict one-to-one exact
+      // match; edited, deleted, or ambiguous rows stay unresolved for an
+      // explicit user choice and are never silently restored or ignored.
+      const itemMatches = new Map<string, number[]>()
+      items.value.forEach((item, index) => {
+        if (item.sourceFileId) return
+        const key = legacyOcrMatchKey(item)
+        if (!key) return
+        itemMatches.set(key, [...(itemMatches.get(key) ?? []), index])
+      })
+      const candidateMatches = new Map<string, typeof candidates>()
+      for (const candidate of candidates) {
+        if (linkedFileIds.has(candidate.file.id) || dismissed.has(candidate.file.id)) continue
+        const key = legacyOcrMatchKey(candidate.item)
+        if (!key) continue
+        candidateMatches.set(key, [...(candidateMatches.get(key) ?? []), candidate])
+      }
+      for (const [key, indexes] of itemMatches) {
+        const matches = candidateMatches.get(key) ?? []
+        if (indexes.length !== 1 || matches.length !== 1) continue
+        const index = indexes[0]!
+        const { file, item: candidate } = matches[0]!
+        const persisted = items.value[index]!
+        items.value[index] = {
+          ...persisted,
+          id: `ocr-${file.id}`,
+          sourceFileId: file.id,
+          source: 'ocr',
+          confidence: candidate.confidence,
+          warnings: candidate.warnings,
+        }
+        linkedFileIds.add(file.id)
+      }
+    }
+    dismissedOcrFileIds.value = [...dismissed]
+    const undecidedCandidates = candidates.filter(
+      ({ file }) => !linkedFileIds.has(file.id) && !dismissed.has(file.id),
+    )
+    const recovered = legacyDisposition
+      ? []
+      : undecidedCandidates.map(({ item }) => item)
+    items.value.push(...recovered)
+    ocrUnavailable.value = draftFiles.some(
+      (file) => file.ocrResult?.error?.code === 'OCR_DISABLED',
+    )
+    totals.value = recovered.length
+      ? null
+      : {
+          ...draft.totals,
+          subsidy: draft.totals.subsidy ? { ...draft.totals.subsidy } : null,
+        }
+    calculationError.value = ''
+    calculating.value = false
+    calculationVersion += 1
+    calculatedSignature.value = recovered.length ? '' : calculationSignature(tripPayload())
+  }
+
   function removeItem(id: string): void {
+    const removed = items.value.find((item) => item.id === id)
+    if (
+      removed?.sourceFileId
+      && !dismissedOcrFileIds.value.includes(removed.sourceFileId)
+    ) {
+      dismissedOcrFileIds.value = [
+        ...dismissedOcrFileIds.value,
+        removed.sourceFileId,
+      ]
+    }
     items.value = items.value.filter((item) => item.id !== id)
     for (const receipt of receiptFiles.value) {
       if (receipt.ocrItemId === id) {
@@ -341,6 +564,36 @@ export const useExpenseStore = defineStore('expense', () => {
     }
     totals.value = null
     calculatedSignature.value = ''
+  }
+
+  function removeDraftFileAssociation(fileId: string): void {
+    const previousLength = items.value.length
+    items.value = items.value.filter((item) => item.sourceFileId !== fileId)
+    dismissedOcrFileIds.value = dismissedOcrFileIds.value.filter((id) => id !== fileId)
+    if (items.value.length !== previousLength) {
+      totals.value = null
+      calculatedSignature.value = ''
+    }
+  }
+
+  function dismissDraftOcrFile(fileId: string): boolean {
+    const normalized = fileId.trim()
+    if (!normalized || items.value.some((item) => item.sourceFileId === normalized)) return false
+    if (!dismissedOcrFileIds.value.includes(normalized)) {
+      dismissedOcrFileIds.value = [...dismissedOcrFileIds.value, normalized]
+    }
+    return true
+  }
+
+  function excelExpenseItems(): ExcelExpenseItemInput[] {
+    return items.value.map((item) => ({
+      category: item.category,
+      date: item.date ?? '',
+      displayDate: item.displayDate,
+      description: item.description,
+      amount: item.amount,
+      receiptCount: item.receiptCount,
+    }))
   }
 
   async function refreshCalculations(): Promise<void> {
@@ -356,7 +609,7 @@ export const useExpenseStore = defineStore('expense', () => {
     }
     calculating.value = true
     try {
-      const result = await calculateTotals(payload, items.value)
+      const result = await calculateTotals(payload, excelExpenseItems())
       if (version === calculationVersion) {
         totals.value = result
         calculatedSignature.value = calculationSignature(payload)
@@ -416,15 +669,20 @@ export const useExpenseStore = defineStore('expense', () => {
     return {
       project,
       trip: tripValue,
-      items: items.value.map((item) => ({
-        category: item.category,
-        date: item.date ?? '',
-        displayDate: item.displayDate,
-        description: item.description,
-        amount: item.amount,
-        receiptCount: item.receiptCount,
-      })),
+      items: excelExpenseItems(),
     }
+  }
+
+  function buildDraftExpenseItems(): ReimbursementDraftExpenseItemInput[] {
+    return items.value.map((item) => ({
+      ...(item.sourceFileId ? { sourceFileId: item.sourceFileId } : {}),
+      category: item.category,
+      date: item.date ?? '',
+      displayDate: item.displayDate,
+      description: item.description,
+      amount: item.amount,
+      receiptCount: item.receiptCount,
+    }))
   }
 
   function setTripType(value: TripType): void {
@@ -701,6 +959,7 @@ export const useExpenseStore = defineStore('expense', () => {
       noSubsidyException: false,
     })
     items.value = []
+    dismissedOcrFileIds.value = []
     includeSubsidy.value = false
     receiptFiles.value = []
     ocrUnavailable.value = false
@@ -717,6 +976,7 @@ export const useExpenseStore = defineStore('expense', () => {
     manualProjectText,
     trip,
     items,
+    dismissedOcrFileIds,
     sortedItems,
     includeSubsidy,
     receiptFiles,
@@ -746,11 +1006,16 @@ export const useExpenseStore = defineStore('expense', () => {
     tripPayload,
     loadCategories,
     upsertManualItem,
+    upsertDraftOcrItem,
+    hydrateFromDraft,
     removeItem,
+    removeDraftFileAssociation,
+    dismissDraftOcrFile,
     removeExpenseItem,
     refreshCalculations,
     projectPayload,
     buildExcelPayload,
+    buildDraftExpenseItems,
     setTripType,
     setSubsidyIncluded,
     addReceiptFiles,
