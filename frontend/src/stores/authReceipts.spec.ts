@@ -1,9 +1,15 @@
 import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { logout as logoutRequest } from '@/api/auth'
+import {
+  getMe,
+  logout as logoutRequest,
+  selectDepartment as selectDepartmentRequest,
+} from '@/api/auth'
+import { getOaReimbursementOptions } from '@/api/reimbursements'
 import { useAuthStore } from '@/stores/auth'
 import { useExpenseStore } from '@/stores/expense'
+import { useReimbursementDraftStore } from '@/stores/reimbursementDraft'
 
 const callbacks = vi.hoisted(() => ({ unauthorized: null as (() => void) | null }))
 
@@ -34,6 +40,24 @@ vi.mock('@/api/receipts', () => ({
   uploadReceiptFile: vi.fn(),
 }))
 
+vi.mock('@/api/reimbursements', () => ({
+  createReimbursementDraft: vi.fn(),
+  deleteReimbursementDraft: vi.fn(),
+  deleteReimbursementDraftFile: vi.fn(),
+  getOaReimbursementOptions: vi.fn(),
+  getReimbursementDraft: vi.fn(),
+  getReimbursementDraftExcelPreview: vi.fn(),
+  listOaTravelApprovals: vi.fn(),
+  listReimbursementDraftFiles: vi.fn(),
+  listReimbursementDrafts: vi.fn(),
+  markReimbursementDraftReviewReady: vi.fn(),
+  recognizeReimbursementDraftFile: vi.fn(),
+  replaceReimbursementRelatedApprovals: vi.fn(),
+  updateReimbursementDraft: vi.fn(),
+  updateReimbursementDraftFile: vi.fn(),
+  uploadReimbursementDraftFile: vi.fn(),
+}))
+
 function seedReceiptMemory(): ReturnType<typeof useExpenseStore> {
   const expense = useExpenseStore()
   expense.receiptFiles.push({
@@ -59,31 +83,140 @@ function seedReceiptMemory(): ReturnType<typeof useExpenseStore> {
   return expense
 }
 
-describe('authentication clears receipt memory', () => {
+function session(userId = 'user-a', departmentId = '100', csrfToken = 'csrf-a') {
+  return {
+    user: { userId, name: `用户 ${userId}` },
+    departments: [
+      { id: '100', name: '测试部门' },
+      { id: '200', name: '另一个部门' },
+    ],
+    selectedDepartment: { id: departmentId, name: `部门 ${departmentId}` },
+    isAdmin: false,
+    csrfToken,
+  }
+}
+
+function seedDraftMemory(): ReturnType<typeof useReimbursementDraftStore> {
+  const drafts = useReimbursementDraftStore()
+  drafts.drafts = [{
+    id: 'draft-a',
+    status: 'DRAFT',
+    revision: 1,
+    department: { id: '100', name: '测试部门' },
+    templateConfigVersion: 12,
+    relatedApprovalCount: 0,
+    expiresAt: '2026-10-04T00:00:00Z',
+    createdAt: '2026-09-04T00:00:00Z',
+    updatedAt: '2026-09-04T00:00:00Z',
+    lockedAt: null,
+  }]
+  drafts.reimbursementOptions = {
+    templateConfigVersion: 12,
+    reimbursementProcessCode: 'PROC-REIMBURSEMENT',
+    companyOptions: [],
+    budgetCodeOptions: [],
+    travelProfiles: [],
+  }
+  return drafts
+}
+
+describe('authentication clears scoped client memory', () => {
   beforeEach(() => {
     callbacks.unauthorized = null
     setActivePinia(createPinia())
-    vi.mocked(logoutRequest).mockClear()
+    vi.clearAllMocks()
+    vi.mocked(logoutRequest).mockResolvedValue(undefined)
   })
 
-  it('clears files and OCR candidates when the HTTP client reports 401', () => {
+  it('aborts and clears receipt and reimbursement memory on HTTP 401', () => {
     useAuthStore()
     const expense = seedReceiptMemory()
+    const drafts = seedDraftMemory()
+    let signal: AbortSignal | undefined
+    vi.mocked(getOaReimbursementOptions).mockImplementation((options) => {
+      signal = options?.signal
+      return new Promise(() => undefined)
+    })
+    void drafts.loadReimbursementOptions()
 
     callbacks.unauthorized?.()
 
+    expect(signal?.aborted).toBe(true)
     expect(expense.receiptFiles).toEqual([])
     expect(expense.items).toEqual([])
+    expect(drafts.drafts).toEqual([])
+    expect(drafts.reimbursementOptions).toBeNull()
   })
 
-  it('clears files and OCR candidates after logout', async () => {
+  it('clears files, OCR candidates and reimbursement state after logout', async () => {
     const auth = useAuthStore()
     const expense = seedReceiptMemory()
+    const drafts = seedDraftMemory()
 
     await auth.logout()
 
     expect(logoutRequest).toHaveBeenCalledOnce()
     expect(expense.receiptFiles).toEqual([])
     expect(expense.items).toEqual([])
+    expect(drafts.drafts).toEqual([])
+    expect(drafts.reimbursementOptions).toBeNull()
+  })
+
+  it('clears client state even when the logout request fails', async () => {
+    const auth = useAuthStore()
+    const expense = seedReceiptMemory()
+    const drafts = seedDraftMemory()
+    vi.mocked(logoutRequest).mockRejectedValue(new Error('network unavailable'))
+
+    await expect(auth.logout()).rejects.toThrow('network unavailable')
+
+    expect(expense.receiptFiles).toEqual([])
+    expect(drafts.drafts).toEqual([])
+    expect(auth.session).toBeNull()
+    expect(auth.status).toBe('unauthorized')
+  })
+
+  it('resets scoped stores before switching department', async () => {
+    const auth = useAuthStore()
+    auth.session = session()
+    auth.status = 'authenticated'
+    const expense = seedReceiptMemory()
+    const drafts = seedDraftMemory()
+    vi.mocked(selectDepartmentRequest).mockResolvedValue({
+      id: '200', name: '另一个部门',
+    })
+
+    await auth.selectDepartment('200')
+
+    expect(selectDepartmentRequest).toHaveBeenCalledWith('200')
+    expect(auth.session?.selectedDepartment?.id).toBe('200')
+    expect(expense.receiptFiles).toEqual([])
+    expect(drafts.drafts).toEqual([])
+  })
+
+  it('clears reimbursement state when refresh discovers a different user', async () => {
+    const auth = useAuthStore()
+    auth.session = session('user-a', '100', 'old-csrf')
+    auth.status = 'authenticated'
+    const drafts = seedDraftMemory()
+    vi.mocked(getMe).mockResolvedValue(session('user-b', '100', 'new-csrf'))
+
+    await auth.refreshMe()
+
+    expect(auth.session?.user.userId).toBe('user-b')
+    expect(drafts.drafts).toEqual([])
+  })
+
+  it('preserves reimbursement state for a CSRF-only session refresh', async () => {
+    const auth = useAuthStore()
+    auth.session = session('user-a', '100', 'old-csrf')
+    auth.status = 'authenticated'
+    const drafts = seedDraftMemory()
+    vi.mocked(getMe).mockResolvedValue(session('user-a', '100', 'rotated-csrf'))
+
+    await auth.refreshMe()
+
+    expect(auth.session?.csrfToken).toBe('rotated-csrf')
+    expect(drafts.drafts.map((draft) => draft.id)).toEqual(['draft-a'])
   })
 })

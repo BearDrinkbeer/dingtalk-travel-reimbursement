@@ -1,6 +1,7 @@
 import io
 import json
 import logging
+import threading
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from app.core.config import Settings
 from app.core.logging import JsonFormatter
 from app.core.request_id import current_request_id
 from app.main import create_app
+from app.services.reimbursement_quota import ReimbursementQuotaCoordinator
 from app.services.reimbursement_staging import StagingLayoutError
 
 
@@ -37,6 +39,31 @@ def test_health_returns_success_envelope_and_request_id(tmp_path: Path) -> None:
     assert application.state.reimbursement_staging.root == tmp_path / "reimbursement-staging"
     assert (tmp_path / "reimbursement-staging" / "drafts").is_dir()
     assert (tmp_path / "reimbursement-staging" / "generated").is_dir()
+
+
+def test_reimbursement_staging_is_reclaimed_on_startup_and_periodically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    periodic_call = threading.Event()
+
+    def record_reclaim(_coordinator: ReimbursementQuotaCoordinator) -> int:
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            periodic_call.set()
+        return 0
+
+    monkeypatch.setattr(ReimbursementQuotaCoordinator, "reclaim_expired", record_reclaim)
+    settings = make_test_settings(tmp_path)
+    settings.temp_cleanup_interval_seconds = 1
+
+    with TestClient(create_app(settings)) as client:
+        assert client.get("/api/health").status_code == 200
+        assert periodic_call.wait(timeout=3)
+
+    assert calls >= 2
 
 
 def test_startup_failure_closes_external_clients_and_database(tmp_path: Path) -> None:

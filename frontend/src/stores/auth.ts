@@ -14,6 +14,7 @@ import { setCsrfToken, setUnauthorizedHandler } from '@/api/http'
 import type { AuthSession } from '@/types/auth'
 import { requestDingTalkAuthCode } from '@/utils/dingtalk'
 import { useExpenseStore } from '@/stores/expense'
+import { useReimbursementDraftStore } from '@/stores/reimbursementDraft'
 
 export type AuthStatus =
   | 'idle'
@@ -33,7 +34,16 @@ export const useAuthStore = defineStore('auth', () => {
   const initialized = computed(() => status.value !== 'idle' && status.value !== 'loading')
   const isAdmin = computed(() => session.value?.isAdmin === true)
 
+  function sameSessionScope(left: AuthSession | null, right: AuthSession): boolean {
+    return left?.user.userId === right.user.userId
+      && left.selectedDepartment?.id === right.selectedDepartment?.id
+  }
+
   function applySession(value: AuthSession): void {
+    if (!sameSessionScope(session.value, value)) {
+      useReimbursementDraftStore().reset()
+      if (session.value !== null) useExpenseStore().reset()
+    }
     session.value = value
     setCsrfToken(value.csrfToken)
     status.value = value.selectedDepartment ? 'authenticated' : 'department_required'
@@ -42,6 +52,7 @@ export const useAuthStore = defineStore('auth', () => {
 
   function clearAsUnauthorized(): void {
     useExpenseStore().reset()
+    useReimbursementDraftStore().reset()
     session.value = null
     setCsrfToken(null)
     if (status.value !== 'loading') status.value = 'unauthorized'
@@ -105,14 +116,20 @@ export const useAuthStore = defineStore('auth', () => {
 
   async function selectDepartment(departmentId: string): Promise<void> {
     if (!session.value) return
+    useExpenseStore().reset()
+    useReimbursementDraftStore().reset()
     session.value.selectedDepartment = await selectDepartmentRequest(departmentId)
     status.value = 'authenticated'
   }
 
   async function logout(): Promise<void> {
-    await logoutRequest()
     useExpenseStore().reset()
-    clearAsUnauthorized()
+    useReimbursementDraftStore().reset()
+    try {
+      await logoutRequest()
+    } finally {
+      clearAsUnauthorized()
+    }
   }
 
   return {

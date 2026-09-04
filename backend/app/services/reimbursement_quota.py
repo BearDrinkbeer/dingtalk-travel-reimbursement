@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -8,10 +9,12 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TypeAlias
 
-from sqlalchemy import Engine, Select, select, text
+from sqlalchemy import Engine, Select, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
+from app.core.errors import ApiError
 from app.models.reimbursement import (
     ReimbursementDraft,
     ReimbursementDraftFile,
@@ -27,8 +30,10 @@ from app.models.reimbursement import (
     new_uuid,
     utc_now,
 )
+from app.services.reimbursement_drafts import DraftActor, bump_owned_draft_revision
 from app.services.reimbursement_staging import (
     ReimbursementStaging,
+    ReimbursementStagingError,
     StagedObject,
     StagingArea,
     StagingReservation,
@@ -39,6 +44,7 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _ACTIVE_DRAFT_STATUSES = frozenset(
     {ReimbursementDraftStatus.DRAFT.value, ReimbursementDraftStatus.REVIEW_READY.value}
 )
+_LOGGER = logging.getLogger(__name__)
 
 
 class ReimbursementQuotaError(RuntimeError):
@@ -97,6 +103,37 @@ class QuotaUsage:
     @property
     def available_bytes(self) -> int:
         return max(0, self.maximum_bytes - self.reserved_bytes)
+
+
+@dataclass(frozen=True, slots=True)
+class _DraftFileCleanup:
+    file_status: str
+    storage_key: str
+    part_storage_key: str | None
+    reserved_bytes: int
+    size_bytes: int | None
+    sha256: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ExpiredDraftCleanup:
+    draft_id: str
+    actor: DraftActor
+    revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class _DeletingDraftFileCleanup:
+    file_id: str
+    draft_id: str
+    actor: DraftActor
+    draft_revision: int
+    draft_status: str
+    draft_expires_at: datetime
+    storage_key: str
+    reserved_bytes: int
+    size_bytes: int
+    sha256: str
 
 
 class ReimbursementQuotaCoordinator:
@@ -165,6 +202,22 @@ class ReimbursementQuotaCoordinator:
                         "draft ownership, revision, or state changed"
                     )
                 self._admit(database, reserved_bytes)
+                claimed_revision = bump_owned_draft_revision(
+                    database,
+                    draft_id=draft.id,
+                    actor=DraftActor(
+                        corp_id=owner.corp_id,
+                        user_id=owner.user_id,
+                        department_id=draft.department_id,
+                        department_name=draft.department_name,
+                    ),
+                    expected_revision=owner.expected_revision,
+                    now=now,
+                )
+                if claimed_revision != _draft_operation_revision(owner):
+                    raise ReimbursementReservationConflict(
+                        "draft reservation claimed an unexpected revision"
+                    )
                 database.add(
                     ReimbursementDraftFile(
                         id=record_id,
@@ -280,19 +333,7 @@ class ReimbursementQuotaCoordinator:
         reservation: QuotaReservation,
         staged: StagedObject,
     ) -> None:
-        if not isinstance(staged, StagedObject):
-            raise ValueError("staged object is required")
-        if staged.storage_key != reservation.staging.storage_key:
-            raise ReimbursementReservationConflict("staged object does not match reservation")
-        if (
-            isinstance(staged.size_bytes, bool)
-            or not isinstance(staged.size_bytes, int)
-            or staged.size_bytes < 1
-            or staged.size_bytes > reservation.staging.reserved_bytes
-        ):
-            raise ReimbursementReservationConflict("staged object exceeds reservation")
-        if not _valid_sha256(staged.sha256):
-            raise ReimbursementReservationConflict("staged object digest is invalid")
+        _validate_staged_object(reservation, staged)
 
         with self._write_session() as database:
             record = self._owned_record(database, authority, reservation, now=utc_now())
@@ -307,6 +348,81 @@ class ReimbursementQuotaCoordinator:
             else:
                 record.local_status = ReimbursementUploadLocalStatus.READY.value
                 record.local_part_storage_key = None
+
+    def finalize_draft_file(
+        self,
+        owner: DraftFileOwner,
+        reservation: QuotaReservation,
+        staged: StagedObject,
+        *,
+        actor: DraftActor,
+    ) -> int:
+        """Finalize a durable draft file and claim its draft revision atomically."""
+
+        _validate_staged_object(reservation, staged)
+        if reservation.kind is not ReservationKind.DRAFT_FILE:
+            raise ReimbursementReservationConflict("reservation is not a draft file")
+        if actor.corp_id != owner.corp_id or actor.user_id != owner.user_id:
+            raise ReimbursementReservationConflict("draft file actor does not own reservation")
+        with self._write_session() as database:
+            record = self._owned_record(database, owner, reservation, now=utc_now())
+            if not isinstance(record, ReimbursementDraftFile):
+                raise ReimbursementReservationConflict("reservation is not a draft file")
+            if record.file_status != ReimbursementDraftFileStatus.WRITING.value:
+                raise ReimbursementReservationConflict("reservation is not being written")
+            record.size_bytes = staged.size_bytes
+            record.sha256 = staged.sha256
+            record.reservation_expires_at = None
+            record.file_status = ReimbursementDraftFileStatus.ACTIVE.value
+            record.part_storage_key = None
+        return _draft_operation_revision(owner)
+
+    def abandon_draft_file(
+        self,
+        owner: DraftFileOwner,
+        reservation: QuotaReservation,
+    ) -> None:
+        """Discard only this unfinished draft reservation, even after revision drift.
+
+        The exact generated storage and part keys remain mandatory. An ACTIVE
+        file is never touched, which makes this safe after an uncertain local
+        finalize result.
+        """
+
+        if reservation.kind is not ReservationKind.DRAFT_FILE:
+            raise ReimbursementReservationConflict("reservation is not a draft file")
+        expected = reservation.staging
+        with self._write_session() as database:
+            record = database.scalar(
+                select(ReimbursementDraftFile)
+                .join(ReimbursementDraft, ReimbursementDraft.id == ReimbursementDraftFile.draft_id)
+                .where(
+                    ReimbursementDraftFile.id == reservation.record_id,
+                    ReimbursementDraftFile.draft_id == owner.draft_id,
+                    ReimbursementDraftFile.storage_key == expected.storage_key,
+                    ReimbursementDraftFile.part_storage_key == expected.part_storage_key,
+                    ReimbursementDraftFile.reserved_bytes == expected.reserved_bytes,
+                    ReimbursementDraftFile.file_status.in_(
+                        {
+                            ReimbursementDraftFileStatus.RESERVED.value,
+                            ReimbursementDraftFileStatus.WRITING.value,
+                        }
+                    ),
+                    ReimbursementDraft.corp_id == owner.corp_id,
+                    ReimbursementDraft.owner_user_id == owner.user_id,
+                )
+            )
+            if record is None:
+                # A successful finalize removes the part key and is deliberately
+                # indistinguishable here from any other non-abandonable state.
+                raise ReimbursementReservationConflict(
+                    "unfinished draft reservation no longer exists"
+                )
+            self._staging.discard_reservation(expected)
+            record.file_status = ReimbursementDraftFileStatus.PURGED.value
+            record.part_storage_key = None
+            record.reservation_expires_at = None
+            record.purged_at = utc_now()
 
     def release(
         self,
@@ -396,19 +512,197 @@ class ReimbursementQuotaCoordinator:
                 record.local_deleted_at = now
                 record.status_version += 1
 
-    def reclaim_expired(self, *, now: datetime | None = None) -> int:
-        """Release only expired, unowned write attempts.
+    def delete_owned_draft(
+        self,
+        *,
+        actor: DraftActor,
+        draft_id: str,
+        expected_revision: int,
+    ) -> str:
+        """Persist a delete intent, clean local files, then delete the draft."""
 
-        Active submission leases and any upload that reached a remote mutation
-        state are deliberately excluded. Filesystem names are removed before
-        the database rows stop contributing to quota.
+        if not isinstance(actor, DraftActor):
+            raise ValueError("draft actor is required")
+        if isinstance(expected_revision, bool) or expected_revision < 1:
+            raise ValueError("expected_revision must be positive")
+        normalized_draft_id = _required_text(draft_id, maximum=36)
+        now = utc_now()
+
+        with self._write_session() as database:
+            draft = database.scalar(
+                select(ReimbursementDraft).where(
+                    ReimbursementDraft.id == normalized_draft_id,
+                    ReimbursementDraft.corp_id == actor.corp_id,
+                    ReimbursementDraft.owner_user_id == actor.user_id,
+                )
+            )
+            if draft is None:
+                raise _draft_not_found_error()
+            _require_draft_department(draft, actor)
+            if (
+                draft.status == ReimbursementDraftStatus.LOCKED.value
+                or draft.locked_at is not None
+            ):
+                raise _draft_locked_error()
+            if database.scalar(
+                select(ReimbursementSubmission.id)
+                .where(ReimbursementSubmission.draft_id == draft.id)
+                .limit(1)
+            ) is not None:
+                raise _draft_in_use_error()
+
+            if draft.status == ReimbursementDraftStatus.EXPIRED.value:
+                operation_revision = draft.revision
+                if expected_revision not in {
+                    operation_revision,
+                    operation_revision - 1,
+                }:
+                    raise _draft_revision_conflict_error()
+            else:
+                if (
+                    draft.status not in _ACTIVE_DRAFT_STATUSES
+                    or draft.revision != expected_revision
+                ):
+                    raise _draft_revision_conflict_error()
+                operation_revision = expected_revision + 1
+                draft.status = ReimbursementDraftStatus.EXPIRED.value
+                draft.revision = operation_revision
+                draft.updated_at = now
+
+            cleanup: list[_DraftFileCleanup] = []
+            files = database.scalars(
+                select(ReimbursementDraftFile).where(
+                    ReimbursementDraftFile.draft_id == draft.id,
+                    ReimbursementDraftFile.file_status
+                    != ReimbursementDraftFileStatus.PURGED.value,
+                )
+            ).all()
+            for record in files:
+                if record.file_status == ReimbursementDraftFileStatus.ACTIVE.value:
+                    record.file_status = ReimbursementDraftFileStatus.DELETING.value
+                cleanup.append(
+                    _DraftFileCleanup(
+                        file_status=record.file_status,
+                        storage_key=record.storage_key,
+                        part_storage_key=record.part_storage_key,
+                        reserved_bytes=record.reserved_bytes,
+                        size_bytes=record.size_bytes,
+                        sha256=record.sha256,
+                    )
+                )
+
+        try:
+            for item in cleanup:
+                _delete_draft_file_cleanup(self._staging, item)
+        except ReimbursementStagingError as exc:
+            raise ApiError(
+                "REIMBURSEMENT_STORAGE_ERROR",
+                "票据文件删除失败，请重试",
+                500,
+            ) from exc
+
+        with self._write_session() as database:
+            draft = database.scalar(
+                select(ReimbursementDraft).where(
+                    ReimbursementDraft.id == normalized_draft_id,
+                    ReimbursementDraft.corp_id == actor.corp_id,
+                    ReimbursementDraft.owner_user_id == actor.user_id,
+                    ReimbursementDraft.department_id == actor.department_id,
+                    ReimbursementDraft.department_name == actor.department_name,
+                    ReimbursementDraft.status == ReimbursementDraftStatus.EXPIRED.value,
+                    ReimbursementDraft.revision == operation_revision,
+                )
+            )
+            if draft is None:
+                # A concurrent retry may already have completed after this call
+                # authenticated the same durable delete intent.
+                return normalized_draft_id
+            if database.scalar(
+                select(ReimbursementSubmission.id)
+                .where(ReimbursementSubmission.draft_id == draft.id)
+                .limit(1)
+            ) is not None:
+                raise _draft_in_use_error()
+            database.delete(draft)
+        return normalized_draft_id
+
+    def reclaim_expired(self, *, now: datetime | None = None) -> int:
+        """Delete expired drafts and release abandoned local write attempts.
+
+        Draft deletion reuses the durable two-phase delete intent and is isolated
+        per draft so one local cleanup failure can be retried without blocking
+        others. Locked/submitted drafts, active submission leases, and uploads
+        that reached a remote mutation state are deliberately excluded.
         """
+
+        schema = inspect(self._engine)
+        if not all(
+            schema.has_table(table_name)
+            for table_name in (
+                ReimbursementDraft.__tablename__,
+                ReimbursementDraftFile.__tablename__,
+                ReimbursementSubmission.__tablename__,
+                ReimbursementUpload.__tablename__,
+            )
+        ):
+            return 0
 
         cutoff = _naive_utc(now) if now is not None else utc_now()
         reclaimed = 0
+        with Session(self._engine) as database:
+            expired_drafts = [
+                _ExpiredDraftCleanup(
+                    draft_id=draft.id,
+                    actor=DraftActor(
+                        corp_id=draft.corp_id,
+                        user_id=draft.owner_user_id,
+                        department_id=draft.department_id,
+                        department_name=draft.department_name,
+                    ),
+                    revision=draft.revision,
+                )
+                for draft in database.scalars(
+                    select(ReimbursementDraft).where(
+                        ReimbursementDraft.status.in_(
+                            {
+                                *_ACTIVE_DRAFT_STATUSES,
+                                ReimbursementDraftStatus.EXPIRED.value,
+                            }
+                        ),
+                        ReimbursementDraft.locked_at.is_(None),
+                        (
+                            (ReimbursementDraft.expires_at <= cutoff)
+                            | (
+                                ReimbursementDraft.status
+                                == ReimbursementDraftStatus.EXPIRED.value
+                            )
+                        ),
+                        ~select(ReimbursementSubmission.id)
+                        .where(ReimbursementSubmission.draft_id == ReimbursementDraft.id)
+                        .exists(),
+                    )
+                ).all()
+            ]
+        for draft in expired_drafts:
+            try:
+                self.delete_owned_draft(
+                    actor=draft.actor,
+                    draft_id=draft.draft_id,
+                    expected_revision=draft.revision,
+                )
+            except (ApiError, ReimbursementQuotaError):
+                _LOGGER.exception(
+                    "Failed to reclaim expired reimbursement draft %s",
+                    draft.draft_id,
+                )
+            else:
+                reclaimed += 1
+
         with self._write_session() as database:
             draft_records = database.scalars(
-                select(ReimbursementDraftFile).where(
+                select(ReimbursementDraftFile)
+                .join(ReimbursementDraft, ReimbursementDraft.id == ReimbursementDraftFile.draft_id)
+                .where(
                     ReimbursementDraftFile.file_status.in_(
                         {
                             ReimbursementDraftFileStatus.RESERVED.value,
@@ -417,6 +711,9 @@ class ReimbursementQuotaCoordinator:
                     ),
                     ReimbursementDraftFile.reservation_expires_at.is_not(None),
                     ReimbursementDraftFile.reservation_expires_at <= cutoff,
+                    ReimbursementDraft.status.in_(_ACTIVE_DRAFT_STATUSES),
+                    ReimbursementDraft.locked_at.is_(None),
+                    ReimbursementDraft.expires_at > cutoff,
                     ~select(ReimbursementSubmission.id)
                     .where(ReimbursementSubmission.draft_id == ReimbursementDraftFile.draft_id)
                     .exists(),
@@ -427,7 +724,14 @@ class ReimbursementQuotaCoordinator:
             ).all()
             for record in draft_records:
                 reservation = _draft_staging_reservation(record)
-                self._staging.discard_reservation(reservation)
+                try:
+                    self._staging.discard_reservation(reservation)
+                except (OSError, ReimbursementStagingError):
+                    _LOGGER.exception(
+                        "Failed to reclaim expired draft file reservation %s",
+                        record.id,
+                    )
+                    continue
                 record.file_status = ReimbursementDraftFileStatus.PURGED.value
                 record.part_storage_key = None
                 record.reservation_expires_at = None
@@ -460,7 +764,14 @@ class ReimbursementQuotaCoordinator:
             ).all()
             for record in upload_records:
                 reservation = _upload_staging_reservation(record)
-                self._staging.discard_reservation(reservation)
+                try:
+                    self._staging.discard_reservation(reservation)
+                except (OSError, ReimbursementStagingError):
+                    _LOGGER.exception(
+                        "Failed to reclaim expired generated upload reservation %s",
+                        record.id,
+                    )
+                    continue
                 record.upload_status = ReimbursementUploadStatus.DISCARDED.value
                 record.local_status = ReimbursementUploadLocalStatus.DELETED.value
                 record.local_part_storage_key = None
@@ -468,7 +779,122 @@ class ReimbursementQuotaCoordinator:
                 record.local_deleted_at = cutoff
                 record.status_version += 1
                 reclaimed += 1
+
+        deleting_files = self._deleting_draft_file_cleanups(cutoff=cutoff)
+        for item in deleting_files:
+            # Verification reads the complete object. Keep it outside the SQLite
+            # write transaction so a large stale file cannot block every writer.
+            try:
+                self._staging.delete(
+                    item.storage_key,
+                    expected_size=item.size_bytes,
+                    expected_sha256=item.sha256,
+                    missing_ok=True,
+                )
+            except (OSError, ReimbursementStagingError):
+                _LOGGER.exception(
+                    "Failed to reclaim deleting draft file %s",
+                    item.file_id,
+                )
+                continue
+            if self._finalize_deleting_draft_file(item, cutoff=cutoff):
+                reclaimed += 1
         return reclaimed
+
+    def _deleting_draft_file_cleanups(
+        self,
+        *,
+        cutoff: datetime,
+    ) -> list[_DeletingDraftFileCleanup]:
+        """Snapshot durable delete intents without taking the SQLite write lock."""
+
+        with Session(self._engine) as database:
+            rows = database.execute(
+                select(ReimbursementDraftFile, ReimbursementDraft)
+                .join(ReimbursementDraft, ReimbursementDraft.id == ReimbursementDraftFile.draft_id)
+                .where(
+                    ReimbursementDraftFile.file_status
+                    == ReimbursementDraftFileStatus.DELETING.value,
+                    ReimbursementDraftFile.size_bytes.is_not(None),
+                    ReimbursementDraftFile.sha256.is_not(None),
+                    ReimbursementDraft.status.in_(_ACTIVE_DRAFT_STATUSES),
+                    ReimbursementDraft.locked_at.is_(None),
+                    ReimbursementDraft.expires_at > cutoff,
+                    ~select(ReimbursementSubmission.id)
+                    .where(ReimbursementSubmission.draft_id == ReimbursementDraftFile.draft_id)
+                    .exists(),
+                    ~select(ReimbursementUpload.id)
+                    .where(ReimbursementUpload.source_draft_file_id == ReimbursementDraftFile.id)
+                    .exists(),
+                )
+            ).all()
+            return [
+                _DeletingDraftFileCleanup(
+                    file_id=file.id,
+                    draft_id=file.draft_id,
+                    actor=DraftActor(
+                        corp_id=draft.corp_id,
+                        user_id=draft.owner_user_id,
+                        department_id=draft.department_id,
+                        department_name=draft.department_name,
+                    ),
+                    draft_revision=draft.revision,
+                    draft_status=draft.status,
+                    draft_expires_at=draft.expires_at,
+                    storage_key=file.storage_key,
+                    reserved_bytes=file.reserved_bytes,
+                    size_bytes=file.size_bytes,
+                    sha256=file.sha256,
+                )
+                for file, draft in rows
+                if file.size_bytes is not None and file.sha256 is not None
+            ]
+
+    def _finalize_deleting_draft_file(
+        self,
+        item: _DeletingDraftFileCleanup,
+        *,
+        cutoff: datetime,
+    ) -> bool:
+        """CAS one physically removed delete intent to PURGED in a short transaction."""
+
+        with self._write_session() as database:
+            record = database.scalar(
+                select(ReimbursementDraftFile)
+                .join(ReimbursementDraft, ReimbursementDraft.id == ReimbursementDraftFile.draft_id)
+                .where(
+                    ReimbursementDraftFile.id == item.file_id,
+                    ReimbursementDraftFile.draft_id == item.draft_id,
+                    ReimbursementDraftFile.file_status
+                    == ReimbursementDraftFileStatus.DELETING.value,
+                    ReimbursementDraftFile.storage_key == item.storage_key,
+                    ReimbursementDraftFile.reserved_bytes == item.reserved_bytes,
+                    ReimbursementDraftFile.size_bytes == item.size_bytes,
+                    ReimbursementDraftFile.sha256 == item.sha256,
+                    ReimbursementDraft.corp_id == item.actor.corp_id,
+                    ReimbursementDraft.owner_user_id == item.actor.user_id,
+                    ReimbursementDraft.department_id == item.actor.department_id,
+                    ReimbursementDraft.department_name == item.actor.department_name,
+                    ReimbursementDraft.revision == item.draft_revision,
+                    ReimbursementDraft.status == item.draft_status,
+                    ReimbursementDraft.locked_at.is_(None),
+                    ReimbursementDraft.expires_at == item.draft_expires_at,
+                    ReimbursementDraft.expires_at > cutoff,
+                    ~select(ReimbursementSubmission.id)
+                    .where(ReimbursementSubmission.draft_id == ReimbursementDraftFile.draft_id)
+                    .exists(),
+                    ~select(ReimbursementUpload.id)
+                    .where(ReimbursementUpload.source_draft_file_id == ReimbursementDraftFile.id)
+                    .exists(),
+                )
+            )
+            if record is None:
+                return False
+            record.file_status = ReimbursementDraftFileStatus.PURGED.value
+            record.part_storage_key = None
+            record.reservation_expires_at = None
+            record.purged_at = cutoff
+            return True
 
     def _admit(self, database: Session, requested_bytes: int) -> None:
         reserved_bytes = int(database.execute(_usage_statement()).scalar_one())
@@ -517,8 +943,10 @@ class ReimbursementQuotaCoordinator:
                     ReimbursementDraftFile.reserved_bytes == expected.reserved_bytes,
                     ReimbursementDraft.corp_id == authority.corp_id,
                     ReimbursementDraft.owner_user_id == authority.user_id,
-                    ReimbursementDraft.revision == authority.expected_revision,
+                    ReimbursementDraft.revision == _draft_operation_revision(authority),
                     ReimbursementDraft.status.in_(_ACTIVE_DRAFT_STATUSES),
+                    ReimbursementDraft.locked_at.is_(None),
+                    ReimbursementDraft.expires_at > now,
                 )
             )
         elif reservation.kind is ReservationKind.GENERATED_UPLOAD and isinstance(
@@ -532,19 +960,13 @@ class ReimbursementQuotaCoordinator:
                 )
                 .where(
                     ReimbursementUpload.id == reservation.record_id,
-                    ReimbursementUpload.submission_id == authority.submission_id,
                     ReimbursementUpload.role == ReimbursementUploadRole.GENERATED_EXCEL.value,
                     ReimbursementUpload.local_storage_key == expected.storage_key,
                     ReimbursementUpload.local_part_storage_key == expected.part_storage_key,
                     ReimbursementUpload.reserved_bytes == expected.reserved_bytes,
-                    ReimbursementSubmission.corp_id == authority.corp_id,
-                    ReimbursementSubmission.originator_user_id == authority.user_id,
+                    *_submission_lease_conditions(authority, now=now),
                     ReimbursementSubmission.status
                     == ReimbursementSubmissionStatus.GENERATING_EXCEL.value,
-                    ReimbursementSubmission.status_version == authority.expected_status_version,
-                    ReimbursementSubmission.lease_token == authority.lease_token,
-                    ReimbursementSubmission.lease_expires_at.is_not(None),
-                    ReimbursementSubmission.lease_expires_at > now,
                 )
             )
         else:
@@ -577,7 +999,7 @@ class ReimbursementQuotaCoordinator:
                     ReimbursementDraftFile.reserved_bytes == expected.reserved_bytes,
                     ReimbursementDraft.corp_id == authority.corp_id,
                     ReimbursementDraft.owner_user_id == authority.user_id,
-                    ReimbursementDraft.revision == authority.expected_revision,
+                    ReimbursementDraft.revision == _draft_operation_revision(authority),
                     ReimbursementDraft.status.in_(_ACTIVE_DRAFT_STATUSES),
                 )
             )
@@ -592,16 +1014,10 @@ class ReimbursementQuotaCoordinator:
                 )
                 .where(
                     ReimbursementUpload.id == reservation.record_id,
-                    ReimbursementUpload.submission_id == authority.submission_id,
                     ReimbursementUpload.role == ReimbursementUploadRole.GENERATED_EXCEL.value,
                     ReimbursementUpload.local_storage_key == expected.storage_key,
                     ReimbursementUpload.reserved_bytes == expected.reserved_bytes,
-                    ReimbursementSubmission.corp_id == authority.corp_id,
-                    ReimbursementSubmission.originator_user_id == authority.user_id,
-                    ReimbursementSubmission.status_version == authority.expected_status_version,
-                    ReimbursementSubmission.lease_token == authority.lease_token,
-                    ReimbursementSubmission.lease_expires_at.is_not(None),
-                    ReimbursementSubmission.lease_expires_at > now,
+                    *_submission_lease_conditions(authority, now=now),
                 )
             )
         else:
@@ -615,6 +1031,77 @@ class ReimbursementQuotaCoordinator:
         ):
             raise ReimbursementReservationConflict("reservation attempt changed")
         return record
+
+
+def _delete_draft_file_cleanup(
+    staging: ReimbursementStaging,
+    item: _DraftFileCleanup,
+) -> None:
+    if item.file_status in {
+        ReimbursementDraftFileStatus.RESERVED.value,
+        ReimbursementDraftFileStatus.WRITING.value,
+    }:
+        if item.part_storage_key is None:
+            raise ReimbursementReservationConflict(
+                "draft reservation attempt is incomplete"
+            )
+        staging.discard_reservation(
+            StagingReservation(
+                storage_key=item.storage_key,
+                part_storage_key=item.part_storage_key,
+                reserved_bytes=item.reserved_bytes,
+            )
+        )
+        return
+    if item.file_status == ReimbursementDraftFileStatus.DELETING.value:
+        if item.size_bytes is None or item.sha256 is None:
+            raise ReimbursementReservationConflict("draft file metadata is incomplete")
+        staging.delete(
+            item.storage_key,
+            expected_size=item.size_bytes,
+            expected_sha256=item.sha256,
+            missing_ok=True,
+        )
+        return
+    if item.file_status == ReimbursementDraftFileStatus.FAILED.value:
+        # Current writers purge failed reservations themselves. A legacy FAILED
+        # row has no trustworthy digest and therefore owns no safely deletable
+        # final object.
+        return
+    raise ReimbursementReservationConflict("draft file is not deletable")
+
+
+def _require_draft_department(draft: ReimbursementDraft, actor: DraftActor) -> None:
+    if draft.department_id != actor.department_id or draft.department_name != actor.department_name:
+        raise ApiError(
+            "REIMBURSEMENT_DRAFT_DEPARTMENT_MISMATCH",
+            "草稿所属部门与当前选择不同，请切换部门后重试",
+            409,
+        )
+
+
+def _draft_not_found_error() -> ApiError:
+    return ApiError("REIMBURSEMENT_DRAFT_NOT_FOUND", "草稿不存在", 404)
+
+
+def _draft_revision_conflict_error() -> ApiError:
+    return ApiError(
+        "REIMBURSEMENT_DRAFT_REVISION_CONFLICT",
+        "草稿已在其他页面更新，请刷新后重试",
+        409,
+    )
+
+
+def _draft_locked_error() -> ApiError:
+    return ApiError("REIMBURSEMENT_DRAFT_LOCKED", "草稿已锁定，不能删除", 409)
+
+
+def _draft_in_use_error() -> ApiError:
+    return ApiError(
+        "REIMBURSEMENT_DRAFT_IN_USE",
+        "草稿已进入提交流程，不能删除",
+        409,
+    )
 
 
 def _usage_statement():
@@ -651,21 +1138,35 @@ def _draft_owner_query(owner: DraftFileOwner) -> Select[tuple[ReimbursementDraft
     )
 
 
+def _draft_operation_revision(owner: DraftFileOwner) -> int:
+    return owner.expected_revision + 1
+
+
 def _submission_lease_query(
     lease: SubmissionLease,
     *,
     now: datetime,
 ) -> Select[tuple[ReimbursementSubmission]]:
+    return select(ReimbursementSubmission).where(
+        *_submission_lease_conditions(lease, now=now),
+        ReimbursementSubmission.status == ReimbursementSubmissionStatus.GENERATING_EXCEL.value,
+    )
+
+
+def _submission_lease_conditions(
+    lease: SubmissionLease,
+    *,
+    now: datetime,
+) -> tuple[ColumnElement[bool], ...]:
     if not isinstance(lease, SubmissionLease):
         raise ValueError("submission lease is required")
     if lease.expected_status_version < 1:
         raise ValueError("expected_status_version must be positive")
     token = _required_text(lease.lease_token, maximum=64)
-    return select(ReimbursementSubmission).where(
+    return (
         ReimbursementSubmission.id == lease.submission_id,
         ReimbursementSubmission.corp_id == lease.corp_id,
         ReimbursementSubmission.originator_user_id == lease.user_id,
-        ReimbursementSubmission.status == ReimbursementSubmissionStatus.GENERATING_EXCEL.value,
         ReimbursementSubmission.status_version == lease.expected_status_version,
         ReimbursementSubmission.lease_token == token,
         ReimbursementSubmission.lease_expires_at.is_not(None),
@@ -741,3 +1242,22 @@ def _upload_staging_reservation(record: ReimbursementUpload) -> StagingReservati
 
 def _valid_sha256(value: object) -> bool:
     return isinstance(value, str) and _SHA256.fullmatch(value) is not None
+
+
+def _validate_staged_object(
+    reservation: QuotaReservation,
+    staged: StagedObject,
+) -> None:
+    if not isinstance(staged, StagedObject):
+        raise ValueError("staged object is required")
+    if staged.storage_key != reservation.staging.storage_key:
+        raise ReimbursementReservationConflict("staged object does not match reservation")
+    if (
+        isinstance(staged.size_bytes, bool)
+        or not isinstance(staged.size_bytes, int)
+        or staged.size_bytes < 1
+        or staged.size_bytes > reservation.staging.reserved_bytes
+    ):
+        raise ReimbursementReservationConflict("staged object exceeds reservation")
+    if not _valid_sha256(staged.sha256):
+        raise ReimbursementReservationConflict("staged object digest is invalid")

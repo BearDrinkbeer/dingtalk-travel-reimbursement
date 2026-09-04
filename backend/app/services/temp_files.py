@@ -40,6 +40,13 @@ class StoredFile:
     original_name: str
 
 
+@dataclass(frozen=True, slots=True)
+class ValidatedUploadType:
+    original_name: str
+    extension: str
+    media_type: str
+
+
 @dataclass(slots=True)
 class UploadBudget:
     session_files: int
@@ -96,6 +103,38 @@ def _extension_from_magic(first_bytes: bytes) -> str:
     if first_bytes.startswith(_PDF_MAGIC):
         return "pdf"
     raise ApiError("UNSUPPORTED_FILE", "文件内容不是受支持的图片或 PDF", 400)
+
+
+def validate_upload_type(raw_name: str | None, first_bytes: bytes) -> ValidatedUploadType:
+    """Validate a receipt name against its content signature.
+
+    Both temporary uploads and durable reimbursement uploads use this boundary
+    so they cannot drift into accepting different file types.
+    """
+
+    original_name = _safe_original_name(raw_name)
+    declared_extension = _extension_from_name(original_name)
+    actual_extension = _extension_from_magic(first_bytes)
+    if actual_extension != declared_extension:
+        raise ApiError("FILE_TYPE_MISMATCH", "文件扩展名与内容不一致", 400)
+    return ValidatedUploadType(
+        original_name=original_name,
+        extension=actual_extension,
+        media_type={
+            "jpg": "image/jpeg",
+            "png": "image/png",
+            "pdf": "application/pdf",
+        }[actual_extension],
+    )
+
+
+def validate_upload_name(raw_name: str | None, *, expected_extension: str) -> str:
+    """Normalize a display name and require it to retain the trusted file type."""
+
+    original_name = _safe_original_name(raw_name)
+    if _extension_from_name(original_name) != expected_extension:
+        raise ApiError("FILE_TYPE_MISMATCH", "文件名必须保留原文件类型", 400)
+    return original_name
 
 
 def _ensure_private_directory(path: Path) -> int:
@@ -255,7 +294,6 @@ async def store_upload(
     process_runner: KillableProcessRunner,
 ) -> StoredFile:
     original_name = _safe_original_name(upload.filename)
-    declared_extension = _extension_from_name(original_name)
     directory = session_directory(settings, session_id_hash)
     directory_fd = _ensure_private_directory(directory)
     temp_id = str(uuid4())
@@ -282,9 +320,8 @@ async def store_upload(
             os.fsync(stream.fileno())
         if file_bytes == 0:
             raise ApiError("EMPTY_FILE", "不能上传空文件", 400)
-        actual_extension = _extension_from_magic(bytes(first_bytes))
-        if actual_extension != declared_extension:
-            raise ApiError("FILE_TYPE_MISMATCH", "文件扩展名与内容不一致", 400)
+        upload_type = validate_upload_type(original_name, bytes(first_bytes))
+        actual_extension = upload_type.extension
         final_name = f"{temp_id}.{actual_extension}"
         os.rename(
             partial_name,
@@ -294,16 +331,11 @@ async def store_upload(
         )
         final = directory / final_name
         await validate_new_file(final, actual_extension, settings, process_runner)
-        media_type = {
-            "jpg": "image/jpeg",
-            "png": "image/png",
-            "pdf": "application/pdf",
-        }[actual_extension]
         return StoredFile(
             temp_id=temp_id,
             path=final,
             extension=actual_extension,
-            media_type=media_type,
+            media_type=upload_type.media_type,
             size=file_bytes,
             original_name=original_name,
         )

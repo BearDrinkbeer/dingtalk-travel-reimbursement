@@ -62,6 +62,19 @@ def test_reimbursement_staging_quota_covers_one_complete_submission() -> None:
         Settings(reimbursement_staging_dir=Path("/tmp/.."))
 
 
+def test_reimbursement_draft_ttl_is_bounded_and_wired_for_deployment() -> None:
+    assert Settings(reimbursement_draft_ttl_days=1).reimbursement_draft_ttl_days == 1
+    assert Settings(reimbursement_draft_ttl_days=365).reimbursement_draft_ttl_days == 365
+    for invalid in (0, 366):
+        with pytest.raises(ValidationError, match="REIMBURSEMENT_DRAFT_TTL_DAYS"):
+            Settings(reimbursement_draft_ttl_days=invalid)
+
+    for env_name in (".env.example", ".env.production.example", ".env.dingtalk-dev.example"):
+        assert "REIMBURSEMENT_DRAFT_TTL_DAYS=30" in (REPOSITORY_ROOT / env_name).read_text()
+    compose = (REPOSITORY_ROOT / "docker-compose.yml").read_text()
+    assert "REIMBURSEMENT_DRAFT_TTL_DAYS: ${REIMBURSEMENT_DRAFT_TTL_DAYS:-30}" in compose
+
+
 @pytest.mark.parametrize(
     ("temp_suffix", "staging_suffix"),
     [

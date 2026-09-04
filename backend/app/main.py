@@ -19,6 +19,8 @@ from app.api.oa_templates import router as oa_templates_router
 from app.api.ocr import router as ocr_router
 from app.api.projects import router as projects_router
 from app.api.receipt_keywords import router as receipt_keywords_router
+from app.api.reimbursement_files import router as reimbursement_files_router
+from app.api.reimbursements import router as reimbursements_router
 from app.api.settings import router as settings_router
 from app.core.config import Settings, get_settings
 from app.core.errors import ApiError, error_response, install_error_handlers
@@ -35,6 +37,7 @@ from app.services.file_coordination import SessionFileCoordinator
 from app.services.multipart_uploads import prepare_spool_directory
 from app.services.ocr_service import OcrService
 from app.services.process_jobs import KillableProcessRunner
+from app.services.reimbursement_quota import ReimbursementQuotaCoordinator
 from app.services.reimbursement_staging import ReimbursementStaging
 from app.services.sessions import SessionCleanupGate, purge_expired_sessions
 from app.services.temp_files import cleanup_expired_temp_files
@@ -59,6 +62,11 @@ def create_app(
     )
     database_engine = create_database_engine(runtime_settings.database_url)
     database_session_factory = create_session_factory(database_engine)
+    reimbursement_quota = ReimbursementQuotaCoordinator(
+        database_engine,
+        reimbursement_staging,
+        max_bytes=runtime_settings.reimbursement_staging_max_bytes,
+    )
     dingtalk_client = DingTalkOpenAPIClient(runtime_settings, transport=dingtalk_transport)
     dingtalk_service = DingTalkService(dingtalk_client)
     dingtalk_workflow = DingTalkWorkflowClient(dingtalk_client)
@@ -79,6 +87,21 @@ def create_app(
     )
     ocr_service = OcrService(runtime_settings, ocr_engine, process_runner)
 
+    def cleanup_expired_reimbursements() -> None:
+        try:
+            reclaimed = reimbursement_quota.reclaim_expired()
+        except Exception as exc:
+            logger.error(
+                "Reimbursement staging cleanup failed",
+                extra={"exception_type": type(exc).__name__},
+            )
+            return
+        if reclaimed:
+            logger.info(
+                "Reclaimed expired reimbursement staging records",
+                extra={"reclaimed_count": reclaimed},
+            )
+
     async def periodic_temp_cleanup(stop: asyncio.Event) -> None:
         while not stop.is_set():
             try:
@@ -98,6 +121,7 @@ def create_app(
                         "Periodic temporary-file cleanup failed",
                         extra={"exception_type": type(exc).__name__},
                     )
+                await asyncio.to_thread(cleanup_expired_reimbursements)
 
     async def stop_periodic_temp_cleanup(
         stop: asyncio.Event,
@@ -123,6 +147,7 @@ def create_app(
             prepare_spool_directory(runtime_settings)
             reimbursement_staging.prepare()
             cleanup_expired_temp_files(runtime_settings, file_coordinator)
+            cleanup_expired_reimbursements()
             with database_session_factory() as database:
                 purge_expired_sessions(database)
             session_cleanup_gate.mark_completed()
@@ -151,6 +176,7 @@ def create_app(
     application.state.dingtalk_workflow = dingtalk_workflow
     application.state.dingtalk_storage = dingtalk_storage
     application.state.reimbursement_staging = reimbursement_staging
+    application.state.reimbursement_quota = reimbursement_quota
     application.state.session_cleanup_gate = session_cleanup_gate
     application.state.ocr_service = ocr_service
     application.state.process_runner = process_runner
@@ -163,7 +189,16 @@ def create_app(
         token = bind_request_id(request_id)
         started_at = perf_counter()
         try:
-            if request.method == "POST" and request.url.path == "/api/files/upload":
+            path_parts = request.url.path.split("/")
+            is_reimbursement_file_upload = (
+                len(path_parts) == 6
+                and path_parts[1:4] == ["api", "reimbursements", "drafts"]
+                and bool(path_parts[4])
+                and path_parts[5] == "files"
+            )
+            if request.method == "POST" and (
+                request.url.path == "/api/files/upload" or is_reimbursement_file_upload
+            ):
                 declared_length = request.headers.get("Content-Length")
                 if declared_length:
                     try:
@@ -221,6 +256,8 @@ def create_app(
     application.include_router(ocr_router, prefix="/api")
     application.include_router(oa_templates_router, prefix="/api")
     application.include_router(oa_reimbursements_router, prefix="/api")
+    application.include_router(reimbursements_router, prefix="/api")
+    application.include_router(reimbursement_files_router, prefix="/api")
     return application
 
 

@@ -1,0 +1,309 @@
+import axios, { type AxiosProgressEvent } from 'axios'
+
+import { downloadBlob, filenameFromContentDisposition } from './excel'
+import { http } from './http'
+import type { ApiEnvelope } from '@/types/auth'
+import type {
+  OaReimbursementOptions,
+  OaTravelApprovalList,
+  ReimbursementDraft,
+  ReimbursementDraftDeletion,
+  ReimbursementDraftFileDeletion,
+  ReimbursementDraftFileList,
+  ReimbursementDraftFileMutation,
+  ReimbursementDraftFileRole,
+  ReimbursementDraftFileUpdate,
+  ReimbursementDraftInput,
+  ReimbursementDraftList,
+  ReimbursementDraftOcrInput,
+  ReimbursementExcelPreview,
+  ReimbursementRelatedApprovalSelection,
+} from '@/types/reimbursements'
+
+const DRAFT_EXCEL_PREVIEW_FILENAME = '差旅费报销单预览.xlsx'
+
+export interface ReimbursementRequestOptions {
+  signal?: AbortSignal
+}
+
+export interface ListReimbursementDraftsOptions extends ReimbursementRequestOptions {
+  offset?: number
+  limit?: number
+}
+
+export interface UploadReimbursementDraftFileOptions extends ReimbursementRequestOptions {
+  role?: ReimbursementDraftFileRole
+  onProgress?: (percent: number) => void
+}
+
+export interface ListOaTravelApprovalsOptions extends ReimbursementRequestOptions {
+  from?: string
+  to?: string
+  query?: string
+}
+
+function draftUrl(draftId: string): string {
+  return `/reimbursements/drafts/${encodeURIComponent(draftId)}`
+}
+
+function fileUrl(draftId: string, fileId: string): string {
+  return `${draftUrl(draftId)}/files/${encodeURIComponent(fileId)}`
+}
+
+function uploadPercent(event: AxiosProgressEvent): number {
+  if (!event.total || event.total <= 0) return 0
+  return Math.min(100, Math.max(0, Math.round((event.loaded / event.total) * 100)))
+}
+
+export async function getOaReimbursementOptions(
+  options: ReimbursementRequestOptions = {},
+): Promise<OaReimbursementOptions> {
+  const response = await http.get<ApiEnvelope<OaReimbursementOptions>>(
+    '/oa/reimbursements/options',
+    { signal: options.signal },
+  )
+  return response.data.data
+}
+
+export async function listOaTravelApprovals(
+  options: ListOaTravelApprovalsOptions = {},
+): Promise<OaTravelApprovalList> {
+  const params: { from?: string; to?: string; q?: string } = {}
+  if (options.from !== undefined) params.from = options.from
+  if (options.to !== undefined) params.to = options.to
+  if (options.query !== undefined) params.q = options.query
+  const response = await http.get<ApiEnvelope<OaTravelApprovalList>>(
+    '/oa/travel-approvals',
+    {
+      params,
+      signal: options.signal,
+      timeout: 60_000,
+    },
+  )
+  return response.data.data
+}
+
+async function normalizeBlobApiError(error: unknown): Promise<never> {
+  if (
+    axios.isAxiosError(error)
+    && error.response
+    && error.response.data instanceof Blob
+  ) {
+    try {
+      error.response.data = JSON.parse(await error.response.data.text()) as unknown
+    } catch {
+      // Keep the original Axios error when the response is not a JSON envelope.
+    }
+  }
+  throw error
+}
+
+export async function createReimbursementDraft(
+  input: ReimbursementDraftInput,
+  options: ReimbursementRequestOptions = {},
+): Promise<ReimbursementDraft> {
+  const response = await http.post<ApiEnvelope<ReimbursementDraft>>(
+    '/reimbursements/drafts',
+    { expectedRevision: 0, input },
+    { signal: options.signal },
+  )
+  return response.data.data
+}
+
+export async function listReimbursementDrafts(
+  options: ListReimbursementDraftsOptions = {},
+): Promise<ReimbursementDraftList> {
+  const response = await http.get<ApiEnvelope<ReimbursementDraftList>>(
+    '/reimbursements/drafts',
+    {
+      params: {
+        offset: options.offset ?? 0,
+        limit: options.limit ?? 50,
+      },
+      signal: options.signal,
+    },
+  )
+  return response.data.data
+}
+
+export async function getReimbursementDraft(
+  draftId: string,
+  options: ReimbursementRequestOptions = {},
+): Promise<ReimbursementDraft> {
+  const response = await http.get<ApiEnvelope<ReimbursementDraft>>(
+    draftUrl(draftId),
+    { signal: options.signal },
+  )
+  return response.data.data
+}
+
+export async function updateReimbursementDraft(
+  draftId: string,
+  expectedRevision: number,
+  input: ReimbursementDraftInput,
+  options: ReimbursementRequestOptions = {},
+): Promise<ReimbursementDraft> {
+  const response = await http.put<ApiEnvelope<ReimbursementDraft>>(
+    draftUrl(draftId),
+    { expectedRevision, input },
+    { signal: options.signal },
+  )
+  return response.data.data
+}
+
+export async function deleteReimbursementDraft(
+  draftId: string,
+  expectedRevision: number,
+  options: ReimbursementRequestOptions = {},
+): Promise<ReimbursementDraftDeletion> {
+  const response = await http.delete<ApiEnvelope<ReimbursementDraftDeletion>>(
+    draftUrl(draftId),
+    {
+      params: { expectedRevision },
+      signal: options.signal,
+    },
+  )
+  return response.data.data
+}
+
+export async function replaceReimbursementRelatedApprovals(
+  draftId: string,
+  expectedRevision: number,
+  selections: ReimbursementRelatedApprovalSelection[],
+  options: ReimbursementRequestOptions = {},
+): Promise<ReimbursementDraft> {
+  const response = await http.put<ApiEnvelope<ReimbursementDraft>>(
+    `${draftUrl(draftId)}/related-approvals`,
+    { expectedRevision, selections },
+    { signal: options.signal, timeout: 60_000 },
+  )
+  return response.data.data
+}
+
+export async function markReimbursementDraftReviewReady(
+  draftId: string,
+  expectedRevision: number,
+  options: ReimbursementRequestOptions = {},
+): Promise<ReimbursementDraft> {
+  const response = await http.post<ApiEnvelope<ReimbursementDraft>>(
+    `${draftUrl(draftId)}/review`,
+    { expectedRevision },
+    { signal: options.signal },
+  )
+  return response.data.data
+}
+
+export async function listReimbursementDraftFiles(
+  draftId: string,
+  options: ReimbursementRequestOptions = {},
+): Promise<ReimbursementDraftFileList> {
+  const response = await http.get<ApiEnvelope<ReimbursementDraftFileList>>(
+    `${draftUrl(draftId)}/files`,
+    { signal: options.signal },
+  )
+  return response.data.data
+}
+
+export async function uploadReimbursementDraftFile(
+  draftId: string,
+  expectedRevision: number,
+  file: File,
+  options: UploadReimbursementDraftFileOptions = {},
+): Promise<ReimbursementDraftFileMutation> {
+  const form = new FormData()
+  form.append('files[]', file, file.name)
+  const response = await http.post<ApiEnvelope<ReimbursementDraftFileMutation>>(
+    `${draftUrl(draftId)}/files`,
+    form,
+    {
+      params: {
+        expectedRevision,
+        role: options.role ?? 'EXPENSE_SOURCE',
+      },
+      signal: options.signal,
+      timeout: 120_000,
+      onUploadProgress: (event) => options.onProgress?.(uploadPercent(event)),
+    },
+  )
+  return response.data.data
+}
+
+export async function updateReimbursementDraftFile(
+  draftId: string,
+  fileId: string,
+  input: ReimbursementDraftFileUpdate,
+  options: ReimbursementRequestOptions = {},
+): Promise<ReimbursementDraftFileMutation> {
+  const response = await http.patch<ApiEnvelope<ReimbursementDraftFileMutation>>(
+    fileUrl(draftId, fileId),
+    input,
+    { signal: options.signal },
+  )
+  return response.data.data
+}
+
+export async function deleteReimbursementDraftFile(
+  draftId: string,
+  fileId: string,
+  expectedRevision: number,
+  options: ReimbursementRequestOptions = {},
+): Promise<ReimbursementDraftFileDeletion> {
+  const response = await http.delete<ApiEnvelope<ReimbursementDraftFileDeletion>>(
+    fileUrl(draftId, fileId),
+    {
+      params: { expectedRevision },
+      signal: options.signal,
+    },
+  )
+  return response.data.data
+}
+
+export async function recognizeReimbursementDraftFile(
+  draftId: string,
+  fileId: string,
+  input: ReimbursementDraftOcrInput,
+  options: ReimbursementRequestOptions = {},
+): Promise<ReimbursementDraftFileMutation> {
+  const response = await http.post<ApiEnvelope<ReimbursementDraftFileMutation>>(
+    `${fileUrl(draftId, fileId)}/ocr`,
+    input,
+    { signal: options.signal, timeout: 135_000 },
+  )
+  return response.data.data
+}
+
+export async function getReimbursementDraftExcelPreview(
+  draftId: string,
+  expectedRevision: number,
+  options: ReimbursementRequestOptions = {},
+): Promise<ReimbursementExcelPreview> {
+  const response = await http.post<Blob>(
+    `${draftUrl(draftId)}/excel-preview`,
+    { expectedRevision },
+    {
+      responseType: 'blob',
+      signal: options.signal,
+      timeout: 60_000,
+    },
+  ).catch(normalizeBlobApiError)
+  return {
+    blob: response.data,
+    filename: filenameFromContentDisposition(
+      response.headers['content-disposition'],
+      DRAFT_EXCEL_PREVIEW_FILENAME,
+    ),
+  }
+}
+
+export async function downloadReimbursementDraftExcelPreview(
+  draftId: string,
+  expectedRevision: number,
+  options: ReimbursementRequestOptions = {},
+): Promise<void> {
+  const preview = await getReimbursementDraftExcelPreview(
+    draftId,
+    expectedRevision,
+    options,
+  )
+  downloadBlob(preview.blob, preview.filename)
+}

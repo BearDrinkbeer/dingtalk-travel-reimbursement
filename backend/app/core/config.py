@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     temp_dir: Path = Path("/tmp/expense")
     reimbursement_staging_dir: Path = Path("/app/staging")
     reimbursement_staging_max_bytes: int = 4 * 1024 * 1024 * 1024
+    reimbursement_draft_ttl_days: int = 30
     excel_template_path: Path = Path("app/templates/expense_template.xlsx")
     ocr_mode: Literal["local"] = "local"
 
@@ -325,6 +326,8 @@ class Settings(BaseSettings):
             )
         if self.reimbursement_staging_max_bytes > 1024 * 1024 * 1024 * 1024:
             raise ValueError("REIMBURSEMENT_STAGING_MAX_BYTES must not exceed 1 TiB")
+        if not 1 <= self.reimbursement_draft_ttl_days <= 365:
+            raise ValueError("REIMBURSEMENT_DRAFT_TTL_DAYS must be between 1 and 365")
         if self.app_env == "production":
             if not self.temp_dir.is_absolute():
                 raise ValueError("TEMP_DIR must be absolute in production")

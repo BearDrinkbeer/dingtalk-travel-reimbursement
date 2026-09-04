@@ -16,6 +16,7 @@ services:
       # would redirect durable files onto the container's read-only root.
       REIMBURSEMENT_STAGING_DIR: /app/staging
       REIMBURSEMENT_STAGING_MAX_BYTES: ${REIMBURSEMENT_STAGING_MAX_BYTES:-4294967296}
+      REIMBURSEMENT_DRAFT_TTL_DAYS: ${REIMBURSEMENT_DRAFT_TTL_DAYS:-30}
       EXCEL_TEMPLATE_PATH: ${EXCEL_TEMPLATE_PATH:-/app/app/templates/expense_template.xlsx}
       DINGTALK_CLIENT_ID: ${DINGTALK_CLIENT_ID:-}
       DINGTALK_CLIENT_SECRET: ${DINGTALK_CLIENT_SECRET:-}
