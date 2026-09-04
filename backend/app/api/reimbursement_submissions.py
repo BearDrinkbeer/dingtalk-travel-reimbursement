@@ -72,6 +72,7 @@ def submit_reimbursement(
         )
     source = collect_snapshot_source(
         database,
+        staging=request.app.state.reimbursement_staging,
         actor=actor,
         originator_union_id=current.record.dingtalk_union_id,
         originator_name=current.record.name,

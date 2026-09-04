@@ -691,10 +691,7 @@ class ReimbursementQuotaCoordinator:
                     expected_revision=draft.revision,
                 )
             except (ApiError, ReimbursementQuotaError):
-                _LOGGER.exception(
-                    "Failed to reclaim expired reimbursement draft %s",
-                    draft.draft_id,
-                )
+                _LOGGER.exception("Failed to reclaim expired reimbursement draft")
             else:
                 reclaimed += 1
 
@@ -727,10 +724,7 @@ class ReimbursementQuotaCoordinator:
                 try:
                     self._staging.discard_reservation(reservation)
                 except (OSError, ReimbursementStagingError):
-                    _LOGGER.exception(
-                        "Failed to reclaim expired draft file reservation %s",
-                        record.id,
-                    )
+                    _LOGGER.exception("Failed to reclaim expired draft file reservation")
                     continue
                 record.file_status = ReimbursementDraftFileStatus.PURGED.value
                 record.part_storage_key = None
@@ -768,8 +762,7 @@ class ReimbursementQuotaCoordinator:
                     self._staging.discard_reservation(reservation)
                 except (OSError, ReimbursementStagingError):
                     _LOGGER.exception(
-                        "Failed to reclaim expired generated upload reservation %s",
-                        record.id,
+                        "Failed to reclaim expired generated upload reservation"
                     )
                     continue
                 record.upload_status = ReimbursementUploadStatus.DISCARDED.value
@@ -792,10 +785,7 @@ class ReimbursementQuotaCoordinator:
                     missing_ok=True,
                 )
             except (OSError, ReimbursementStagingError):
-                _LOGGER.exception(
-                    "Failed to reclaim deleting draft file %s",
-                    item.file_id,
-                )
+                _LOGGER.exception("Failed to reclaim deleting draft file")
                 continue
             if self._finalize_deleting_draft_file(item, cutoff=cutoff):
                 reclaimed += 1

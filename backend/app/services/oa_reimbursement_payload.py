@@ -69,6 +69,10 @@ from app.services.reimbursement_drafts import (
     validate_and_calculate_input,
     validate_draft_file_references,
 )
+from app.services.reimbursement_staging import (
+    ReimbursementStaging,
+    ReimbursementStagingError,
+)
 
 SNAPSHOT_VERSION = 1
 _MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
@@ -372,6 +376,7 @@ class ExcelGenerationInput:
 def collect_snapshot_source(
     database: Session,
     *,
+    staging: ReimbursementStaging,
     actor: DraftActor,
     originator_union_id: str,
     originator_name: str,
@@ -489,6 +494,20 @@ def collect_snapshot_source(
             "请先上传至少一个有效附件",
             409,
         )
+    try:
+        for original in originals:
+            with staging.open_verified(
+                original.storage_key,
+                expected_size=original.size_bytes,
+                expected_sha256=original.sha256,
+            ):
+                pass
+    except (OSError, ReimbursementStagingError):
+        raise ApiError(
+            "REIMBURSEMENT_DRAFT_FILE_CHANGED",
+            "附件文件已丢失或内容发生变化，请删除后重新上传",
+            409,
+        ) from None
     return SnapshotSource(
         draft_id=draft.id,
         draft_revision=draft.revision,

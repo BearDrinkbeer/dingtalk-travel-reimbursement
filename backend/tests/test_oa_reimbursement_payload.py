@@ -59,6 +59,7 @@ from app.services.oa_template_profiles import (
     TravelTemplateContract,
 )
 from app.services.reimbursement_drafts import DraftActor, validate_and_calculate_input
+from app.services.reimbursement_staging import StagingArea
 
 
 def _component(
@@ -578,6 +579,8 @@ def test_collect_snapshot_source_reads_review_ready_state_without_mutating(
         department_name="工业物联二部",
     )
     with client.app.state.database_session_factory() as database:
+        staging = client.app.state.reimbursement_staging
+        file_content = b"a" * 101
         calculation = validate_and_calculate_input(
             database,
             catalog=catalog,
@@ -586,7 +589,7 @@ def test_collect_snapshot_source_reads_review_ready_state_without_mutating(
             validate_project=True,
         )
         draft = ReimbursementDraft(
-            id="draft-for-snapshot",
+            id="11111111-1111-4111-8111-111111111111",
             corp_id=actor.corp_id,
             owner_user_id=actor.user_id,
             status=ReimbursementDraftStatus.REVIEW_READY.value,
@@ -602,6 +605,13 @@ def test_collect_snapshot_source_reads_review_ready_state_without_mutating(
         )
         database.add(draft)
         database.flush()
+        reservation = staging.new_reservation(
+            StagingArea.DRAFTS,
+            draft.id,
+            "pdf",
+            reserved_bytes=len(file_content),
+        )
+        staged = staging.write_bytes(reservation, file_content)
         database.add_all(
             [
                 ReimbursementDraftRelatedApproval(
@@ -631,15 +641,15 @@ def test_collect_snapshot_source_reads_review_ready_state_without_mutating(
                     sort_order=4,
                     processing_role=ReimbursementDraftFileRole.EXPENSE_SOURCE.value,
                     file_status=ReimbursementDraftFileStatus.ACTIVE.value,
-                    storage_key=f"drafts/{draft.id}/receipt.pdf",
+                    storage_key=staged.storage_key,
                     part_storage_key=None,
                     reserved_bytes=101,
                     reservation_expires_at=None,
                     original_name="发票.pdf",
                     extension="pdf",
                     media_type="application/pdf",
-                    size_bytes=101,
-                    sha256="a" * 64,
+                    size_bytes=staged.size_bytes,
+                    sha256=staged.sha256,
                     ocr_status=ReimbursementOcrStatus.COMPLETE.value,
                     ocr_result_json="{}",
                 ),
@@ -658,6 +668,7 @@ def test_collect_snapshot_source_reads_review_ready_state_without_mutating(
         with pytest.raises(ApiError, match="确认每张已识别票据"):
             collect_snapshot_source(
                 database,
+                staging=staging,
                 actor=actor,
                 originator_union_id="union-1",
                 originator_name="测试员工",
@@ -671,6 +682,7 @@ def test_collect_snapshot_source_reads_review_ready_state_without_mutating(
         database.commit()
         source = collect_snapshot_source(
             database,
+            staging=staging,
             actor=actor,
             originator_union_id="union-1",
             originator_name="测试员工",
@@ -683,10 +695,32 @@ def test_collect_snapshot_source_reads_review_ready_state_without_mutating(
 
         assert source.draft_revision == 5
         assert source.related_approvals[0].process_instance_id == "travel-instance-1"
-        assert source.original_files[0].storage_key.endswith("receipt.pdf")
+        assert source.original_files[0].storage_key == staged.storage_key
         assert source.original_files[0].sort_order == 0
         database.expire_all()
         unchanged = database.get(ReimbursementDraft, draft.id)
         assert unchanged is not None
         assert unchanged.status == ReimbursementDraftStatus.REVIEW_READY.value
         assert unchanged.revision == 5
+
+        file_record = database.get(ReimbursementDraftFile, "snapshot-source-file")
+        assert file_record is not None
+        file_record.sha256 = "0" * 64
+        database.commit()
+        with pytest.raises(ApiError) as changed:
+            collect_snapshot_source(
+                database,
+                staging=staging,
+                actor=actor,
+                originator_union_id="union-1",
+                originator_name="测试员工",
+                draft_id=draft.id,
+                expected_revision=5,
+                microapp_agent_id=4_951_124_324,
+                excel_template_path=client.app.state.settings.excel_template_path,
+                max_items=100,
+            )
+        assert changed.value.code == "REIMBURSEMENT_DRAFT_FILE_CHANGED"
+        database.refresh(draft)
+        assert draft.status == ReimbursementDraftStatus.REVIEW_READY.value
+        assert draft.locked_at is None
