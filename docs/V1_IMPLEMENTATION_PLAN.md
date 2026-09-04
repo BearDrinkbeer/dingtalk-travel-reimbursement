@@ -4,6 +4,8 @@
 日期：2026-09-02  
 项目性质：公司内部单体 H5 工具；保持 V1 范围，不扩展为完整费控系统
 
+> **范围说明：**本文只约束 Phase 1–5 的 Excel、本地 OCR、免登和基础安全能力。文中关于审批、关联出差、草稿恢复和持久附件的排除项，仅表示它们不在 Phase 1–5 交付边界内，不是当前完整产品的范围说明。当前草稿、原始附件、关联出差、最终 Excel 和钉钉 OA 提交以 [`DINGTALK_OA_INTEGRATION_DESIGN.md`](DINGTALK_OA_INTEGRATION_DESIGN.md) 为准。
+
 ## 1. 结论先行
 
 V1 建议做成一个部署在公司钉钉工作台中的单体 H5 应用：Vue 3 前端、FastAPI 后端、SQLite 配置库、PaddleOCR 本地识别、openpyxl 基于公司模板生成 Excel、Nginx + Docker Compose 部署。OCR 和票据解析均在本地运行，生产环境不调用按次收费的 OCR、AI 或大模型 API。
