@@ -8,6 +8,7 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import quote, urlencode, urlsplit
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -79,6 +80,13 @@ class Settings(BaseSettings):
     dingtalk_agent_id: int | None = None
     dingtalk_storage_upload_timeout_seconds: float = 120.0
     dingtalk_storage_upload_host_suffixes: str = "trans.dingtalk.com"
+    dingtalk_oa_worker_enabled: bool = False
+    dingtalk_oa_worker_poll_interval_seconds: float = 1.0
+    dingtalk_oa_worker_lease_seconds: int = 180
+    dingtalk_oa_worker_retry_base_seconds: int = 5
+    dingtalk_oa_worker_retry_max_seconds: int = 300
+    dingtalk_oa_worker_reconciliation_seconds: int = 900
+    dingtalk_approval_detail_url_template: str = ""
     session_secret: str = ""
     admin_user_ids: str = ""
     session_cookie_name: str = "expense_session"
@@ -179,6 +187,48 @@ class Settings(BaseSettings):
                 "DINGTALK_STORAGE_UPLOAD_HOST_SUFFIXES must contain between 1 and 20 hosts"
             )
         return ",".join(suffixes)
+
+    @field_validator("dingtalk_approval_detail_url_template")
+    @classmethod
+    def validate_dingtalk_approval_detail_url_template(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            return ""
+        if len(normalized) > 2048 or normalized.count("{processInstanceId}") != 1:
+            raise ValueError(
+                "DINGTALK_APPROVAL_DETAIL_URL_TEMPLATE must contain exactly one "
+                "{processInstanceId} placeholder and be at most 2048 characters"
+            )
+        parsed = urlsplit(normalized)
+        if parsed.scheme not in {"https", "dingtalk"} or not parsed.netloc:
+            raise ValueError(
+                "DINGTALK_APPROVAL_DETAIL_URL_TEMPLATE must be an absolute HTTPS or "
+                "dingtalk URL"
+            )
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("DINGTALK_APPROVAL_DETAIL_URL_TEMPLATE must not contain credentials")
+        return normalized
+
+    @field_validator("dingtalk_oa_worker_poll_interval_seconds")
+    @classmethod
+    def validate_dingtalk_oa_worker_poll_interval(cls, value: float) -> float:
+        if not 0.1 <= value <= 60:
+            raise ValueError(
+                "DINGTALK_OA_WORKER_POLL_INTERVAL_SECONDS must be between 0.1 and 60"
+            )
+        return value
+
+    @field_validator(
+        "dingtalk_oa_worker_lease_seconds",
+        "dingtalk_oa_worker_retry_base_seconds",
+        "dingtalk_oa_worker_retry_max_seconds",
+        "dingtalk_oa_worker_reconciliation_seconds",
+    )
+    @classmethod
+    def validate_dingtalk_oa_worker_seconds(cls, value: int) -> int:
+        if not 1 <= value <= 86_400:
+            raise ValueError("DINGTALK_OA_WORKER timing values must be between 1 and 86400")
+        return value
 
     @field_validator("session_ttl_minutes")
     @classmethod
@@ -326,6 +376,26 @@ class Settings(BaseSettings):
             )
         if self.reimbursement_staging_max_bytes > 1024 * 1024 * 1024 * 1024:
             raise ValueError("REIMBURSEMENT_STAGING_MAX_BYTES must not exceed 1 TiB")
+        minimum_oa_lease_seconds = int(self.dingtalk_storage_upload_timeout_seconds) + 30
+        if (
+            self.dingtalk_oa_worker_enabled
+            and self.dingtalk_oa_worker_lease_seconds < minimum_oa_lease_seconds
+        ):
+            raise ValueError(
+                "DINGTALK_OA_WORKER_LEASE_SECONDS must cover the upload timeout plus "
+                "checkpoint headroom"
+            )
+        if (
+            self.dingtalk_oa_worker_retry_max_seconds
+            < self.dingtalk_oa_worker_retry_base_seconds
+        ):
+            raise ValueError(
+                "DINGTALK_OA_WORKER_RETRY_MAX_SECONDS must be at least the retry base"
+            )
+        if self.dingtalk_oa_worker_reconciliation_seconds < 30:
+            raise ValueError(
+                "DINGTALK_OA_WORKER_RECONCILIATION_SECONDS must be at least 30"
+            )
         if not 1 <= self.reimbursement_draft_ttl_days <= 365:
             raise ValueError("REIMBURSEMENT_DRAFT_TTL_DAYS must be between 1 and 365")
         if self.app_env == "production":
@@ -410,6 +480,27 @@ class Settings(BaseSettings):
     @property
     def reimbursement_staging_minimum_free_bytes(self) -> int:
         return self.session_max_bytes + self.upload_max_file_bytes
+
+    def dingtalk_approval_url(self, process_instance_id: str) -> str:
+        """Return a configured detail link or the known native approval entry point."""
+
+        normalized_id = process_instance_id.strip()
+        if not normalized_id or len(normalized_id) > 128:
+            raise ValueError("process_instance_id must be non-empty and at most 128 characters")
+        if self.dingtalk_approval_detail_url_template:
+            return self.dingtalk_approval_detail_url_template.replace(
+                "{processInstanceId}",
+                quote(normalized_id, safe=""),
+            )
+        query = urlencode(
+            {
+                "app_id": "-4",
+                "container_type": "work_platform",
+                "corpid": self.dingtalk_corp_id,
+                "ddtab": "true",
+            }
+        )
+        return f"dingtalk://dingtalkclient/action/openapp?{query}"
 
 
 @lru_cache

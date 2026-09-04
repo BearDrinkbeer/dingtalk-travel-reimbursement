@@ -13,7 +13,7 @@ from typing import BinaryIO
 from uuid import uuid4
 
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.datastructures import UploadFile
 
@@ -50,6 +50,7 @@ from app.services.receipt_keywords import load_receipt_keyword_rules
 from app.services.reimbursement_drafts import (
     DraftActor,
     bump_owned_draft_revision,
+    detach_draft_file_from_input,
     require_owned_draft,
 )
 from app.services.reimbursement_quota import (
@@ -312,7 +313,14 @@ def update_draft_file(
             original_name,
             expected_extension=file.extension,
         )
+    detached_input_json: str | None = None
     if processing_role is not None:
+        if processing_role is ReimbursementDraftFileRole.ATTACHMENT_ONLY:
+            detached_input_json = detach_draft_file_from_input(
+                database,
+                draft=draft,
+                file_id=file.id,
+            ).canonical_json
         file.processing_role = processing_role.value
         if processing_role is ReimbursementDraftFileRole.ATTACHMENT_ONLY:
             file.ocr_status = ReimbursementOcrStatus.NOT_REQUESTED.value
@@ -324,6 +332,16 @@ def update_draft_file(
         actor=actor,
         expected_revision=expected_revision,
     )
+    if detached_input_json is not None:
+        database.execute(
+            update(ReimbursementDraft)
+            .where(
+                ReimbursementDraft.id == draft.id,
+                ReimbursementDraft.revision == new_revision,
+            )
+            .values(input_json=detached_input_json)
+            .execution_options(synchronize_session=False)
+        )
     database.commit()
     database.refresh(file)
     return DraftFileMutationResult(revision=new_revision, file=_snapshot(file))
@@ -387,6 +405,20 @@ def begin_draft_file_delete(
             draft_id=draft.id,
             actor=actor,
             expected_revision=expected_revision,
+        )
+        detached_input_json = detach_draft_file_from_input(
+            database,
+            draft=draft,
+            file_id=file.id,
+        ).canonical_json
+        database.execute(
+            update(ReimbursementDraft)
+            .where(
+                ReimbursementDraft.id == draft.id,
+                ReimbursementDraft.revision == new_revision,
+            )
+            .values(input_json=detached_input_json)
+            .execution_options(synchronize_session=False)
         )
         file.file_status = ReimbursementDraftFileStatus.DELETING.value
         deletion = DraftFileDeletion(

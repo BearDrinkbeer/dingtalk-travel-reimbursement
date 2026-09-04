@@ -205,6 +205,105 @@ def test_storage_upload_settings_are_wired_through_deployment_entrypoints() -> N
     ) in compose
 
 
+def test_dingtalk_oa_worker_settings_are_bounded() -> None:
+    settings = Settings(
+        dingtalk_oa_worker_poll_interval_seconds=0.1,
+        dingtalk_oa_worker_lease_seconds=150,
+        dingtalk_oa_worker_retry_base_seconds=1,
+        dingtalk_oa_worker_retry_max_seconds=1,
+        dingtalk_oa_worker_reconciliation_seconds=30,
+    )
+    assert settings.dingtalk_oa_worker_enabled is False
+    assert (
+        Settings(
+            dingtalk_client_id="credentialed-client",
+            dingtalk_client_secret="credentialed-secret",
+            dingtalk_corp_id="ding-credentialed-corp",
+            dingtalk_agent_id=123456,
+        ).dingtalk_oa_worker_enabled
+        is False
+    )
+
+    with pytest.raises(ValidationError, match="POLL_INTERVAL_SECONDS"):
+        Settings(dingtalk_oa_worker_poll_interval_seconds=0)
+    with pytest.raises(ValidationError, match="LEASE_SECONDS"):
+        Settings(dingtalk_oa_worker_enabled=True, dingtalk_oa_worker_lease_seconds=149)
+    with pytest.raises(ValidationError, match="RETRY_MAX_SECONDS"):
+        Settings(
+            dingtalk_oa_worker_retry_base_seconds=10,
+            dingtalk_oa_worker_retry_max_seconds=9,
+        )
+    with pytest.raises(ValidationError, match="RECONCILIATION_SECONDS"):
+        Settings(dingtalk_oa_worker_reconciliation_seconds=29)
+
+
+def test_dingtalk_approval_detail_url_template_is_optional_and_strict() -> None:
+    generic = Settings(
+        dingtalk_corp_id="ding corp/id",
+        dingtalk_approval_detail_url_template="",
+    )
+    assert generic.dingtalk_approval_detail_url_template == ""
+    assert generic.dingtalk_approval_url("instance-1") == (
+        "dingtalk://dingtalkclient/action/openapp?"
+        "app_id=-4&container_type=work_platform&corpid=ding+corp%2Fid&ddtab=true"
+    )
+    template = "dingtalk://approval/detail?id={processInstanceId}"
+    configured = Settings(dingtalk_approval_detail_url_template=f" {template} ")
+    assert configured.dingtalk_approval_detail_url_template == template
+    assert configured.dingtalk_approval_url("instance /1") == (
+        "dingtalk://approval/detail?id=instance%20%2F1"
+    )
+
+    for invalid in (
+        "https://example.com/no-placeholder",
+        "https://example.com/{processInstanceId}/{processInstanceId}",
+        "http://example.com/{processInstanceId}",
+        "https://user:password@example.com/{processInstanceId}",
+    ):
+        with pytest.raises(ValidationError, match="DINGTALK_APPROVAL_DETAIL_URL_TEMPLATE"):
+            Settings(dingtalk_approval_detail_url_template=invalid)
+
+
+def test_dingtalk_oa_worker_settings_are_wired_for_deployment() -> None:
+    required = (
+        "DINGTALK_OA_WORKER_ENABLED=false",
+        "DINGTALK_OA_WORKER_POLL_INTERVAL_SECONDS=1",
+        "DINGTALK_OA_WORKER_LEASE_SECONDS=180",
+        "DINGTALK_OA_WORKER_RETRY_BASE_SECONDS=5",
+        "DINGTALK_OA_WORKER_RETRY_MAX_SECONDS=300",
+        "DINGTALK_OA_WORKER_RECONCILIATION_SECONDS=900",
+        "DINGTALK_APPROVAL_DETAIL_URL_TEMPLATE=",
+    )
+    for env_name in (".env.example", ".env.production.example", ".env.dingtalk-dev.example"):
+        content = (REPOSITORY_ROOT / env_name).read_text()
+        for expected in required:
+            assert expected in content
+        assert (
+            "Keep false until migrations, templates, permissions, and one acceptance run "
+            "are verified."
+        ) in content
+
+    compose = (REPOSITORY_ROOT / "docker-compose.yml").read_text()
+    assert (
+        "DINGTALK_OA_WORKER_ENABLED: ${DINGTALK_OA_WORKER_ENABLED:-false}"
+        in compose
+    )
+    assert (
+        "Keep false until migrations, templates, permissions, and one acceptance run "
+        "are verified."
+    ) in compose
+    for variable in (
+        "DINGTALK_OA_WORKER_ENABLED",
+        "DINGTALK_OA_WORKER_POLL_INTERVAL_SECONDS",
+        "DINGTALK_OA_WORKER_LEASE_SECONDS",
+        "DINGTALK_OA_WORKER_RETRY_BASE_SECONDS",
+        "DINGTALK_OA_WORKER_RETRY_MAX_SECONDS",
+        "DINGTALK_OA_WORKER_RECONCILIATION_SECONDS",
+        "DINGTALK_APPROVAL_DETAIL_URL_TEMPLATE",
+    ):
+        assert f"{variable}: ${{{variable}:-" in compose
+
+
 def test_reimbursement_staging_is_wired_to_a_persistent_compose_volume() -> None:
     for env_name in (".env.example", ".env.production.example", ".env.dingtalk-dev.example"):
         content = (REPOSITORY_ROOT / env_name).read_text()

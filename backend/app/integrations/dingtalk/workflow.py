@@ -300,7 +300,10 @@ class DingTalkWorkflowClient:
         self,
         command: CreateProcessInstanceCommand,
     ) -> CreatedProcessInstance:
-        request_body = _create_process_instance_body(command)
+        # Build the transmitted object from the same canonical serialization
+        # that the reimbursement state machine persists and hashes.  This
+        # prevents the mutation body and its audit checkpoint from drifting.
+        request_body = json.loads(serialize_create_process_instance_command(command))
         create_error: ApiError | None = None
         payload: dict[str, Any] | None = None
         try:
@@ -521,6 +524,19 @@ def _instance_id_query_body(
         "userIds": list(normalized_user_ids),
         "statuses": list(normalized_statuses),
     }
+
+
+def serialize_create_process_instance_command(
+    command: CreateProcessInstanceCommand,
+) -> str:
+    """Return the canonical JSON used for both OA creation and request hashing."""
+
+    return json.dumps(
+        _create_process_instance_body(command),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 def _create_process_instance_body(

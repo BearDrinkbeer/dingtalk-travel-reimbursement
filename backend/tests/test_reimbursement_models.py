@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import CheckConstraint, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -30,6 +30,8 @@ _HASH_B = "b" * 64
 _HASH_C = "c" * 64
 
 _IMMUTABLE_TRIGGER_NAMES = {
+    "trg_reimbursement_submissions_snapshot_immutable",
+    "trg_reimbursement_submissions_oa_request_immutable",
     "trg_reimbursement_submissions_process_instance_immutable",
     "trg_reimbursement_submissions_submitted_terminal",
     "trg_reimbursement_uploads_linked_at_immutable",
@@ -187,6 +189,66 @@ def test_create_all_installs_the_same_immutable_history_guards_as_migration(
 
     assert _IMMUTABLE_TRIGGER_NAMES <= trigger_names
     assert _SUBMITTED_MANIFEST_TRIGGER_NAMES <= trigger_names
+
+
+def test_submission_terminal_fields_match_published_migration_contract() -> None:
+    checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in ReimbursementSubmission.__table__.constraints
+        if isinstance(constraint, CheckConstraint) and constraint.name is not None
+    }
+
+    assert checks["ck_reimbursement_submissions_submitted_at"] == (
+        "status != 'SUBMITTED' OR "
+        "(submitted_at IS NOT NULL AND business_id IS NOT NULL AND approval_url IS NOT NULL)"
+    )
+    assert checks["ck_reimbursement_submissions_instance_required"] == (
+        "status NOT IN ('VERIFYING', 'SUBMITTED') OR process_instance_id IS NOT NULL"
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("snapshot_version", 2),
+        ("form_snapshot_json", '{"changed":true}'),
+        ("related_instance_ids_json", '["another-travel"]'),
+        ("snapshot_sha256", _HASH_C),
+        ("idempotency_key_hash", _HASH_A),
+    ],
+)
+def test_submission_snapshot_is_immutable_after_insert(
+    database: Session,
+    field: str,
+    value: object,
+) -> None:
+    draft = new_draft()
+    database.add(draft)
+    database.flush()
+    submission = new_submission(draft)
+    database.add(submission)
+    database.commit()
+
+    setattr(submission, field, value)
+    with pytest.raises(IntegrityError):
+        database.commit()
+
+
+def test_oa_create_command_is_immutable_after_checkpoint(database: Session) -> None:
+    draft = new_draft()
+    database.add(draft)
+    database.flush()
+    submission = new_submission(draft)
+    submission.status = ReimbursementSubmissionStatus.OA_CREATING.value
+    submission.oa_create_started_at = utc_now()
+    submission.oa_request_json = '{"request":1}'
+    submission.oa_request_hash = _HASH_A
+    database.add(submission)
+    database.commit()
+
+    submission.oa_request_json = '{"request":2}'
+    with pytest.raises(IntegrityError):
+        database.commit()
 
 
 def test_persists_verified_related_approval_snapshot(database: Session) -> None:

@@ -29,6 +29,7 @@ def settings_factory(tmp_path: Path):
             "dingtalk_client_secret": "client-secret",
             "dingtalk_corp_id": "corp-fixed",
             "dingtalk_agent_id": 1234567890,
+            "dingtalk_oa_worker_enabled": False,
             "session_secret": "test-session-secret-with-more-than-32-chars",
             "session_cookie_secure": False,
             # Unit tests opt out unless they exercise the OCR boundary
@@ -68,7 +69,7 @@ def client_factory(settings_factory):
             )
             connection.execute(text("DELETE FROM alembic_version"))
             connection.execute(
-                text("INSERT INTO alembic_version (version_num) VALUES ('20260904_0010')")
+                text("INSERT INTO alembic_version (version_num) VALUES ('20260904_0011')")
             )
         client = TestClient(application)
         client.__enter__()

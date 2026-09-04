@@ -403,6 +403,10 @@ class ReimbursementSubmission(Base):
             name="ck_reimbursement_submissions_template_config_version_positive",
         ),
         CheckConstraint(
+            "snapshot_version > 0",
+            name="ck_reimbursement_submissions_snapshot_version_positive",
+        ),
+        CheckConstraint(
             "length(schema_fingerprint) = 64",
             name="ck_reimbursement_submissions_schema_fingerprint_length",
         ),
@@ -482,6 +486,7 @@ class ReimbursementSubmission(Base):
     template_process_code: Mapped[str] = mapped_column(String(128))
     template_config_version: Mapped[int] = mapped_column(Integer)
     schema_fingerprint: Mapped[str] = mapped_column(String(64))
+    snapshot_version: Mapped[int] = mapped_column(Integer, default=1)
     form_snapshot_json: Mapped[str] = mapped_column(Text)
     related_instance_ids_json: Mapped[str] = mapped_column(Text)
     snapshot_sha256: Mapped[str] = mapped_column(String(64))
@@ -499,6 +504,7 @@ class ReimbursementSubmission(Base):
     lease_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
     oa_create_started_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    oa_request_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     oa_request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     reconciliation_deadline_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
     orphan_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
@@ -721,6 +727,42 @@ class ReimbursementUpload(Base):
 # the final table keeps test/dev schemas created via ``Base.metadata.create_all``
 # subject to the same cross-row safety boundary as migrated databases.
 _SQLITE_REIMBURSEMENT_SAFETY_TRIGGERS = (
+    """
+    CREATE TRIGGER trg_reimbursement_submissions_snapshot_immutable
+    BEFORE UPDATE ON reimbursement_submissions
+    WHEN NEW.draft_id IS NOT OLD.draft_id
+         OR NEW.corp_id IS NOT OLD.corp_id
+         OR NEW.originator_user_id IS NOT OLD.originator_user_id
+         OR NEW.originator_union_id IS NOT OLD.originator_union_id
+         OR NEW.originator_name IS NOT OLD.originator_name
+         OR NEW.department_id IS NOT OLD.department_id
+         OR NEW.department_name IS NOT OLD.department_name
+         OR NEW.template_process_code IS NOT OLD.template_process_code
+         OR NEW.template_config_version IS NOT OLD.template_config_version
+         OR NEW.schema_fingerprint IS NOT OLD.schema_fingerprint
+         OR NEW.snapshot_version IS NOT OLD.snapshot_version
+         OR NEW.form_snapshot_json IS NOT OLD.form_snapshot_json
+         OR NEW.related_instance_ids_json IS NOT OLD.related_instance_ids_json
+         OR NEW.snapshot_sha256 IS NOT OLD.snapshot_sha256
+         OR NEW.idempotency_key_hash IS NOT OLD.idempotency_key_hash
+    BEGIN
+        SELECT RAISE(ABORT, 'reimbursement submission snapshot is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER trg_reimbursement_submissions_oa_request_immutable
+    BEFORE UPDATE OF oa_create_started_at, oa_request_json, oa_request_hash
+    ON reimbursement_submissions
+    WHEN OLD.oa_create_started_at IS NOT NULL
+         AND (
+             NEW.oa_create_started_at IS NOT OLD.oa_create_started_at
+             OR NEW.oa_request_json IS NOT OLD.oa_request_json
+             OR NEW.oa_request_hash IS NOT OLD.oa_request_hash
+         )
+    BEGIN
+        SELECT RAISE(ABORT, 'OA create checkpoint is immutable once set');
+    END
+    """,
     """
     CREATE TRIGGER trg_reimbursement_submissions_process_instance_immutable
     BEFORE UPDATE OF process_instance_id ON reimbursement_submissions
@@ -952,8 +994,14 @@ _SQLITE_REIMBURSEMENT_SAFETY_TRIGGERS = (
                  FROM reimbursement_submissions AS submission
                  WHERE submission.id = NEW.submission_id
                    AND submission.draft_id = NEW.draft_id
-                   AND submission.status = 'ORPHAN_CLEANUP'
                    AND submission.process_instance_id IS NULL
+                   AND (
+                       submission.status = 'ORPHAN_CLEANUP'
+                       OR (
+                           NEW.upload_status = 'CLEANED'
+                           AND submission.status = 'FAILED_FINAL'
+                       )
+                   )
              )
              OR EXISTS (
                  SELECT 1
@@ -976,8 +1024,14 @@ _SQLITE_REIMBURSEMENT_SAFETY_TRIGGERS = (
                  FROM reimbursement_submissions AS submission
                  WHERE submission.id = NEW.submission_id
                    AND submission.draft_id = NEW.draft_id
-                   AND submission.status = 'ORPHAN_CLEANUP'
                    AND submission.process_instance_id IS NULL
+                   AND (
+                       submission.status = 'ORPHAN_CLEANUP'
+                       OR (
+                           NEW.upload_status = 'CLEANED'
+                           AND submission.status = 'FAILED_FINAL'
+                       )
+                   )
              )
              OR EXISTS (
                  SELECT 1
@@ -1018,8 +1072,21 @@ _SQLITE_REIMBURSEMENT_SAFETY_TRIGGERS = (
          )
          AND (
              NEW.id IS NOT OLD.id
-             OR NEW.status IS NOT 'ORPHAN_CLEANUP'
              OR NEW.process_instance_id IS NOT NULL
+             OR (
+                 NEW.status IS NOT 'ORPHAN_CLEANUP'
+                 AND (
+                     NEW.status IS NOT 'FAILED_FINAL'
+                     OR EXISTS (
+                         SELECT 1
+                         FROM reimbursement_uploads AS unfinished
+                         WHERE unfinished.submission_id = OLD.id
+                           AND unfinished.upload_status NOT IN (
+                               'PENDING', 'PUTTING', 'PUT_DONE', 'CLEANED', 'DISCARDED'
+                           )
+                     )
+                 )
+             )
          )
     BEGIN
         SELECT RAISE(ABORT, 'OA instance and remote cleanup cannot coexist');

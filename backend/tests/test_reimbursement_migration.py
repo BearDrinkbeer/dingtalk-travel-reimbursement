@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import gzip
+import hashlib
 import sqlite3
 from datetime import timedelta
 from pathlib import Path
@@ -164,6 +167,23 @@ RELATED_APPROVAL_COLUMNS = {
     "updated_at",
 }
 
+# Frozen from commit bd4ba4a after applying the unmodified migration chain through 0010.
+# Keeping the SQLite artifact independent of today's migration modules is intentional: it
+# exercises the same upgrade surface as an already-deployed database.
+_PUBLISHED_0010_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "published_20260904_0010.sqlite3.gz.b64"
+)
+_PUBLISHED_0010_DATABASE_SHA256 = (
+    "7b55e6e60154bdfd5725d4016dffa3ebeb520cb0a5d84775c04d85575f30b138"
+)
+_SUBMITTED_CHECK_SQL = (
+    "status != 'SUBMITTED' OR "
+    "(submitted_at IS NOT NULL AND business_id IS NOT NULL AND approval_url IS NOT NULL)"
+)
+_INSTANCE_REQUIRED_CHECK_SQL = (
+    "status NOT IN ('VERIFYING', 'SUBMITTED') OR process_instance_id IS NOT NULL"
+)
+
 
 def alembic_config() -> Config:
     config = Config()
@@ -178,6 +198,260 @@ def table_names(connection: sqlite3.Connection) -> set[str]:
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         ).fetchall()
     }
+
+
+def restore_published_0010_database(database_path: Path) -> None:
+    compressed = base64.b64decode(_PUBLISHED_0010_FIXTURE.read_text(encoding="ascii"))
+    database_bytes = gzip.decompress(compressed)
+    assert hashlib.sha256(database_bytes).hexdigest() == _PUBLISHED_0010_DATABASE_SHA256
+    database_path.write_bytes(database_bytes)
+
+
+def migrate_database_to_head(database_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{database_path}")
+    get_settings.cache_clear()
+    command.upgrade(alembic_config(), "head")
+
+
+def normalized_submission_table_sql(database_path: Path) -> str:
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'reimbursement_submissions'"
+        ).fetchone()
+    assert row is not None
+    return " ".join(str(row[0]).split())
+
+
+def seed_verifying_submission_with_linked_excel(
+    connection: sqlite3.Connection,
+    *,
+    suffix: str,
+) -> str:
+    submission_id = f"submission-{suffix}"
+    draft_id = f"draft-{suffix}"
+    now = "2026-09-04 12:00:00"
+    connection.execute(
+        """
+        INSERT INTO reimbursement_submissions (
+            id, draft_id, corp_id, originator_user_id, originator_union_id,
+            originator_name, department_id, department_name, template_process_code,
+            template_config_version, schema_fingerprint, form_snapshot_json,
+            related_instance_ids_json, snapshot_sha256, idempotency_key_hash,
+            status, resume_status, status_version, attempt_count,
+            reconciliation_attempt_count, oa_create_started_at, oa_request_json,
+            oa_request_hash, process_instance_id, created_at, updated_at
+        ) VALUES (
+            ?, ?, 'corp-test', 'employee-1', 'union-1',
+            '测试员工', 'department-1', '测试部门', 'PROC-REIMBURSEMENT',
+            1, ?, '{}', '[]', ?, ?,
+            'VERIFYING', NULL, 1, 1,
+            0, ?, '{}', ?, ?, ?, ?
+        )
+        """,
+        (
+            submission_id,
+            draft_id,
+            "a" * 64,
+            "b" * 64,
+            "c" * 64,
+            now,
+            "d" * 64,
+            f"process-{suffix}",
+            now,
+            now,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO reimbursement_uploads (
+            id, submission_id, draft_id, source_draft_file_id, role, sort_order,
+            local_storage_key, local_part_storage_key, local_status, reserved_bytes,
+            reservation_expires_at, file_name, file_type, media_type, size_bytes,
+            sha256, upload_status, status_version, attempt_count, space_id, file_id,
+            linked_at, created_at, updated_at
+        ) VALUES (
+            ?, ?, ?, NULL, 'GENERATED_EXCEL', 0,
+            ?, NULL, 'READY', 1,
+            NULL, '报销单.xlsx', 'xlsx',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 1,
+            ?, 'LINKED', 1, 1, ?, ?,
+            ?, ?, ?
+        )
+        """,
+        (
+            f"upload-{suffix}",
+            submission_id,
+            draft_id,
+            f"generated/{submission_id}/final.xlsx",
+            "e" * 64,
+            f"space-{suffix}",
+            f"file-{suffix}",
+            now,
+            now,
+            now,
+        ),
+    )
+    connection.commit()
+    return submission_id
+
+
+def assert_submitted_field_contract(database_path: Path) -> None:
+    fields = ("submitted_at", "process_instance_id", "business_id", "approval_url")
+    with sqlite3.connect(database_path) as connection:
+        for index, missing_field in enumerate(fields):
+            submission_id = seed_verifying_submission_with_linked_excel(
+                connection,
+                suffix=f"missing-{index}",
+            )
+            values = {
+                "status": "SUBMITTED",
+                "submitted_at": "2026-09-04 12:05:00",
+                "process_instance_id": f"process-missing-{index}",
+                "business_id": f"business-missing-{index}",
+                "approval_url": f"dingtalk://approval/missing-{index}",
+                "submission_id": submission_id,
+            }
+            values[missing_field] = None
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    UPDATE reimbursement_submissions
+                    SET status = :status,
+                        submitted_at = :submitted_at,
+                        process_instance_id = :process_instance_id,
+                        business_id = :business_id,
+                        approval_url = :approval_url
+                    WHERE id = :submission_id
+                    """,
+                    values,
+                )
+            connection.rollback()
+
+        valid_submission_id = seed_verifying_submission_with_linked_excel(
+            connection,
+            suffix="complete",
+        )
+        connection.execute(
+            """
+            UPDATE reimbursement_submissions
+            SET status = 'SUBMITTED',
+                submitted_at = '2026-09-04 12:05:00',
+                business_id = 'business-complete',
+                approval_url = 'dingtalk://approval/complete'
+            WHERE id = ?
+            """,
+            (valid_submission_id,),
+        )
+        connection.commit()
+        assert connection.execute(
+            "SELECT status FROM reimbursement_submissions WHERE id = ?",
+            (valid_submission_id,),
+        ).fetchone() == ("SUBMITTED",)
+
+
+def assert_failed_final_accepts_safe_local_only_remainders(database_path: Path) -> None:
+    now = "2026-09-04 12:00:00"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO reimbursement_submissions (
+                id, draft_id, corp_id, originator_user_id, originator_union_id,
+                originator_name, department_id, department_name, template_process_code,
+                template_config_version, schema_fingerprint, form_snapshot_json,
+                related_instance_ids_json, snapshot_sha256, idempotency_key_hash,
+                status, resume_status, status_version, attempt_count,
+                reconciliation_attempt_count, orphan_confirmed_at,
+                orphan_confirmation_code, created_at, updated_at
+            ) VALUES (
+                'submission-orphan', 'draft-orphan', 'corp-test', 'employee-1', 'union-1',
+                '测试员工', 'department-1', '测试部门', 'PROC-REIMBURSEMENT',
+                1, ?, '{}', '[]', ?, ?,
+                'ORPHAN_CLEANUP', NULL, 1, 1,
+                0, ?, 'OA_CREATE_REJECTED', ?, ?
+            )
+            """,
+            ("a" * 64, "b" * 64, "c" * 64, now, now, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO reimbursement_uploads (
+                id, submission_id, draft_id, source_draft_file_id, role, sort_order,
+                local_storage_key, local_part_storage_key, local_status, reserved_bytes,
+                reservation_expires_at, file_name, file_type, media_type, size_bytes,
+                sha256, upload_status, status_version, attempt_count, space_id, file_id,
+                cleanup_started_at, cleaned_at, created_at, updated_at
+            ) VALUES (
+                'upload-cleaned', 'submission-orphan', 'draft-orphan', NULL,
+                'GENERATED_EXCEL', 0, 'generated/submission-orphan/final.xlsx', NULL,
+                'READY', 1, NULL, '报销单.xlsx', 'xlsx',
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 1,
+                ?, 'CLEANED', 1, 1, 'space-cleaned', 'file-cleaned', ?, ?, ?, ?
+            )
+            """,
+            ("d" * 64, now, now, now, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO reimbursement_uploads (
+                id, submission_id, draft_id, source_draft_file_id, role, sort_order,
+                local_storage_key, local_part_storage_key, local_status, reserved_bytes,
+                reservation_expires_at, file_name, file_type, media_type, size_bytes,
+                sha256, upload_status, status_version, attempt_count, created_at, updated_at
+            ) VALUES (
+                'upload-local-only', 'submission-orphan', 'draft-orphan', 'source-local-only',
+                'ORIGINAL', 1, 'drafts/draft-orphan/original.pdf', NULL,
+                'READY', 1, NULL, '原始发票.pdf', 'pdf', 'application/pdf', 1,
+                ?, 'PENDING', 1, 0, ?, ?
+            )
+            """,
+            ("e" * 64, now, now),
+        )
+        connection.commit()
+
+        connection.execute(
+            """
+            UPDATE reimbursement_submissions
+            SET status = 'FAILED_FINAL', updated_at = ?
+            WHERE id = 'submission-orphan'
+            """,
+            (now,),
+        )
+        connection.commit()
+        assert connection.execute(
+            "SELECT status FROM reimbursement_submissions WHERE id = 'submission-orphan'"
+        ).fetchone() == ("FAILED_FINAL",)
+
+
+def test_published_0010_upgrade_and_fresh_head_share_submitted_contract(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    upgraded_path = tmp_path / "published-0010-upgraded.db"
+    fresh_path = tmp_path / "fresh-head.db"
+
+    restore_published_0010_database(upgraded_path)
+    with sqlite3.connect(upgraded_path) as connection:
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
+            "20260904_0010",
+        )
+
+    migrate_database_to_head(upgraded_path, monkeypatch)
+    migrate_database_to_head(fresh_path, monkeypatch)
+
+    try:
+        upgraded_sql = normalized_submission_table_sql(upgraded_path)
+        fresh_sql = normalized_submission_table_sql(fresh_path)
+        assert upgraded_sql == fresh_sql
+        assert f"CHECK ({_SUBMITTED_CHECK_SQL})" in fresh_sql
+        assert f"CHECK ({_INSTANCE_REQUIRED_CHECK_SQL})" in fresh_sql
+
+        assert_submitted_field_contract(upgraded_path)
+        assert_submitted_field_contract(fresh_path)
+        assert_failed_final_accepts_safe_local_only_remainders(upgraded_path)
+        assert_failed_final_accepts_safe_local_only_remainders(fresh_path)
+    finally:
+        get_settings.cache_clear()
 
 
 def test_reimbursement_migration_upgrade_downgrade_and_reupgrade(
@@ -310,7 +584,7 @@ def test_reimbursement_migration_upgrade_downgrade_and_reupgrade(
         command.upgrade(config, "head")
         with sqlite3.connect(database_path) as connection:
             assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
-                "20260904_0010",
+                "20260904_0011",
             )
             assert set(EXPECTED_COLUMNS).issubset(table_names(connection))
     finally:
@@ -414,9 +688,84 @@ def test_related_approval_catalog_migration_upgrade_downgrade_and_reupgrade(
         command.upgrade(config, "head")
         with sqlite3.connect(database_path) as connection:
             assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
-                "20260904_0010",
+                "20260904_0011",
             )
             assert "reimbursement_draft_related_approvals" in table_names(connection)
+    finally:
+        get_settings.cache_clear()
+
+
+def test_submission_snapshot_migration_upgrade_downgrade_and_reupgrade(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database_path = tmp_path / "submission-snapshot-migration.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{database_path}")
+    get_settings.cache_clear()
+    config = alembic_config()
+    try:
+        command.upgrade(config, "20260904_0010")
+        with sqlite3.connect(database_path) as connection:
+            before = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(reimbursement_submissions)"
+                ).fetchall()
+            }
+            assert "snapshot_version" not in before
+            assert "oa_request_json" not in before
+
+        command.upgrade(config, "20260904_0011")
+        with sqlite3.connect(database_path) as connection:
+            assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
+                "20260904_0011",
+            )
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(reimbursement_submissions)"
+                ).fetchall()
+            }
+            assert {"snapshot_version", "oa_request_json"} <= columns
+            trigger_names = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                ).fetchall()
+            }
+            assert {
+                "trg_reimbursement_submissions_snapshot_immutable",
+                "trg_reimbursement_submissions_oa_request_immutable",
+                "trg_reimbursement_submissions_cleanup_guard_update",
+                "trg_reimbursement_uploads_cleanup_parent_insert",
+                "trg_reimbursement_uploads_cleanup_parent_update",
+            } <= trigger_names
+
+        command.downgrade(config, "20260904_0010")
+        with sqlite3.connect(database_path) as connection:
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(reimbursement_submissions)"
+                ).fetchall()
+            }
+            assert "snapshot_version" not in columns
+            assert "oa_request_json" not in columns
+            trigger_names = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                ).fetchall()
+            }
+            assert "trg_reimbursement_submissions_snapshot_immutable" not in trigger_names
+            assert "trg_reimbursement_submissions_oa_request_immutable" not in trigger_names
+            assert "trg_reimbursement_submissions_cleanup_guard_update" in trigger_names
+
+        command.upgrade(config, "20260904_0011")
+        with sqlite3.connect(database_path) as connection:
+            assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
+                "20260904_0011",
+            )
     finally:
         get_settings.cache_clear()
 
@@ -448,7 +797,7 @@ def test_migrated_schema_enforces_resume_status_pair(
     database_url = f"sqlite:///{database_path}"
     monkeypatch.setenv("DATABASE_URL", database_url)
     get_settings.cache_clear()
-    command.upgrade(alembic_config(), "20260904_0009")
+    command.upgrade(alembic_config(), "head")
     engine = create_database_engine(database_url)
     try:
         with Session(engine) as database:
@@ -507,7 +856,7 @@ def test_migrated_schema_preserves_irreversible_remote_history(
     monkeypatch.setenv("DATABASE_URL", database_url)
     get_settings.cache_clear()
     config = alembic_config()
-    command.upgrade(config, "20260904_0009")
+    command.upgrade(config, "head")
     engine = create_database_engine(database_url)
     try:
         now = utc_now()

@@ -88,6 +88,7 @@ def _catalog_with_travel(*, travel_type: str = "市外项目出差（短期）")
 
 def _input() -> dict[str, object]:
     return {
+        "ocrDispositionVersion": 1,
         "companyValue": "北京",
         "budgetCodeValue": "26007",
         "project": {"mode": "manual", "text": "P-001 示例项目"},
@@ -108,6 +109,7 @@ def _input() -> dict[str, object]:
                 "receiptCount": 1,
             }
         ],
+        "dismissedOcrFileIds": [],
     }
 
 
@@ -199,14 +201,26 @@ class FakeTravelWorkflow:
         )
 
 
-def _add_active_file(client, draft_id: str, *, ocr_status: str = "COMPLETE") -> str:
+def _add_active_file(
+    client,
+    draft_id: str,
+    *,
+    ocr_status: str = "COMPLETE",
+    processing_role: str = ReimbursementDraftFileRole.EXPENSE_SOURCE.value,
+    record_disposition: bool = True,
+) -> str:
     with client.app.state.database_session_factory() as database:
+        sort_order = (
+            database.query(ReimbursementDraftFile)
+            .filter(ReimbursementDraftFile.draft_id == draft_id)
+            .count()
+        )
         file = ReimbursementDraftFile(
             draft_id=draft_id,
-            sort_order=0,
-            processing_role=ReimbursementDraftFileRole.EXPENSE_SOURCE.value,
+            sort_order=sort_order,
+            processing_role=processing_role,
             file_status=ReimbursementDraftFileStatus.ACTIVE.value,
-            storage_key=f"drafts/{draft_id}/receipt.pdf",
+            storage_key=f"drafts/{draft_id}/receipt-{sort_order}.pdf",
             part_storage_key=None,
             reserved_bytes=100,
             reservation_expires_at=None,
@@ -216,9 +230,66 @@ def _add_active_file(client, draft_id: str, *, ocr_status: str = "COMPLETE") -> 
             size_bytes=100,
             sha256="f" * 64,
             ocr_status=ocr_status,
-            ocr_result_json="{}" if ocr_status == ReimbursementOcrStatus.COMPLETE.value else None,
+            ocr_result_json=None,
         )
         database.add(file)
+        database.flush()
+        if ocr_status == ReimbursementOcrStatus.COMPLETE.value:
+            file.ocr_result_json = json.dumps(
+                {
+                    "fileId": file.id,
+                    "type": "taxi",
+                    "categoryId": "other",
+                    "categoryName": "其他",
+                    "date": "2026-09-01",
+                    "description": "打车费",
+                    "amount": "44.89",
+                    "receiptCount": 1,
+                    "source": "ocr",
+                    "confidence": "0.95",
+                    "warnings": [],
+                    "status": "recognized",
+                    "error": None,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        elif ocr_status == ReimbursementOcrStatus.FAILED.value:
+            file.ocr_result_json = json.dumps(
+                {
+                    "fileId": file.id,
+                    "type": "other",
+                    "categoryId": "other",
+                    "categoryName": "其他",
+                    "date": None,
+                    "description": None,
+                    "amount": None,
+                    "receiptCount": 1,
+                    "source": "ocr",
+                    "confidence": "0.00",
+                    "warnings": ["MANUAL_REVIEW_REQUIRED"],
+                    "status": "failed",
+                    "error": {"code": "OCR_FAILED", "message": "识别失败"},
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        if record_disposition and ocr_status in {
+            ReimbursementOcrStatus.COMPLETE.value,
+            ReimbursementOcrStatus.FAILED.value,
+        }:
+            draft = database.get(ReimbursementDraft, draft_id)
+            assert draft is not None
+            input_data = json.loads(draft.input_json)
+            input_data["items"][0]["sourceFileId"] = file.id
+            draft.input_json = json.dumps(
+                input_data,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
         database.commit()
         return file.id
 
@@ -293,6 +364,292 @@ def test_create_list_read_and_update_draft_are_persistent_and_canonical(
             separators=(",", ":"),
             sort_keys=True,
         )
+
+
+def test_legacy_draft_save_binds_one_unique_exact_terminal_ocr_match(
+    client_factory,
+    monkeypatch,
+) -> None:
+    _install_catalog(monkeypatch)
+    client = client_factory(auth_mock_enabled=True)
+    login = mock_login(client)
+    headers = {"X-CSRF-Token": login["csrfToken"]}
+    draft_id = _create(client, headers).json()["data"]["id"]
+    file_id = _add_active_file(client, draft_id, record_disposition=False)
+
+    with client.app.state.database_session_factory() as database:
+        draft = database.get(ReimbursementDraft, draft_id)
+        assert draft is not None
+        legacy = json.loads(draft.input_json)
+        legacy.pop("ocrDispositionVersion", None)
+        legacy.pop("dismissedOcrFileIds", None)
+        draft.input_json = json.dumps(
+            legacy,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        database.commit()
+
+    loaded = client.get(f"/api/reimbursements/drafts/{draft_id}")
+    assert loaded.status_code == 200, loaded.text
+    loaded_input = loaded.json()["data"]["input"]
+    assert loaded_input["ocrDispositionVersion"] == 0
+    assert len(loaded_input["items"]) == 1
+    assert loaded.json()["data"]["totals"]["expenseTotal"] == "44.89"
+
+    legacy_request = dict(loaded_input)
+    legacy_request.pop("ocrDispositionVersion")
+    legacy_request.pop("dismissedOcrFileIds")
+    saved = client.put(
+        f"/api/reimbursements/drafts/{draft_id}",
+        json={"expectedRevision": 1, "input": legacy_request},
+        headers=headers,
+    )
+
+    assert saved.status_code == 200, saved.text
+    saved_input = saved.json()["data"]["input"]
+    assert saved_input["ocrDispositionVersion"] == 1
+    assert saved_input["dismissedOcrFileIds"] == []
+    assert len(saved_input["items"]) == 1
+    assert saved_input["items"][0]["sourceFileId"] == file_id
+    assert saved.json()["data"]["totals"]["expenseTotal"] == "44.89"
+
+
+def test_legacy_draft_save_does_not_revive_a_removed_ocr_line(
+    client_factory,
+    monkeypatch,
+) -> None:
+    _install_catalog(monkeypatch)
+    client = client_factory(auth_mock_enabled=True)
+    login = mock_login(client)
+    headers = {"X-CSRF-Token": login["csrfToken"]}
+    draft_id = _create(client, headers).json()["data"]["id"]
+    file_id = _add_active_file(client, draft_id, record_disposition=False)
+
+    with client.app.state.database_session_factory() as database:
+        draft = database.get(ReimbursementDraft, draft_id)
+        assert draft is not None
+        legacy = json.loads(draft.input_json)
+        legacy.pop("ocrDispositionVersion", None)
+        legacy.pop("dismissedOcrFileIds", None)
+        legacy["items"] = []
+        draft.input_json = json.dumps(
+            legacy,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        database.commit()
+
+    unresolved = client.put(
+        f"/api/reimbursements/drafts/{draft_id}",
+        json={"expectedRevision": 1, "input": legacy},
+        headers=headers,
+    )
+
+    assert unresolved.status_code == 409
+    assert unresolved.json()["error"]["code"] == "REIMBURSEMENT_DRAFT_NOT_READY"
+
+    decided = {**legacy, "ocrDispositionVersion": 1, "dismissedOcrFileIds": [file_id]}
+    saved = client.put(
+        f"/api/reimbursements/drafts/{draft_id}",
+        json={"expectedRevision": 1, "input": decided},
+        headers=headers,
+    )
+    assert saved.status_code == 200, saved.text
+    saved_input = saved.json()["data"]["input"]
+    assert saved_input["ocrDispositionVersion"] == 1
+    assert saved_input["items"] == []
+    assert saved_input["dismissedOcrFileIds"] == [file_id]
+    assert saved.json()["data"]["totals"]["expenseTotal"] == "0.00"
+
+
+def test_legacy_edited_ocr_line_stays_unresolved_until_explicitly_ignored(
+    client_factory,
+    monkeypatch,
+) -> None:
+    _install_catalog(monkeypatch)
+    client = client_factory(auth_mock_enabled=True)
+    login = mock_login(client)
+    headers = {"X-CSRF-Token": login["csrfToken"]}
+    draft_id = _create(client, headers).json()["data"]["id"]
+    file_id = _add_active_file(client, draft_id, record_disposition=False)
+    legacy = _input()
+    legacy.pop("ocrDispositionVersion")
+    legacy.pop("dismissedOcrFileIds")
+    legacy["items"][0]["description"] = "用户修改后的打车费"
+
+    unresolved = client.put(
+        f"/api/reimbursements/drafts/{draft_id}",
+        json={"expectedRevision": 1, "input": legacy},
+        headers=headers,
+    )
+
+    assert unresolved.status_code == 409
+    assert unresolved.json()["error"]["code"] == "REIMBURSEMENT_DRAFT_NOT_READY"
+    explicit = {
+        **legacy,
+        "ocrDispositionVersion": 1,
+        "dismissedOcrFileIds": [file_id],
+    }
+    saved = client.put(
+        f"/api/reimbursements/drafts/{draft_id}",
+        json={"expectedRevision": 1, "input": explicit},
+        headers=headers,
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["data"]["input"]["items"][0]["description"] == (
+        "用户修改后的打车费"
+    )
+
+
+def test_legacy_duplicate_exact_lines_are_ambiguous_and_not_auto_bound(
+    client_factory,
+    monkeypatch,
+) -> None:
+    _install_catalog(monkeypatch)
+    client = client_factory(auth_mock_enabled=True)
+    login = mock_login(client)
+    headers = {"X-CSRF-Token": login["csrfToken"]}
+    draft_id = _create(client, headers).json()["data"]["id"]
+    _add_active_file(client, draft_id, record_disposition=False)
+    legacy = _input()
+    legacy.pop("ocrDispositionVersion")
+    legacy.pop("dismissedOcrFileIds")
+    legacy["items"].append(dict(legacy["items"][0]))
+
+    unresolved = client.put(
+        f"/api/reimbursements/drafts/{draft_id}",
+        json={"expectedRevision": 1, "input": legacy},
+        headers=headers,
+    )
+
+    assert unresolved.status_code == 409
+    assert unresolved.json()["error"]["code"] == "REIMBURSEMENT_DRAFT_NOT_READY"
+
+
+def test_v1_save_rejects_a_terminal_ocr_file_without_an_exact_disposition(
+    client_factory,
+    monkeypatch,
+) -> None:
+    _install_catalog(monkeypatch)
+    client = client_factory(auth_mock_enabled=True)
+    login = mock_login(client)
+    headers = {"X-CSRF-Token": login["csrfToken"]}
+    draft_id = _create(client, headers).json()["data"]["id"]
+    _add_active_file(client, draft_id, record_disposition=False)
+
+    saved = client.put(
+        f"/api/reimbursements/drafts/{draft_id}",
+        json={"expectedRevision": 1, "input": _input()},
+        headers=headers,
+    )
+
+    assert saved.status_code == 409
+    assert saved.json()["error"]["code"] == "REIMBURSEMENT_DRAFT_NOT_READY"
+    loaded = client.get(f"/api/reimbursements/drafts/{draft_id}")
+    assert loaded.json()["data"]["revision"] == 1
+
+
+def test_draft_rejects_duplicate_or_overlapping_ocr_file_dispositions(
+    client_factory,
+    monkeypatch,
+) -> None:
+    _install_catalog(monkeypatch)
+    client = client_factory(auth_mock_enabled=True)
+    login = mock_login(client)
+    headers = {"X-CSRF-Token": login["csrfToken"]}
+
+    duplicate = _input()
+    duplicate["items"] = [
+        {**duplicate["items"][0], "sourceFileId": "file-1"},
+        {
+            **duplicate["items"][0],
+            "description": "另一条费用",
+            "sourceFileId": "file-1",
+        },
+    ]
+    duplicate_response = _create(client, headers, duplicate)
+    assert duplicate_response.status_code == 422
+
+    overlapping = _input()
+    overlapping["items"][0]["sourceFileId"] = "file-1"
+    overlapping["dismissedOcrFileIds"] = ["file-1"]
+    overlapping_response = _create(client, headers, overlapping)
+    assert overlapping_response.status_code == 422
+
+
+def test_update_validates_ocr_file_provenance_inside_the_owned_draft(
+    client_factory,
+    monkeypatch,
+) -> None:
+    _install_catalog(monkeypatch)
+    client = client_factory(auth_mock_enabled=True)
+    login = mock_login(client)
+    headers = {"X-CSRF-Token": login["csrfToken"]}
+    source_draft_id = _create(client, headers).json()["data"]["id"]
+    target_draft_id = _create(client, headers).json()["data"]["id"]
+    foreign_file_id = _add_active_file(
+        client,
+        source_draft_id,
+        record_disposition=False,
+    )
+
+    linked_to_other_draft = _input()
+    linked_to_other_draft["items"][0]["sourceFileId"] = foreign_file_id
+    rejected_link = client.put(
+        f"/api/reimbursements/drafts/{target_draft_id}",
+        json={"expectedRevision": 1, "input": linked_to_other_draft},
+        headers=headers,
+    )
+    assert rejected_link.status_code == 422
+    assert (
+        rejected_link.json()["error"]["code"]
+        == "REIMBURSEMENT_DRAFT_FILE_REFERENCE_INVALID"
+    )
+
+    dismissed_from_other_draft = _input()
+    dismissed_from_other_draft["dismissedOcrFileIds"] = [foreign_file_id]
+    rejected_dismissal = client.put(
+        f"/api/reimbursements/drafts/{target_draft_id}",
+        json={"expectedRevision": 1, "input": dismissed_from_other_draft},
+        headers=headers,
+    )
+    assert rejected_dismissal.status_code == 422
+    assert (
+        rejected_dismissal.json()["error"]["code"]
+        == "REIMBURSEMENT_DRAFT_FILE_REFERENCE_INVALID"
+    )
+
+    attachment_id = _add_active_file(
+        client,
+        target_draft_id,
+        processing_role=ReimbursementDraftFileRole.ATTACHMENT_ONLY.value,
+        record_disposition=False,
+    )
+    linked_to_attachment = _input()
+    linked_to_attachment["items"][0]["sourceFileId"] = attachment_id
+    rejected_role = client.put(
+        f"/api/reimbursements/drafts/{target_draft_id}",
+        json={"expectedRevision": 1, "input": linked_to_attachment},
+        headers=headers,
+    )
+    assert rejected_role.status_code == 422
+    assert rejected_role.json()["error"]["code"] == (
+        "REIMBURSEMENT_DRAFT_FILE_REFERENCE_INVALID"
+    )
+
+    own_file_id = _add_active_file(client, target_draft_id, record_disposition=False)
+    valid = _input()
+    valid["items"][0]["sourceFileId"] = own_file_id
+    accepted = client.put(
+        f"/api/reimbursements/drafts/{target_draft_id}",
+        json={"expectedRevision": 1, "input": valid},
+        headers=headers,
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["data"]["input"]["items"][0]["sourceFileId"] == own_file_id
 
 
 def test_owner_can_delete_an_unlocked_draft_at_the_expected_revision(
@@ -897,7 +1254,7 @@ def test_review_requires_verified_approval_and_active_file_then_marks_ready(
     assert reviewed.json()["data"]["status"] == "REVIEW_READY"
     assert reviewed.json()["data"]["revision"] == 3
 
-    changed = _input()
+    changed = reviewed.json()["data"]["input"]
     changed["items"][0]["amount"] = "50.00"
     edited = client.put(
         f"/api/reimbursements/drafts/{draft_id}",
@@ -907,6 +1264,217 @@ def test_review_requires_verified_approval_and_active_file_then_marks_ready(
     assert edited.status_code == 200, edited.text
     assert edited.json()["data"]["status"] == "DRAFT"
     assert edited.json()["data"]["revision"] == 4
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        ReimbursementOcrStatus.COMPLETE.value,
+        ReimbursementOcrStatus.FAILED.value,
+    ],
+)
+def test_review_requires_an_exact_disposition_for_each_terminal_ocr_file(
+    client_factory,
+    monkeypatch,
+    terminal_status: str,
+) -> None:
+    catalog = _catalog_with_travel()
+    monkeypatch.setattr(
+        reimbursement_drafts,
+        "require_submission_ready_catalog",
+        lambda _database: catalog,
+    )
+    client = client_factory(auth_mock_enabled=True)
+    login = mock_login(client)
+    headers = {"X-CSRF-Token": login["csrfToken"]}
+    draft_id = _create(client, headers).json()["data"]["id"]
+    client.app.state.dingtalk_workflow = FakeTravelWorkflow()
+    related = client.put(
+        f"/api/reimbursements/drafts/{draft_id}/related-approvals",
+        json={"expectedRevision": 1, "selections": [_selection()]},
+        headers=headers,
+    )
+    assert related.status_code == 200, related.text
+    file_id = _add_active_file(
+        client,
+        draft_id,
+        ocr_status=terminal_status,
+        record_disposition=False,
+    )
+
+    missing = client.post(
+        f"/api/reimbursements/drafts/{draft_id}/review",
+        json={"expectedRevision": 2},
+        headers=headers,
+    )
+    assert missing.status_code == 409
+    assert missing.json()["error"]["code"] == "REIMBURSEMENT_DRAFT_NOT_READY"
+
+    dismissed = _input()
+    dismissed["dismissedOcrFileIds"] = [file_id]
+    saved = client.put(
+        f"/api/reimbursements/drafts/{draft_id}",
+        json={"expectedRevision": 2, "input": dismissed},
+        headers=headers,
+    )
+    assert saved.status_code == 200, saved.text
+
+    reviewed = client.post(
+        f"/api/reimbursements/drafts/{draft_id}/review",
+        json={"expectedRevision": 3},
+        headers=headers,
+    )
+    assert reviewed.status_code == 200, reviewed.text
+    assert reviewed.json()["data"]["status"] == "REVIEW_READY"
+
+
+def test_review_conservatively_normalizes_a_legacy_terminal_ocr_file(
+    client_factory,
+    monkeypatch,
+) -> None:
+    catalog = _catalog_with_travel()
+    monkeypatch.setattr(
+        reimbursement_drafts,
+        "require_submission_ready_catalog",
+        lambda _database: catalog,
+    )
+    client = client_factory(auth_mock_enabled=True)
+    login = mock_login(client)
+    headers = {"X-CSRF-Token": login["csrfToken"]}
+    draft_id = _create(client, headers).json()["data"]["id"]
+    client.app.state.dingtalk_workflow = FakeTravelWorkflow()
+    related = client.put(
+        f"/api/reimbursements/drafts/{draft_id}/related-approvals",
+        json={"expectedRevision": 1, "selections": [_selection()]},
+        headers=headers,
+    )
+    assert related.status_code == 200, related.text
+    file_id = _add_active_file(client, draft_id, record_disposition=False)
+    with client.app.state.database_session_factory() as database:
+        draft = database.get(ReimbursementDraft, draft_id)
+        assert draft is not None
+        legacy = json.loads(draft.input_json)
+        legacy.pop("ocrDispositionVersion", None)
+        legacy.pop("dismissedOcrFileIds", None)
+        draft.input_json = json.dumps(
+            legacy,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        database.commit()
+
+    reviewed = client.post(
+        f"/api/reimbursements/drafts/{draft_id}/review",
+        json={"expectedRevision": 2},
+        headers=headers,
+    )
+
+    assert reviewed.status_code == 200, reviewed.text
+    assert reviewed.json()["data"]["status"] == "REVIEW_READY"
+    assert reviewed.json()["data"]["input"]["ocrDispositionVersion"] == 1
+    assert reviewed.json()["data"]["input"]["dismissedOcrFileIds"] == []
+    assert reviewed.json()["data"]["input"]["items"][0]["sourceFileId"] == file_id
+    assert reviewed.json()["data"]["totals"]["expenseTotal"] == "44.89"
+
+
+def test_review_rejects_an_unmatched_legacy_terminal_ocr_file(
+    client_factory,
+    monkeypatch,
+) -> None:
+    catalog = _catalog_with_travel()
+    monkeypatch.setattr(
+        reimbursement_drafts,
+        "require_submission_ready_catalog",
+        lambda _database: catalog,
+    )
+    client = client_factory(auth_mock_enabled=True)
+    login = mock_login(client)
+    headers = {"X-CSRF-Token": login["csrfToken"]}
+    draft_id = _create(client, headers).json()["data"]["id"]
+    client.app.state.dingtalk_workflow = FakeTravelWorkflow()
+    related = client.put(
+        f"/api/reimbursements/drafts/{draft_id}/related-approvals",
+        json={"expectedRevision": 1, "selections": [_selection()]},
+        headers=headers,
+    )
+    assert related.status_code == 200, related.text
+    _add_active_file(client, draft_id, record_disposition=False)
+    with client.app.state.database_session_factory() as database:
+        draft = database.get(ReimbursementDraft, draft_id)
+        assert draft is not None
+        legacy = json.loads(draft.input_json)
+        legacy.pop("ocrDispositionVersion", None)
+        legacy.pop("dismissedOcrFileIds", None)
+        legacy["items"][0]["description"] = "用户已修改的说明"
+        draft.input_json = json.dumps(
+            legacy,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        database.commit()
+
+    reviewed = client.post(
+        f"/api/reimbursements/drafts/{draft_id}/review",
+        json={"expectedRevision": 2},
+        headers=headers,
+    )
+
+    assert reviewed.status_code == 409
+    assert reviewed.json()["error"]["code"] == "REIMBURSEMENT_DRAFT_NOT_READY"
+    loaded = client.get(f"/api/reimbursements/drafts/{draft_id}").json()["data"]
+    assert loaded["revision"] == 2
+    assert loaded["input"]["ocrDispositionVersion"] == 0
+
+
+def test_review_blocks_unrecognized_expense_source_but_not_plain_attachment(
+    client_factory,
+    monkeypatch,
+) -> None:
+    catalog = _catalog_with_travel()
+    monkeypatch.setattr(
+        reimbursement_drafts,
+        "require_submission_ready_catalog",
+        lambda _database: catalog,
+    )
+    client = client_factory(auth_mock_enabled=True)
+    login = mock_login(client)
+    headers = {"X-CSRF-Token": login["csrfToken"]}
+    draft_id = _create(client, headers).json()["data"]["id"]
+    client.app.state.dingtalk_workflow = FakeTravelWorkflow()
+    related = client.put(
+        f"/api/reimbursements/drafts/{draft_id}/related-approvals",
+        json={"expectedRevision": 1, "selections": [_selection()]},
+        headers=headers,
+    )
+    assert related.status_code == 200, related.text
+    file_id = _add_active_file(
+        client,
+        draft_id,
+        ocr_status=ReimbursementOcrStatus.NOT_REQUESTED.value,
+        record_disposition=False,
+    )
+
+    unrecognized = client.post(
+        f"/api/reimbursements/drafts/{draft_id}/review",
+        json={"expectedRevision": 2},
+        headers=headers,
+    )
+    assert unrecognized.status_code == 409
+    assert unrecognized.json()["error"]["code"] == "REIMBURSEMENT_DRAFT_NOT_READY"
+
+    with client.app.state.database_session_factory() as database:
+        file = database.get(ReimbursementDraftFile, file_id)
+        assert file is not None
+        file.processing_role = ReimbursementDraftFileRole.ATTACHMENT_ONLY.value
+        database.commit()
+    attachment_only = client.post(
+        f"/api/reimbursements/drafts/{draft_id}/review",
+        json={"expectedRevision": 2},
+        headers=headers,
+    )
+    assert attachment_only.status_code == 200, attachment_only.text
 
 
 def test_review_rejects_related_approval_with_disjoint_trip_dates(

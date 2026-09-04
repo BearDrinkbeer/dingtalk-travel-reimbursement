@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import socket
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from time import perf_counter
+from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -20,6 +23,7 @@ from app.api.ocr import router as ocr_router
 from app.api.projects import router as projects_router
 from app.api.receipt_keywords import router as receipt_keywords_router
 from app.api.reimbursement_files import router as reimbursement_files_router
+from app.api.reimbursement_submissions import router as reimbursement_submissions_router
 from app.api.reimbursements import router as reimbursements_router
 from app.api.settings import router as settings_router
 from app.core.config import Settings, get_settings
@@ -35,6 +39,13 @@ from app.ocr.types import LocalOcrEngine
 from app.services.dingtalk import DingTalkService
 from app.services.file_coordination import SessionFileCoordinator
 from app.services.multipart_uploads import prepare_spool_directory
+from app.services.oa_reimbursement import (
+    DatabaseSubmissionState,
+    DurableOAReimbursementWorker,
+    LinkedLocalFileMaintenance,
+    OAReimbursementProcessor,
+    SnapshotSubmissionMaterializer,
+)
 from app.services.ocr_service import OcrService
 from app.services.process_jobs import KillableProcessRunner
 from app.services.reimbursement_quota import ReimbursementQuotaCoordinator
@@ -86,6 +97,46 @@ def create_app(
         admission_timeout_seconds=runtime_settings.process_job_admission_wait_seconds
     )
     ocr_service = OcrService(runtime_settings, ocr_engine, process_runner)
+    oa_worker_id = f"{socket.gethostname()[:48]}:{os.getpid()}:{uuid4().hex}"
+    oa_materializer = SnapshotSubmissionMaterializer(
+        workflow=dingtalk_workflow,
+        staging=reimbursement_staging,
+        excel_template_path=runtime_settings.excel_template_path,
+        approval_url_factory=runtime_settings.dingtalk_approval_url,
+    )
+    oa_submission_state = DatabaseSubmissionState(
+        session_factory=database_session_factory,
+        worker_id=oa_worker_id,
+        quota=reimbursement_quota,
+        staging=reimbursement_staging,
+        materializer=oa_materializer,
+        generated_reservation_seconds=max(
+            runtime_settings.dingtalk_oa_worker_lease_seconds * 2,
+            int(runtime_settings.dingtalk_storage_upload_timeout_seconds) + 60,
+        ),
+    )
+    oa_processor = OAReimbursementProcessor(
+        state=oa_submission_state,
+        materializer=oa_materializer,
+        workflow=dingtalk_workflow,
+        storage=dingtalk_storage,
+        lease_seconds=runtime_settings.dingtalk_oa_worker_lease_seconds,
+        retry_base_seconds=runtime_settings.dingtalk_oa_worker_retry_base_seconds,
+        retry_max_seconds=runtime_settings.dingtalk_oa_worker_retry_max_seconds,
+        reconciliation_seconds=runtime_settings.dingtalk_oa_worker_reconciliation_seconds,
+    )
+    oa_maintenance = LinkedLocalFileMaintenance(
+        session_factory=database_session_factory,
+        staging=reimbursement_staging,
+    )
+    oa_worker = DurableOAReimbursementWorker(
+        worker_id=oa_worker_id,
+        state=oa_submission_state,
+        processor=oa_processor,
+        maintenance=oa_maintenance,
+        lease_seconds=runtime_settings.dingtalk_oa_worker_lease_seconds,
+        poll_interval_seconds=runtime_settings.dingtalk_oa_worker_poll_interval_seconds,
+    )
 
     def cleanup_expired_reimbursements() -> None:
         try:
@@ -134,6 +185,17 @@ def create_app(
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+    async def stop_oa_submission_worker(
+        stop: asyncio.Event,
+        task: asyncio.Task[None],
+    ) -> None:
+        stop.set()
+        try:
+            await asyncio.wait_for(task, timeout=5)
+        except TimeoutError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         async with AsyncExitStack() as resources:
@@ -159,6 +221,14 @@ def create_app(
                 cleanup_stop,
                 cleanup_task,
             )
+            if runtime_settings.dingtalk_oa_worker_enabled:
+                oa_worker_stop = asyncio.Event()
+                oa_worker_task = asyncio.create_task(oa_worker.run(oa_worker_stop))
+                resources.push_async_callback(
+                    stop_oa_submission_worker,
+                    oa_worker_stop,
+                    oa_worker_task,
+                )
             yield
 
     application = FastAPI(
@@ -181,6 +251,11 @@ def create_app(
     application.state.ocr_service = ocr_service
     application.state.process_runner = process_runner
     application.state.file_coordinator = file_coordinator
+    application.state.oa_reimbursement_materializer = oa_materializer
+    application.state.oa_reimbursement_state = oa_submission_state
+    application.state.oa_reimbursement_processor = oa_processor
+    application.state.oa_reimbursement_maintenance = oa_maintenance
+    application.state.oa_reimbursement_worker = oa_worker
 
     @application.middleware("http")
     async def request_context(request: Request, call_next) -> Response:
@@ -258,6 +333,7 @@ def create_app(
     application.include_router(oa_reimbursements_router, prefix="/api")
     application.include_router(reimbursements_router, prefix="/api")
     application.include_router(reimbursement_files_router, prefix="/api")
+    application.include_router(reimbursement_submissions_router, prefix="/api")
     return application
 
 

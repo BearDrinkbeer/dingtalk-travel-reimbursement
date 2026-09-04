@@ -45,6 +45,7 @@ def _image_bytes(image_format: str = "PNG") -> bytes:
 
 def _draft_input(*, amount: str = "44.89") -> dict[str, object]:
     return {
+        "ocrDispositionVersion": 1,
         "companyValue": "北京",
         "budgetCodeValue": "26007",
         "project": {"mode": "manual", "text": "P-001 示例项目"},
@@ -65,6 +66,7 @@ def _draft_input(*, amount: str = "44.89") -> dict[str, object]:
                 "receiptCount": 1,
             }
         ],
+        "dismissedOcrFileIds": [],
     }
 
 
@@ -111,6 +113,54 @@ def _upload(
         headers={"X-CSRF-Token": csrf},
         files=[("files[]", (name, content or _image_bytes(), content_type))],
     )
+
+
+def _store_legacy_complete_ocr(
+    client,
+    *,
+    draft_id: str,
+    file_id: str,
+    description: str = "打车费",
+    amount: str = "44.89",
+    duplicate_line: bool = False,
+) -> None:
+    with client.app.state.database_session_factory() as database:
+        draft = database.get(ReimbursementDraft, draft_id)
+        file = database.get(ReimbursementDraftFile, file_id)
+        assert draft is not None and file is not None
+        file.ocr_status = "COMPLETE"
+        file.ocr_result_json = json.dumps(
+            {
+                "fileId": file.id,
+                "type": "taxi",
+                "categoryId": "other",
+                "categoryName": "其他",
+                "date": "2026-09-01",
+                "description": description,
+                "amount": amount,
+                "receiptCount": 1,
+                "source": "ocr",
+                "confidence": "0.95",
+                "warnings": [],
+                "status": "recognized",
+                "error": None,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        legacy = json.loads(draft.input_json)
+        legacy.pop("ocrDispositionVersion", None)
+        legacy.pop("dismissedOcrFileIds", None)
+        if duplicate_line:
+            legacy["items"].append(dict(legacy["items"][0]))
+        draft.input_json = json.dumps(
+            legacy,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        database.commit()
 
 
 def test_upload_is_durable_private_and_recovers_after_restart(client_factory) -> None:
@@ -488,6 +538,156 @@ def test_patch_and_delete_use_revision_cas_and_delete_physical_first(client_fact
     )
     assert repeated.status_code == 200
     assert repeated.json()["data"]["revision"] == 4
+
+
+def test_delete_file_atomically_clears_linked_item_and_ocr_disposition(
+    client_factory,
+) -> None:
+    client = client_factory(auth_mock_enabled=True)
+    csrf = str(mock_login(client)["csrfToken"])
+    draft_id = _insert_draft(client)
+    first = _upload(client, csrf, draft_id, revision=1)
+    second = _upload(client, csrf, draft_id, revision=2, name="second.png")
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    linked_file_id = first.json()["data"]["file"]["id"]
+    dismissed_file_id = second.json()["data"]["file"]["id"]
+    with client.app.state.database_session_factory() as database:
+        draft = database.get(ReimbursementDraft, draft_id)
+        assert draft is not None
+        input_data = _draft_input()
+        input_data["items"][0]["sourceFileId"] = linked_file_id
+        input_data["dismissedOcrFileIds"] = [dismissed_file_id]
+        draft.input_json = json.dumps(
+            input_data,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        database.commit()
+
+    deleted_linked = client.delete(
+        f"/api/reimbursements/drafts/{draft_id}/files/{linked_file_id}",
+        params={"expectedRevision": 3},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert deleted_linked.status_code == 200, deleted_linked.text
+    after_linked = client.get(f"/api/reimbursements/drafts/{draft_id}").json()["data"]
+    assert after_linked["input"]["items"] == []
+    assert after_linked["input"]["dismissedOcrFileIds"] == [dismissed_file_id]
+    assert after_linked["totals"]["expenseTotal"] == "0.00"
+    assert after_linked["totals"]["totalAmount"] == "200.00"
+
+    deleted_dismissed = client.delete(
+        f"/api/reimbursements/drafts/{draft_id}/files/{dismissed_file_id}",
+        params={"expectedRevision": 4},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert deleted_dismissed.status_code == 200, deleted_dismissed.text
+    after_dismissed = client.get(f"/api/reimbursements/drafts/{draft_id}").json()["data"]
+    assert after_dismissed["input"]["dismissedOcrFileIds"] == []
+
+
+def test_delete_legacy_exact_match_removes_line_but_keeps_other_unresolved_v0(
+    client_factory,
+) -> None:
+    client = client_factory(auth_mock_enabled=True)
+    csrf = str(mock_login(client)["csrfToken"])
+    draft_id = _insert_draft(client)
+    first = _upload(client, csrf, draft_id, revision=1)
+    second = _upload(client, csrf, draft_id, revision=2, name="second.png")
+    first_id = first.json()["data"]["file"]["id"]
+    second_id = second.json()["data"]["file"]["id"]
+    _store_legacy_complete_ocr(client, draft_id=draft_id, file_id=first_id)
+    with client.app.state.database_session_factory() as database:
+        second_file = database.get(ReimbursementDraftFile, second_id)
+        assert second_file is not None
+        second_file.ocr_status = "COMPLETE"
+        second_file.ocr_result_json = json.dumps(
+            {
+                "fileId": second_id,
+                "type": "train",
+                "categoryId": "other",
+                "categoryName": "其他",
+                "date": "2026-09-02",
+                "description": "旧草稿中已删除的另一行",
+                "amount": "99.00",
+                "receiptCount": 1,
+                "source": "ocr",
+                "confidence": "0.90",
+                "warnings": [],
+                "status": "recognized",
+                "error": None,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        database.commit()
+
+    deleted = client.delete(
+        f"/api/reimbursements/drafts/{draft_id}/files/{first_id}",
+        params={"expectedRevision": 3},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert deleted.status_code == 200, deleted.text
+    refreshed = client.get(f"/api/reimbursements/drafts/{draft_id}").json()["data"]
+    assert refreshed["input"]["ocrDispositionVersion"] == 0
+    assert refreshed["input"]["items"] == []
+    assert refreshed["input"]["dismissedOcrFileIds"] == []
+
+
+def test_rerole_legacy_exact_match_to_attachment_removes_the_linked_line(
+    client_factory,
+) -> None:
+    client = client_factory(auth_mock_enabled=True)
+    csrf = str(mock_login(client)["csrfToken"])
+    draft_id = _insert_draft(client)
+    uploaded = _upload(client, csrf, draft_id, revision=1)
+    file_id = uploaded.json()["data"]["file"]["id"]
+    _store_legacy_complete_ocr(client, draft_id=draft_id, file_id=file_id)
+
+    changed = client.patch(
+        f"/api/reimbursements/drafts/{draft_id}/files/{file_id}",
+        headers={"X-CSRF-Token": csrf},
+        json={"expectedRevision": 2, "role": "ATTACHMENT_ONLY"},
+    )
+
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["data"]["file"]["role"] == "ATTACHMENT_ONLY"
+    refreshed = client.get(f"/api/reimbursements/drafts/{draft_id}").json()["data"]
+    assert refreshed["input"]["ocrDispositionVersion"] == 0
+    assert refreshed["input"]["items"] == []
+    assert refreshed["totals"]["expenseTotal"] == "0.00"
+
+
+def test_delete_legacy_ambiguous_match_does_not_remove_manual_lines(
+    client_factory,
+) -> None:
+    client = client_factory(auth_mock_enabled=True)
+    csrf = str(mock_login(client)["csrfToken"])
+    draft_id = _insert_draft(client)
+    uploaded = _upload(client, csrf, draft_id, revision=1)
+    file_id = uploaded.json()["data"]["file"]["id"]
+    _store_legacy_complete_ocr(
+        client,
+        draft_id=draft_id,
+        file_id=file_id,
+        duplicate_line=True,
+    )
+
+    deleted = client.delete(
+        f"/api/reimbursements/drafts/{draft_id}/files/{file_id}",
+        params={"expectedRevision": 2},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert deleted.status_code == 200, deleted.text
+    refreshed = client.get(f"/api/reimbursements/drafts/{draft_id}").json()["data"]
+    assert refreshed["input"]["ocrDispositionVersion"] == 0
+    assert len(refreshed["input"]["items"]) == 2
+    assert all("sourceFileId" not in item for item in refreshed["input"]["items"])
 
 
 def test_delete_releases_sync_session_before_physical_cleanup(

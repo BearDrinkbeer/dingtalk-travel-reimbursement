@@ -15,6 +15,7 @@ from app.models.project import Project
 from app.models.reimbursement import (
     ReimbursementDraft,
     ReimbursementDraftFile,
+    ReimbursementDraftFileRole,
     ReimbursementDraftFileStatus,
     ReimbursementDraftRelatedApproval,
     ReimbursementDraftStatus,
@@ -23,6 +24,8 @@ from app.models.reimbursement import (
 )
 from app.schemas.excel import ManualProjectInput, SelectedProjectInput
 from app.schemas.reimbursements import (
+    CURRENT_OCR_DISPOSITION_VERSION,
+    ReimbursementDraftExpenseItemInput,
     ReimbursementDraftInput,
     RelatedApprovalSelectionInput,
 )
@@ -188,6 +191,11 @@ def create_reimbursement_draft(
     now: datetime | None = None,
 ) -> dict[str, object]:
     created_at = now or utc_now()
+    if _draft_file_reference_ids(draft_input):
+        raise _invalid_file_reference_error()
+    draft_input = draft_input.model_copy(
+        update={"ocr_disposition_version": CURRENT_OCR_DISPOSITION_VERSION}
+    )
     catalog = require_submission_ready_catalog(database)
     calculation = validate_and_calculate_input(
         database,
@@ -286,12 +294,23 @@ def update_reimbursement_draft(
     )
     catalog = require_submission_ready_catalog(database)
     _require_catalog_binding(draft, CatalogBinding.from_catalog(catalog))
+    draft_input = _normalize_legacy_ocr_dispositions(
+        database,
+        draft_id=draft.id,
+        draft_input=draft_input,
+    )
     calculation = validate_and_calculate_input(
         database,
         catalog=catalog,
         draft_input=draft_input,
         max_items=max_items,
         validate_project=True,
+    )
+    validate_draft_file_references(
+        database,
+        draft_id=draft.id,
+        draft_input=draft_input,
+        require_terminal_disposition=True,
     )
     try:
         new_revision = bump_owned_draft_revision(
@@ -344,6 +363,11 @@ def mark_reimbursement_draft_review_ready(
     binding = CatalogBinding.from_catalog(catalog)
     _require_catalog_binding(draft, binding)
     draft_input = _stored_input(draft)
+    draft_input = _normalize_legacy_ocr_dispositions(
+        database,
+        draft_id=draft.id,
+        draft_input=draft_input,
+    )
     calculation = validate_and_calculate_input(
         database,
         catalog=catalog,
@@ -357,7 +381,7 @@ def mark_reimbursement_draft_review_ready(
         .order_by(ReimbursementDraftRelatedApproval.sort_order)
     ).all()
     _validate_related_snapshot(draft, related, catalog, draft_input=draft_input)
-    _validate_file_snapshot(database, draft_id=draft.id)
+    _validate_file_snapshot(database, draft_id=draft.id, draft_input=draft_input)
 
     try:
         result = database.execute(
@@ -376,6 +400,7 @@ def mark_reimbursement_draft_review_ready(
             .values(
                 revision=expected_revision + 1,
                 status=ReimbursementDraftStatus.REVIEW_READY.value,
+                input_json=calculation.canonical_json,
                 updated_at=changed_at,
             )
             .execution_options(synchronize_session=False)
@@ -477,6 +502,81 @@ def validate_and_calculate_input(
     if validate_project:
         _validate_project(database, draft_input)
     return _calculate_input(database, draft_input)
+
+
+def validate_draft_file_references(
+    database: Session,
+    *,
+    draft_id: str,
+    draft_input: ReimbursementDraftInput,
+    require_terminal_disposition: bool = False,
+) -> None:
+    """Validate receipt provenance without revealing another draft's files."""
+
+    reference_ids = _draft_file_reference_ids(draft_input)
+    files = database.scalars(
+        select(ReimbursementDraftFile).where(
+            ReimbursementDraftFile.draft_id == draft_id,
+            ReimbursementDraftFile.file_status == ReimbursementDraftFileStatus.ACTIVE.value,
+        )
+    ).all()
+    files_by_id = {item.id: item for item in files}
+    if any(
+        file_id not in files_by_id
+        or files_by_id[file_id].processing_role
+        != ReimbursementDraftFileRole.EXPENSE_SOURCE.value
+        for file_id in reference_ids
+    ):
+        raise _invalid_file_reference_error()
+
+    if not require_terminal_disposition:
+        return
+    terminal_ids = {
+        item.id
+        for item in files
+        if item.processing_role == ReimbursementDraftFileRole.EXPENSE_SOURCE.value
+        and item.ocr_status
+        in {
+            ReimbursementOcrStatus.COMPLETE.value,
+            ReimbursementOcrStatus.FAILED.value,
+        }
+    }
+    if not terminal_ids.issubset(reference_ids):
+        raise _not_ready_error("请确认每张已识别票据的费用明细，或明确忽略识别结果")
+
+
+def detach_draft_file_from_input(
+    database: Session,
+    *,
+    draft: ReimbursementDraft,
+    file_id: str,
+) -> DraftCalculation:
+    """Canonicalize input after removing one file's item and disposition."""
+
+    draft_input = _stored_input(draft)
+    draft_input = _bind_unique_legacy_ocr_matches(
+        database,
+        draft_id=draft.id,
+        draft_input=draft_input,
+    )
+    remaining_items = [
+        item for item in draft_input.items if item.source_file_id != file_id
+    ]
+    remaining_dismissed = [
+        value for value in draft_input.dismissed_ocr_file_ids if value != file_id
+    ]
+    if (
+        len(remaining_items) == len(draft_input.items)
+        and len(remaining_dismissed) == len(draft_input.dismissed_ocr_file_ids)
+    ):
+        return _calculate_input(database, draft_input)
+    updated_input = draft_input.model_copy(
+        update={
+            "items": remaining_items,
+            "dismissed_ocr_file_ids": remaining_dismissed,
+        }
+    )
+    return _calculate_input(database, updated_input)
 
 
 def _calculate_input(
@@ -622,7 +722,10 @@ def _store_related_approvals(
 
 def _canonical_input_data(draft_input: ReimbursementDraftInput) -> dict[str, object]:
     project = draft_input.project.model_dump(mode="json", by_alias=True)
-    items = [item.model_dump(mode="json", by_alias=True) for item in draft_input.items]
+    items = [
+        item.model_dump(mode="json", by_alias=True, exclude_none=True)
+        for item in draft_input.items
+    ]
     trip: dict[str, object] | None = None
     if draft_input.trip is not None:
         trip = draft_input.trip.model_dump(
@@ -634,11 +737,148 @@ def _canonical_input_data(draft_input: ReimbursementDraftInput) -> dict[str, obj
         trip["startTime"] = draft_input.trip.start_time.strftime("%H:%M")
         trip["endTime"] = draft_input.trip.end_time.strftime("%H:%M")
     return {
+        "ocrDispositionVersion": draft_input.ocr_disposition_version,
         "companyValue": draft_input.company_value,
         "budgetCodeValue": draft_input.budget_code_value,
         "project": project,
         "trip": trip,
         "items": items,
+        "dismissedOcrFileIds": list(draft_input.dismissed_ocr_file_ids),
+    }
+
+
+def _normalize_legacy_ocr_dispositions(
+    database: Session,
+    *,
+    draft_id: str,
+    draft_input: ReimbursementDraftInput,
+) -> ReimbursementDraftInput:
+    """Upgrade only unambiguous legacy OCR links; never infer a dismissal.
+
+    A v0 draft cannot prove whether an unmatched OCR result was never delivered,
+    edited, or deliberately removed. Bind a receipt only when its complete
+    calculation fields match exactly one unlinked line and no other receipt has
+    the same fields. Any remaining terminal receipt stays unresolved, and the
+    normal v1 invariant blocks save/review until the user explicitly adopts or
+    ignores it.
+    """
+
+    if draft_input.ocr_disposition_version != 0:
+        return draft_input
+
+    with_matches = _bind_unique_legacy_ocr_matches(
+        database,
+        draft_id=draft_id,
+        draft_input=draft_input,
+    )
+    return with_matches.model_copy(
+        update={"ocr_disposition_version": CURRENT_OCR_DISPOSITION_VERSION}
+    )
+
+
+def _bind_unique_legacy_ocr_matches(
+    database: Session,
+    *,
+    draft_id: str,
+    draft_input: ReimbursementDraftInput,
+) -> ReimbursementDraftInput:
+    """Add provable v0 source links while preserving the v0 migration marker."""
+
+    if draft_input.ocr_disposition_version != 0:
+        return draft_input
+
+    linked_ids = {
+        item.source_file_id
+        for item in draft_input.items
+        if item.source_file_id is not None
+    }
+    decided_ids = linked_ids | set(draft_input.dismissed_ocr_file_ids)
+    terminal_files = database.scalars(
+        select(ReimbursementDraftFile)
+        .where(
+            ReimbursementDraftFile.draft_id == draft_id,
+            ReimbursementDraftFile.file_status
+            == ReimbursementDraftFileStatus.ACTIVE.value,
+            ReimbursementDraftFile.processing_role
+            == ReimbursementDraftFileRole.EXPENSE_SOURCE.value,
+            ReimbursementDraftFile.ocr_status.in_(
+                (
+                    ReimbursementOcrStatus.COMPLETE.value,
+                    ReimbursementOcrStatus.FAILED.value,
+                )
+            ),
+        )
+        .order_by(ReimbursementDraftFile.sort_order, ReimbursementDraftFile.id)
+    ).all()
+    item_matches: dict[tuple[object, ...], list[int]] = {}
+    updated_items = list(draft_input.items)
+    for index, item in enumerate(updated_items):
+        if item.source_file_id is not None:
+            continue
+        item_matches.setdefault(_legacy_item_match_key(item), []).append(index)
+    file_matches: dict[tuple[object, ...], list[ReimbursementDraftFile]] = {}
+    for file in terminal_files:
+        if file.id in decided_ids:
+            continue
+        key = _legacy_file_match_key(file)
+        if key is not None:
+            file_matches.setdefault(key, []).append(file)
+    for key, indexes in item_matches.items():
+        matching_files = file_matches.get(key, [])
+        if len(indexes) != 1 or len(matching_files) != 1:
+            continue
+        item_index = indexes[0]
+        updated_items[item_index] = updated_items[item_index].model_copy(
+            update={"source_file_id": matching_files[0].id}
+        )
+    return draft_input.model_copy(update={"items": updated_items})
+
+
+def _legacy_item_match_key(
+    item: ReimbursementDraftExpenseItemInput,
+) -> tuple[object, ...]:
+    value = item.model_dump(mode="json", by_alias=True)
+    return (
+        value.get("category"),
+        value.get("date"),
+        value.get("displayDate"),
+        value.get("description"),
+        value.get("amount"),
+        value.get("receiptCount"),
+    )
+
+
+def _legacy_file_match_key(file: ReimbursementDraftFile) -> tuple[object, ...] | None:
+    try:
+        value = json.loads(file.ocr_result_json or "null")
+    except (TypeError, ValueError):
+        return None
+    if (
+        not isinstance(value, dict)
+        or value.get("fileId") != file.id
+        or value.get("source") != "ocr"
+        or value.get("status") not in {"recognized", "failed"}
+    ):
+        return None
+    key = (
+        value.get("categoryId"),
+        value.get("date"),
+        value.get("date"),
+        value.get("description"),
+        value.get("amount"),
+        value.get("receiptCount"),
+    )
+    return None if any(part is None for part in key) else key
+
+
+def _draft_file_reference_ids(draft_input: ReimbursementDraftInput) -> set[str]:
+    return {
+        *(
+            item.source_file_id
+            for item in draft_input.items
+            if item.source_file_id is not None
+        ),
+        *draft_input.dismissed_ocr_file_ids,
     }
 
 
@@ -761,7 +1001,12 @@ def _validate_related_snapshot(
         )
 
 
-def _validate_file_snapshot(database: Session, *, draft_id: str) -> None:
+def _validate_file_snapshot(
+    database: Session,
+    *,
+    draft_id: str,
+    draft_input: ReimbursementDraftInput,
+) -> None:
     files = database.scalars(
         select(ReimbursementDraftFile).where(ReimbursementDraftFile.draft_id == draft_id)
     ).all()
@@ -775,9 +1020,20 @@ def _validate_file_snapshot(database: Session, *, draft_id: str) -> None:
             ReimbursementDraftFileStatus.DELETING.value,
         }
         or item.ocr_status == ReimbursementOcrStatus.RUNNING.value
+        or (
+            item.file_status == ReimbursementDraftFileStatus.ACTIVE.value
+            and item.processing_role == ReimbursementDraftFileRole.EXPENSE_SOURCE.value
+            and item.ocr_status == ReimbursementOcrStatus.NOT_REQUESTED.value
+        )
         for item in files
     ):
-        raise _not_ready_error("附件仍在上传、删除或识别中，请稍后重试")
+        raise _not_ready_error("票据尚未识别，或附件仍在上传、删除、识别中")
+    validate_draft_file_references(
+        database,
+        draft_id=draft_id,
+        draft_input=draft_input,
+        require_terminal_disposition=True,
+    )
 
 
 def _require_department(draft: ReimbursementDraft, actor: DraftActor) -> None:
@@ -891,6 +1147,14 @@ def _template_changed_error() -> ApiError:
 
 def _not_ready_error(message: str) -> ApiError:
     return ApiError("REIMBURSEMENT_DRAFT_NOT_READY", message, 409)
+
+
+def _invalid_file_reference_error() -> ApiError:
+    return ApiError(
+        "REIMBURSEMENT_DRAFT_FILE_REFERENCE_INVALID",
+        "费用明细引用的票据文件无效，请刷新后重试",
+        422,
+    )
 
 
 def _corrupted_error() -> ApiError:
