@@ -32,6 +32,7 @@ _PROCESS_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _PROFILE_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _MAX_CONFIG_CAS_ATTEMPTS = 3
 _MAX_TRAVEL_PROFILES = 20
+_TRAVEL_TABLE_COMPONENT_TYPES: Final = frozenset({"DDTableField", "TableField"})
 _TRAVEL_PROFILE_JSON_KEYS = frozenset(
     {
         "profileKey",
@@ -144,8 +145,16 @@ REIMBURSEMENT_LOGICAL_FIELD_SPECS: Final[tuple[LogicalFieldSpec, ...]] = (
     LogicalFieldSpec("attachments", "附件", frozenset({"DDAttachment"})),
 )
 TRAVEL_LOGICAL_FIELD_SPECS: Final[tuple[LogicalFieldSpec, ...]] = (
-    LogicalFieldSpec("startDate", "出差开始日期", frozenset({"DDDateField"})),
-    LogicalFieldSpec("endDate", "出差结束日期", frozenset({"DDDateField"})),
+    LogicalFieldSpec(
+        "startDate",
+        "出差开始日期",
+        frozenset({"DDDateField", *_TRAVEL_TABLE_COMPONENT_TYPES}),
+    ),
+    LogicalFieldSpec(
+        "endDate",
+        "出差结束日期",
+        frozenset({"DDDateField", *_TRAVEL_TABLE_COMPONENT_TYPES}),
+    ),
 )
 LOGICAL_FIELD_SPECS = REIMBURSEMENT_LOGICAL_FIELD_SPECS
 
@@ -543,12 +552,21 @@ def validate_travel_template_mapping(
     schema: FormSchema,
     mappings: dict[str, str],
 ) -> dict[str, str]:
-    return _validate_mapping(
+    normalized = _validate_mapping(
         schema,
         mappings,
         specs=TRAVEL_LOGICAL_FIELD_SPECS,
         reject_unmapped_required=False,
+        reusable_component_types=_TRAVEL_TABLE_COMPONENT_TYPES,
     )
+    component_by_id = {component.component_id: component for component in schema.components}
+    uses_table = any(
+        component_by_id[component_id].component_type in _TRAVEL_TABLE_COMPONENT_TYPES
+        for component_id in normalized.values()
+    )
+    if uses_table and len(set(normalized.values())) != 1:
+        raise _mapping_error("出差开始日期和结束日期必须映射到同一个表格控件")
+    return normalized
 
 
 def _validate_mapping(
@@ -557,6 +575,7 @@ def _validate_mapping(
     *,
     specs: tuple[LogicalFieldSpec, ...],
     reject_unmapped_required: bool,
+    reusable_component_types: frozenset[str] = frozenset(),
 ) -> dict[str, str]:
     field_by_key = {item.key: item for item in specs}
     supplied_keys = set(mappings)
@@ -576,11 +595,14 @@ def _validate_mapping(
         component_id = raw_component_id.strip() if isinstance(raw_component_id, str) else ""
         if not component_id:
             raise _mapping_error(f"{spec.label}尚未选择 OA 控件")
-        if component_id in used_component_ids:
-            raise _mapping_error("同一个 OA 控件不能对应多个系统字段")
         component = component_by_id.get(component_id)
         if component is None:
             raise _mapping_error(f"{spec.label}对应的 OA 控件不存在")
+        if (
+            component_id in used_component_ids
+            and component.component_type not in reusable_component_types
+        ):
+            raise _mapping_error("同一个 OA 控件不能对应多个系统字段")
         incompatibility = _component_incompatibility(component, spec)
         if incompatibility is not None:
             raise _mapping_error(f"{spec.label}{incompatibility}")
@@ -795,7 +817,11 @@ def _component_incompatibility(
     component: FormComponent,
     spec: LogicalFieldSpec,
 ) -> str | None:
-    if component.in_subtable or component.unsupported_container_ancestor:
+    is_travel_table = (
+        spec.key in {"startDate", "endDate"}
+        and component.component_type in _TRAVEL_TABLE_COMPONENT_TYPES
+    )
+    if component.in_subtable or (component.unsupported_container_ancestor and not is_travel_table):
         return "暂不支持映射到明细表或复杂业务组件的子控件"
     if (
         component.disabled
@@ -808,7 +834,11 @@ def _component_incompatibility(
         return f"不支持控件类型 {component.component_type}"
     if component.component_type == "DDSelectField" and not component.options:
         return "对应的选择控件没有可用选项"
-    if spec.key in {"startDate", "endDate"} and component.value_format != "yyyy-MM-dd":
+    if (
+        spec.key in {"startDate", "endDate"}
+        and component.component_type == "DDDateField"
+        and component.value_format != "yyyy-MM-dd"
+    ):
         return "仅支持 yyyy-MM-dd 日期格式"
     return None
 

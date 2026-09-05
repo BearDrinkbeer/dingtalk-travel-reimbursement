@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from dataclasses import replace
 from datetime import date
 from types import SimpleNamespace
 
@@ -112,6 +114,25 @@ def _instance(
         created_at="2026-08-01T08:00:00+08:00",
         finished_at="2026-08-02T08:00:00+08:00",
         form_values=tuple(values),
+    )
+
+
+def _itinerary_instance(
+    instance_id: str,
+    value: object,
+) -> WorkflowProcessInstance:
+    return replace(
+        _instance(instance_id, start_date=None, end_date=None),
+        form_values=(
+            WorkflowFormValue(
+                component_id="itinerary-id",
+                name="行程",
+                component_type="TableField",
+                value=value if isinstance(value, str) else json.dumps(value, ensure_ascii=False),
+                ext_value=None,
+                biz_alias="itinerary",
+            ),
+        ),
     )
 
 
@@ -239,6 +260,96 @@ async def test_listing_pages_each_profile_uses_only_current_identity_and_filters
         "missing-date",
         "target-b",
     }
+
+
+@pytest.mark.asyncio
+async def test_native_itinerary_table_uses_earliest_start_and_latest_end() -> None:
+    profile = _profile("native", "PROC-NATIVE")
+    profile.start_date_component_id = "itinerary-id"
+    profile.end_date_component_id = "itinerary-id"
+    rows = [
+        {
+            "rowValue": [
+                {
+                    "bizAlias": "startTime",
+                    "key": "DDDateField-J8TW2TVY",
+                    "value": "2026-09-10 上午",
+                },
+                {
+                    "bizAlias": "endTime",
+                    "key": "DDDateField-J8TW2TVZ",
+                    "value": "2026-09-18 下午",
+                },
+            ]
+        },
+        {
+            "rowValue": [
+                {
+                    "bizAlias": "startTime",
+                    "key": "DDDateField-J8TW2TVY",
+                    "value": "2026-09-03 下午",
+                },
+                {
+                    "bizAlias": "endTime",
+                    "key": "DDDateField-J8TW2TVZ",
+                    "value": "2026-09-05 上午",
+                },
+            ]
+        },
+    ]
+    workflow = FakeWorkflow(
+        {("PROC-NATIVE", 0): WorkflowInstanceIdPage(("native-trip",), None)},
+        {"native-trip": _itinerary_instance("native-trip", rows)},
+    )
+
+    candidates = await list_current_user_travel_approvals(
+        workflow,
+        _catalog(profile),
+        current_user_id="employee-1",
+        query_window=_window(),
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].start_date == date(2026, 9, 3)
+    assert candidates[0].end_date == date(2026, 9, 18)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value",
+    (
+        "not-json",
+        [{"rowValue": []}],
+        [
+            {
+                "rowValue": [
+                    {
+                        "bizAlias": "startTime",
+                        "key": "DDDateField-J8TW2TVY",
+                        "value": "2026-09-03 上午",
+                    }
+                ]
+            }
+        ],
+    ),
+)
+async def test_native_itinerary_table_fails_closed_for_invalid_rows(value: object) -> None:
+    profile = _profile("native", "PROC-NATIVE")
+    profile.start_date_component_id = "itinerary-id"
+    profile.end_date_component_id = "itinerary-id"
+    workflow = FakeWorkflow(
+        {("PROC-NATIVE", 0): WorkflowInstanceIdPage(("invalid-trip",), None)},
+        {"invalid-trip": _itinerary_instance("invalid-trip", value)},
+    )
+
+    candidates = await list_current_user_travel_approvals(
+        workflow,
+        _catalog(profile),
+        current_user_id="employee-1",
+        query_window=_window(),
+    )
+
+    assert candidates == ()
 
 
 @pytest.mark.asyncio

@@ -78,8 +78,9 @@ export PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=1
 
 mkdir -p data "$TEMP_DIR" "$REIMBURSEMENT_STAGING_DIR"
 uv run --frozen --extra dev --extra ocr alembic upgrade head
+# The app already isolates image validation and OCR in fresh spawn processes.
+# Uvicorn's macOS reload subprocess cannot reliably create those children.
 exec uv run --frozen --extra dev --extra ocr uvicorn app.main:app \
     --host 127.0.0.1 \
     --port 8000 \
-    --reload \
     --no-access-log

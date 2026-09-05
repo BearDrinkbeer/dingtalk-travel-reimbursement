@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Protocol
@@ -386,16 +387,37 @@ def _eligible_candidate(
         or instance.result != "agree"
     ):
         return None
-    start_date = _component_date(instance, listed.start_date_component_id)
-    end_date = _component_date(instance, listed.end_date_component_id)
-    if start_date is None or end_date is None or end_date < start_date:
+    dates = travel_approval_dates(
+        instance,
+        start_date_component_id=listed.start_date_component_id,
+        end_date_component_id=listed.end_date_component_id,
+    )
+    if dates is None:
         return None
+    start_date, end_date = dates
     return TravelApprovalCandidate(
         listed=listed,
         instance=instance,
         start_date=start_date,
         end_date=end_date,
     )
+
+
+def travel_approval_dates(
+    instance: WorkflowProcessInstance,
+    *,
+    start_date_component_id: str,
+    end_date_component_id: str,
+) -> tuple[date, date] | None:
+    """Read one approved trip period from direct dates or a native itinerary table."""
+
+    if start_date_component_id == end_date_component_id:
+        return _itinerary_dates(instance, start_date_component_id)
+    start_date = _component_date(instance, start_date_component_id)
+    end_date = _component_date(instance, end_date_component_id)
+    if start_date is None or end_date is None or end_date < start_date:
+        return None
+    return start_date, end_date
 
 
 def _component_date(instance: WorkflowProcessInstance, component_id: str) -> date | None:
@@ -411,6 +433,70 @@ def _component_date(instance: WorkflowProcessInstance, component_id: str) -> dat
         return None
     try:
         return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _itinerary_dates(
+    instance: WorkflowProcessInstance,
+    component_id: str,
+) -> tuple[date, date] | None:
+    component = next(
+        (
+            form_value
+            for form_value in instance.form_values
+            if form_value.component_id == component_id
+        ),
+        None,
+    )
+    if (
+        component is None
+        or component.component_type not in {"TableField", "DDTableField"}
+        or component.value is None
+    ):
+        return None
+    try:
+        rows = json.loads(component.value)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(rows, list) or not rows:
+        return None
+
+    starts: list[date] = []
+    ends: list[date] = []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("rowValue"), list):
+            return None
+        row_values = row["rowValue"]
+        start = _itinerary_row_date(row_values, "startTime")
+        end = _itinerary_row_date(row_values, "endTime")
+        if start is None or end is None or end < start:
+            return None
+        starts.append(start)
+        ends.append(end)
+    return min(starts), max(ends)
+
+
+def _itinerary_row_date(values: list[object], biz_alias: str) -> date | None:
+    matches = [
+        value for value in values if isinstance(value, dict) and value.get("bizAlias") == biz_alias
+    ]
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    key = match.get("key")
+    raw_value = match.get("value")
+    if (
+        not isinstance(key, str)
+        or not key.startswith("DDDateField")
+        or not isinstance(raw_value, str)
+    ):
+        return None
+    parts = raw_value.strip().split()
+    if not 1 <= len(parts) <= 2 or (len(parts) == 2 and parts[1] not in {"上午", "下午"}):
+        return None
+    try:
+        return date.fromisoformat(parts[0])
     except ValueError:
         return None
 

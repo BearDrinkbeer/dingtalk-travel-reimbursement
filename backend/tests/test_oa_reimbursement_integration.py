@@ -188,6 +188,13 @@ def _schemas() -> tuple[FormSchema, FormSchema, FormOption]:
     return reimbursement, travel, travel_type
 
 
+def _itinerary_schema() -> FormSchema:
+    return _schema(
+        TRAVEL_PROCESS_CODE,
+        (_component("travel-itinerary-id", "TableField", "行程"),),
+    )
+
+
 class LocalWorkflowBoundary:
     def __init__(
         self,
@@ -245,17 +252,44 @@ class LocalWorkflowBoundary:
             self.travel_detail_calls += 1
             if self.advance_validation_clock is not None:
                 self.advance_validation_clock(timedelta(seconds=2))
-            return WorkflowProcessInstance(
-                instance_id=instance_id,
-                title="境内出差申请",
-                business_id=f"TRAVEL-{instance_id}",
-                originator_user_id="mock-user",
-                originator_department_id="100",
-                status="COMPLETED",
-                result="agree",
-                created_at="2026-08-20T01:02:03Z",
-                finished_at="2026-08-20T02:02:03Z",
-                form_values=(
+            itinerary = next(
+                (
+                    component
+                    for component in self.schemas[TRAVEL_PROCESS_CODE].components
+                    if component.component_type in {"TableField", "DDTableField"}
+                ),
+                None,
+            )
+            form_values = (
+                (
+                    WorkflowFormValue(
+                        component_id=itinerary.component_id,
+                        name="行程",
+                        component_type=itinerary.component_type,
+                        value=json.dumps(
+                            [
+                                {
+                                    "rowValue": [
+                                        {
+                                            "bizAlias": "startTime",
+                                            "key": "DDDateField-start",
+                                            "value": "2026-09-01 上午",
+                                        },
+                                        {
+                                            "bizAlias": "endTime",
+                                            "key": "DDDateField-end",
+                                            "value": "2026-09-03 下午",
+                                        },
+                                    ]
+                                }
+                            ]
+                        ),
+                        ext_value=None,
+                        biz_alias="itinerary",
+                    ),
+                )
+                if itinerary is not None
+                else (
                     WorkflowFormValue(
                         component_id="travel-start-id",
                         name="开始日期",
@@ -272,7 +306,19 @@ class LocalWorkflowBoundary:
                         ext_value=None,
                         biz_alias="alias-travel-end-id",
                     ),
-                ),
+                )
+            )
+            return WorkflowProcessInstance(
+                instance_id=instance_id,
+                title="境内出差申请",
+                business_id=f"TRAVEL-{instance_id}",
+                originator_user_id="mock-user",
+                originator_department_id="100",
+                status="COMPLETED",
+                result="agree",
+                created_at="2026-08-20T01:02:03Z",
+                finished_at="2026-08-20T02:02:03Z",
+                form_values=form_values,
             )
         assert instance_id == OA_INSTANCE_ID
         assert self.created_command is not None
@@ -446,6 +492,14 @@ def _persist_ready_draft(
     with client.app.state.database_session_factory() as database:
         reimbursement_schema = workflow.schemas[REIMBURSEMENT_PROCESS_CODE]
         travel_schema = workflow.schemas[TRAVEL_PROCESS_CODE]
+        itinerary = next(
+            (
+                component
+                for component in travel_schema.components
+                if component.component_type in {"TableField", "DDTableField"}
+            ),
+            None,
+        )
         asyncio.run(
             confirm_template_catalog(
                 database,
@@ -460,10 +514,17 @@ def _persist_ready_draft(
                         display_name="境内出差",
                         process_code=TRAVEL_PROCESS_CODE,
                         schema_fingerprint=travel_schema.fingerprint,
-                        mappings={
-                            "startDate": "travel-start-id",
-                            "endDate": "travel-end-id",
-                        },
+                        mappings=(
+                            {
+                                "startDate": itinerary.component_id,
+                                "endDate": itinerary.component_id,
+                            }
+                            if itinerary is not None
+                            else {
+                                "startDate": "travel-start-id",
+                                "endDate": "travel-end-id",
+                            }
+                        ),
                         travel_type_option=travel_type,
                     )
                 ],
@@ -689,7 +750,8 @@ def test_validation_shares_membership_pages_across_related_approvals(
 def test_submit_worker_readback_and_cleanup_are_one_durable_local_flow(
     client_factory,
 ) -> None:
-    reimbursement_schema, travel_schema, travel_type = _schemas()
+    reimbursement_schema, _travel_schema, travel_type = _schemas()
+    travel_schema = _itinerary_schema()
     workflow = LocalWorkflowBoundary(reimbursement_schema, travel_schema)
     storage = LocalStorageBoundary(auto_rename_first=True)
     client = client_factory(auth_mock_enabled=True)

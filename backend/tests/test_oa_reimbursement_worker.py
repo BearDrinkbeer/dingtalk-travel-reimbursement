@@ -927,6 +927,47 @@ def test_readback_matching_compares_structured_controls_as_strict_json() -> None
     )
 
 
+def test_readback_matching_accepts_dingtalk_related_titles_only_with_exact_ext_ids() -> None:
+    command = replace(
+        _command(),
+        form_values=(
+            CreateWorkflowFormValue(
+                component_id="RelateField_1",
+                name="关联审批单",
+                component_type="RelateField",
+                value='["travel-instance-1"]',
+            ),
+        ),
+    )
+    value = WorkflowFormValue(
+        component_id="RelateField_1",
+        name="关联审批单",
+        component_type="RelateField",
+        value='["员工提交的出差"]',
+        ext_value='{"list":[{"procInstId":"travel-instance-1"}]}',
+        biz_alias=None,
+    )
+    instance = replace(_instance(), form_values=(value,))
+
+    assert strict_instance_matches_command(command, instance)
+    assert not strict_instance_matches_command(
+        command,
+        replace(
+            instance,
+            form_values=(
+                replace(
+                    value,
+                    ext_value='{"list":[{"procInstId":"different-instance"}]}',
+                ),
+            ),
+        ),
+    )
+    assert not strict_instance_matches_command(
+        command,
+        replace(instance, form_values=(replace(value, ext_value=None),)),
+    )
+
+
 async def test_transient_validation_failure_is_retried_from_validation_phase() -> None:
     state = FakeState(_job(ReimbursementSubmissionStatus.VALIDATING))
     processor = OAReimbursementProcessor(

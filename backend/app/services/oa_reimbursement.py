@@ -96,6 +96,7 @@ from app.services.reimbursement_submissions import (
     renew_submission_lease,
     reset_rejected_upload_commit,
 )
+from app.services.travel_approvals import travel_approval_dates
 
 logger = logging.getLogger(__name__)
 
@@ -497,21 +498,19 @@ class SnapshotSubmissionMaterializer:
                     self._workflow.get_process_instance(instance_id)
                 ),
             )
-            start_value = _instance_component_value(
+            dates = travel_approval_dates(
                 instance,
-                profile.start_date_component_id,
-            )
-            end_value = _instance_component_value(
-                instance,
-                profile.end_date_component_id,
+                start_date_component_id=profile.start_date_component_id,
+                end_date_component_id=profile.end_date_component_id,
             )
             if (
                 instance.instance_id != related.process_instance_id
                 or instance.originator_user_id != snapshot.identity.user_id
                 or instance.status != "COMPLETED"
                 or instance.result != "agree"
-                or start_value != related.start_date.isoformat()
-                or end_value != related.end_date.isoformat()
+                or dates is None
+                or dates[0] != related.start_date
+                or dates[1] != related.end_date
             ):
                 raise ApiError(
                     "TRAVEL_APPROVAL_MEMBERSHIP_CHANGED",
@@ -2270,12 +2269,48 @@ def _form_value_matches(
 ) -> bool:
     """Compare structured controls semantically and plain controls byte-for-byte."""
 
+    if expected.component_type == "RelateField":
+        return _relate_field_matches(expected.value, actual)
     if expected.component_type not in _JSON_FORM_COMPONENT_TYPES:
         return actual.value == expected.value
     if actual.value is None:
         return False
     try:
         return _strict_json_value(actual.value) == _strict_json_value(expected.value)
+    except ValueError:
+        return False
+
+
+def _relate_field_matches(expected_raw: str, actual: WorkflowFormValue) -> bool:
+    """Accept DingTalk's title display value only when extValue proves the exact IDs."""
+
+    try:
+        expected = _strict_json_value(expected_raw)
+        if (
+            not isinstance(expected, list)
+            or any(not isinstance(item, str) or not item for item in expected)
+            or len(expected) != len(set(expected))
+        ):
+            return False
+        if actual.value is not None and _strict_json_value(actual.value) == expected:
+            return True
+        if actual.ext_value is None:
+            return False
+        ext_value = _strict_json_value(actual.ext_value)
+        if not isinstance(ext_value, dict) or set(ext_value) != {"list"}:
+            return False
+        entries = ext_value["list"]
+        if not isinstance(entries, list):
+            return False
+        actual_ids = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                return False
+            instance_id = entry.get("procInstId")
+            if not isinstance(instance_id, str) or not instance_id:
+                return False
+            actual_ids.append(instance_id)
+        return actual_ids == expected
     except ValueError:
         return False
 
@@ -2390,16 +2425,6 @@ def _validate_original_manifest(
                 "原始附件清单与锁定快照不一致",
                 409,
             )
-
-
-def _instance_component_value(
-    instance: WorkflowProcessInstance,
-    component_id: str,
-) -> str | None:
-    matches = tuple(
-        value.value for value in instance.form_values if value.component_id == component_id
-    )
-    return matches[0] if len(matches) == 1 else None
 
 
 def _quota_lease(lease: SubmissionLease) -> QuotaSubmissionLease:

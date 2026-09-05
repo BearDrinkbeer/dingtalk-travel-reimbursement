@@ -157,6 +157,7 @@ def test_agent_id_is_wired_through_deployment_and_development_entrypoints() -> N
         "; do", maxsplit=1
     )[0]
     assert "DINGTALK_AGENT_ID" in required_variables
+    assert "--reload" not in dingtalk_script
 
     frontend_script = (REPOSITORY_ROOT / "scripts" / "dev-dingtalk-frontend.sh").read_text()
     unset_line = next(line for line in frontend_script.splitlines() if line.startswith("unset "))

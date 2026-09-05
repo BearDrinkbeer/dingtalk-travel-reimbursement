@@ -153,6 +153,8 @@ make dev-dingtalk
 `/tmp/dingtalk-expense-dingtalk-dev`。前端仍通过 Vite 将同源 `/api` 代理到本机后端。
 `dev-dingtalk-frontend` 会显式设置 `VITE_DINGTALK_REMOTE_DEBUG=true`，按需动态加载锁定的
 `dingtalk-h5-remote-debug@0.1.3`；只有钉钉调试平台生成的调试链接才会继续加载远程调试 SDK。
+真实钉钉联调后端不启用 Uvicorn 热重载，以免 macOS 的重载子进程与图片/OCR 隔离子进程冲突；
+修改后端代码后手动重启 `make dev-dingtalk` 即可。
 普通 `dev-frontend`、测试和生产构建默认不初始化该工具。
 PC 钉钉本机调试时，不配置 `DINGTALK_DEV_PUBLIC_HOST`，保持
 `DINGTALK_DEV_COOKIE_SECURE=false`，在官方四端调试工具中填写

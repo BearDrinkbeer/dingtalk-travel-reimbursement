@@ -19,6 +19,7 @@ from app.services.oa_template_profiles import load_fresh_submission_template
 
 PROCESS_CODE = "PROC-TEST-REIMBURSEMENT"
 TRAVEL_PROCESS_CODES = ["PROC-TRAVEL-DOMESTIC", "PROC-TRAVEL-INTERNATIONAL"]
+TRAVEL_TABLE_COMPONENT_ID = "TableField-J8TW2TVT"
 
 MAPPINGS = {
     "company": "company-id",
@@ -129,6 +130,42 @@ def travel_schema_payload(
                         format="yyyy-MM-dd",
                     ),
                     component("TextField", "travel-reason-id", "出差事由"),
+                ],
+            },
+        }
+    }
+
+
+def travel_table_schema_payload(
+    process_code: str,
+    *,
+    component_type: str,
+) -> dict[str, object]:
+    return {
+        "result": {
+            "formCode": process_code,
+            "formUuid": f"form-uuid-{process_code.lower()}",
+            "name": f"{process_code} 出差申请",
+            "status": "PUBLISHED",
+            "gmtModified": "2026-09-03T11:00:00+08:00",
+            "schemaContent": {
+                "title": f"{process_code} 出差申请",
+                "items": [
+                    {
+                        "componentName": "DDBizSuite",
+                        "props": {
+                            "id": "DDBizSuite-J4NUHWH9",
+                            "label": "商旅出差",
+                            "bizAlias": "tripSuite",
+                        },
+                        "children": [
+                            component(
+                                component_type,
+                                TRAVEL_TABLE_COMPONENT_ID,
+                                "出差明细",
+                            )
+                        ],
+                    }
                 ],
             },
         }
@@ -332,6 +369,162 @@ def test_inspect_uses_official_signature_and_normalizes_safe_schema(client_facto
     assert "client-secret" not in response.text
     assert "access-1" not in response.text
     assert calls == {"token": 1, "schema": 1}
+
+
+@pytest.mark.parametrize("component_type", ("TableField", "DDTableField"))
+def test_travel_dates_can_share_one_top_level_table_through_confirm_and_reload(
+    client_factory,
+    component_type: str,
+) -> None:
+    def travel_response(process_code: str, _request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=travel_table_schema_payload(
+                process_code,
+                component_type=component_type,
+            ),
+        )
+
+    transport, _calls = transport_for_schema(
+        lambda _number, _request: httpx.Response(200, json=schema_payload()),
+        travel_response_factory=travel_response,
+    )
+    client, headers = admin_client(client_factory, transport)
+
+    inspected = inspect(client, headers)
+
+    assert inspected.status_code == 200, inspected.text
+    inspection = inspected.json()["data"]
+    fingerprints: dict[str, str] = {}
+    table_mappings: dict[str, dict[str, str]] = {}
+    for profile in inspection["travelProfiles"]:
+        table = next(
+            component
+            for component in profile["schema"]["components"]
+            if component["componentId"] == TRAVEL_TABLE_COMPONENT_ID
+        )
+        assert table["componentType"] == component_type
+        assert table["nested"] is True
+        assert table["inSubtable"] is False
+        assert table["unsupportedContainerAncestor"] is True
+        assert table["parentComponentId"] == "DDBizSuite-J4NUHWH9"
+        assert table["compatibleLogicalFields"] == ["startDate", "endDate"]
+        fingerprints[profile["processCode"]] = profile["schema"]["schemaFingerprint"]
+        table_mappings[profile["processCode"]] = {
+            "startDate": TRAVEL_TABLE_COMPONENT_ID,
+            "endDate": TRAVEL_TABLE_COMPONENT_ID,
+        }
+
+    confirmed = confirm(
+        client,
+        headers,
+        inspection["reimbursement"]["schema"]["schemaFingerprint"],
+        travel_schema_fingerprints=fingerprints,
+        travel_mappings=table_mappings,
+    )
+    current = client.get("/api/admin/oa/templates/catalog")
+
+    assert confirmed.status_code == 200, confirmed.text
+    assert current.status_code == 200, current.text
+    assert current.json()["data"]["isSubmissionReady"] is True
+    assert all(
+        profile["mappings"]
+        == {
+            "startDate": TRAVEL_TABLE_COMPONENT_ID,
+            "endDate": TRAVEL_TABLE_COMPONENT_ID,
+        }
+        for profile in current.json()["data"]["catalog"]["travelProfiles"]
+    )
+
+    async def reload_contract():
+        return await load_fresh_submission_template(
+            client.app.state.database_session_factory,
+            client.app.state.dingtalk_workflow,
+        )
+
+    reloaded = asyncio.run(reload_contract())
+    assert all(
+        profile.start_date_component_id == TRAVEL_TABLE_COMPONENT_ID
+        and profile.end_date_component_id == TRAVEL_TABLE_COMPONENT_ID
+        for profile in reloaded.travel_profiles
+    )
+
+
+def test_travel_dates_cannot_share_one_direct_date_component(client_factory) -> None:
+    transport, _calls = transport_for_schema(
+        lambda _number, _request: httpx.Response(200, json=schema_payload())
+    )
+    client, headers = admin_client(client_factory, transport)
+    inspected = inspect(client, headers).json()["data"]
+
+    response = confirm(
+        client,
+        headers,
+        inspected["reimbursement"]["schema"]["schemaFingerprint"],
+        travel_mappings={
+            TRAVEL_PROCESS_CODES[0]: {
+                "startDate": "travel-start-id",
+                "endDate": "travel-start-id",
+            }
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "OA_TEMPLATE_MAPPING_INVALID"
+    assert "同一个 OA 控件" in response.json()["error"]["message"]
+
+
+def test_travel_dates_cannot_mix_a_table_with_a_direct_date_component(
+    client_factory,
+) -> None:
+    mixed = travel_table_schema_payload(
+        TRAVEL_PROCESS_CODES[0],
+        component_type="TableField",
+    )
+    mixed["result"]["schemaContent"]["items"].append(
+        component(
+            "DDDateField",
+            "travel-end-id",
+            "结束日期",
+            format="yyyy-MM-dd",
+        )
+    )
+
+    def travel_response(process_code: str, _request: httpx.Request) -> httpx.Response:
+        payload = (
+            mixed
+            if process_code == TRAVEL_PROCESS_CODES[0]
+            else travel_schema_payload(process_code)
+        )
+        return httpx.Response(200, json=payload)
+
+    transport, _calls = transport_for_schema(
+        lambda _number, _request: httpx.Response(200, json=schema_payload()),
+        travel_response_factory=travel_response,
+    )
+    client, headers = admin_client(client_factory, transport)
+    inspected = inspect(client, headers).json()["data"]
+    fingerprints = {
+        profile["processCode"]: profile["schema"]["schemaFingerprint"]
+        for profile in inspected["travelProfiles"]
+    }
+
+    response = confirm(
+        client,
+        headers,
+        inspected["reimbursement"]["schema"]["schemaFingerprint"],
+        travel_schema_fingerprints=fingerprints,
+        travel_mappings={
+            TRAVEL_PROCESS_CODES[0]: {
+                "startDate": TRAVEL_TABLE_COMPONENT_ID,
+                "endDate": "travel-end-id",
+            }
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "OA_TEMPLATE_MAPPING_INVALID"
+    assert "同一个表格控件" in response.json()["error"]["message"]
 
 
 def test_schema_read_refreshes_one_rejected_access_token(client_factory) -> None:
