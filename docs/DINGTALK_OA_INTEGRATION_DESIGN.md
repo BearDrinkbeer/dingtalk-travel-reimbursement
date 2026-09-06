@@ -471,11 +471,13 @@ Workflow 适配代码见 [workflow.py](../backend/app/integrations/dingtalk/work
 
 | 方法与路径 | 用途 |
 |---|---|
-| `GET /api/config/public` | 返回前端免登需要的 CorpId、Client ID 等公开配置 |
+| `GET /api/config/public` | 无需 Session；返回 CorpId、Client ID、Mock 开关、上传/费用限制和 OA 提交开关 |
 | `POST /api/auth/dingtalk` | 用免登码建立服务端 Session |
 | `GET /api/me` | 恢复当前身份并轮换 CSRF token |
 | `POST /api/me/department` | 从钉钉确认过的部门中选择本次报销部门 |
 | `POST /api/auth/logout` | 注销 Session |
+
+公共配置中的 `oaSubmissionEnabled` 是布尔值，直接来自 `DINGTALK_OA_WORKER_ENABLED`。前端以它判断是否允许发起新 OA 提交；该字段不代表真实权限或远端能力预检结果。公共响应不包含应用 Secret 或 AgentId。
 
 ### 11.2 模板目录
 
@@ -512,7 +514,7 @@ Workflow 适配代码见 [workflow.py](../backend/app/integrations/dingtalk/work
 
 | 方法与路径 | 用途 |
 |---|---|
-| `POST /api/oa/reimbursements/{draftId}/submit` | 原子锁定草稿并创建持久后台任务；固定返回 HTTP 202 |
+| `POST /api/oa/reimbursements/{draftId}/submit` | 接受新提交或返回已有任务时为 HTTP 202；worker 关闭时拒绝新提交 |
 | `GET /api/oa/reimbursements/submissions/{submissionId}` | 按任务 ID 轮询进度 |
 | `GET /api/oa/reimbursements/drafts/{draftId}/submission` | 按草稿只读查找已有任务，用于另一设备或浏览器存储丢失后的恢复 |
 
@@ -526,6 +528,8 @@ Content-Type: application/json
 
 {"expectedRevision": 8}
 ```
+
+服务端先按当前身份查找草稿已有的提交记录：若存在，直接返回原任务，worker 关闭时也可恢复。若没有原任务且 worker 关闭，则返回 HTTP 503，错误码 `OA_SUBMISSION_DISABLED`；检查发生在快照构建、草稿锁定和任务创建之前，草稿保持可编辑，不发生远端操作。按任务 ID 和草稿 ID 的 GET 查询继续可用。
 
 进度响应的核心结构：
 
@@ -804,7 +808,7 @@ SQLite CAS、唯一约束和触发器共同保证：
 - 当前 SQLite 部署按单个后端副本运行。不能把 SQLite 文件放到多个容器随意共享并横向扩容；若未来改成多副本，应先迁移到支持该并发模型的数据库并重新验证租约；
 - 启动前执行 Alembic 到 `20260906_0012`；readiness 会检查当前 revision 和关键字段；后端代码升级后重启服务使新代码生效；
 - 代码和所有现成部署示例均保持 `DINGTALK_OA_WORKER_ENABLED=false`，启动服务不会自动消费已排队的正式提交；
-- worker 关闭时，员工点击正式提交仍会锁定草稿并创建持久任务；以后开启 worker 会消费这些已排队任务，因此开启前必须查清所有非终态 submission，不得遗留未确认的历史任务；
+- worker 关闭时，公共配置 `oaSubmissionEnabled=false`，页面禁用新提交；后端独立以 `503 / OA_SUBMISSION_DISABLED` 拒绝新提交，保留可编辑草稿且不创建任务。已有任务仍可查询和恢复；以后开启 worker 会消费先前已排队的任务，因此开启前必须查清所有非终态 submission，不得遗留未确认的历史任务；
 - 只有在 Alembic 迁移、模板 Schema/映射、权限、应用归属、非终态任务清单和 `/api/ready` 预检全部通过，且已准备执行一次明确的真实验收时，才显式设为 `true`；进入生产正式接单也必须经过同样的发布确认；
 - 应用退出时给已显式开启的 worker 最多 5 秒优雅停止，未完成任务随后由租约恢复；
 - SQLite 与持久暂存卷应做一致性备份。只恢复其中一份可能使数据库哈希和文件不匹配，系统会停止提交而不是使用错误文件。
@@ -813,7 +817,7 @@ SQLite CAS、唯一约束和触发器共同保证：
 
 - `GET /api/health`：只说明 FastAPI 进程存活；
 - `GET /api/ready`：检查数据库、迁移、Excel 模板、临时目录、持久暂存空间、OCR 和钉钉基础配置；
-- `/api/ready` 不发起真实 Workflow/Storage 调用，也不代替权限、模板目录和远端创建能力预检；
+- `/api/ready` 不表示 worker 已开启，不发起真实 Workflow/Storage 调用，也不代替权限、模板目录和远端创建能力预检；新提交开关由公共配置的 `oaSubmissionEnabled` 提供；
 - 模板目录是否已经确认由管理员目录接口和员工 options 接口检查。模板未配置或发生漂移时，页面提示配置问题，无法准备新报销或正式提交。
 
 ## 18. 监控和人工处理
@@ -891,6 +895,7 @@ SQLite CAS、唯一约束和触发器共同保证：
 | 快照/payload | 规范 JSON、SHA-256、防篡改、10 字段、关联数组、预算完整标签、版本 1 恢复、版本 2 两附件 |
 | PDF | 原始 PDF 页面/旋转保留、图片 EXIF/A4/完整边界、多页材料、按费用关联顺序、同 ID 一次且不同上传均保留、大小/页数限制和失败清理 |
 | worker | 续租、指数退避、PUT 重试、明确 commit 拒绝、commit 不确定、OA 不确定核对 |
+| 提交开关 | worker 关闭时新提交返回 503、不建任务且草稿可编辑；已有任务可恢复；公共配置准确反映开关且不泄露密钥 |
 | 回读 | 员工、部门、每个字段和结构化控件精确匹配，错误时进入人工核对 |
 | 清理 | `LINKED` 本地删除、孤儿远端回收、安全 `FAILED_FINAL` 到期删除、危险状态不删除 |
 | 前端 | 单费用列表、唯一操作、文件预览、自动保存排队/失败/恢复、预算来源、真实 totals 请求契约、行程单与外币提示、一次提交、刷新轮询和迟到响应隔离 |

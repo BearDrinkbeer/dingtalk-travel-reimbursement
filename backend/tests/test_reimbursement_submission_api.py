@@ -138,13 +138,14 @@ def _persist_submission_for_mock_user(client) -> tuple[str, str]:
         return draft.id, result.submission_id
 
 
-def test_submission_can_be_recovered_by_draft_without_csrf_and_without_mutation(
+def test_submission_can_be_recovered_with_worker_disabled_without_mutation(
     client_factory,
 ) -> None:
     owner = client_factory(
         auth_mock_enabled=True,
         auth_mock_user_id="owner-1",
         auth_mock_departments="100:测试部门,200:项目部",
+        dingtalk_oa_worker_enabled=False,
     )
     login = mock_login(owner)
     selected = owner.post(
@@ -165,10 +166,20 @@ def test_submission_can_be_recovered_by_draft_without_csrf_and_without_mutation(
             before_draft.updated_at,
         )
 
+    replay = owner.post(
+        f"/api/oa/reimbursements/{draft_id}/submit",
+        json={"expectedRevision": 999},
+        headers={
+            "X-CSRF-Token": login["csrfToken"],
+            "Idempotency-Key": "11111111-1111-4111-8111-111111111111",
+        },
+    )
     recovered = owner.get(f"/api/oa/reimbursements/drafts/{draft_id}/submission")
     by_id = owner.get(f"/api/oa/reimbursements/submissions/{submission_id}")
 
     assert recovered.status_code == 200, recovered.text
+    assert replay.status_code == 202, replay.text
+    assert replay.json()["data"] == recovered.json()["data"]
     assert recovered.json()["data"] == by_id.json()["data"]
     assert recovered.json()["data"]["submissionId"] == submission_id
     with owner.app.state.database_session_factory() as database:

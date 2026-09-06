@@ -86,6 +86,7 @@ def public_config(request: Request) -> dict[str, object]:
             "clientId": settings.dingtalk_client_id,
             "authMockEnabled": settings.app_env in {"development", "test"}
             and settings.auth_mock_enabled,
+            "oaSubmissionEnabled": settings.dingtalk_oa_worker_enabled,
             "uploadLimits": {
                 "maxFiles": settings.session_max_files,
                 "maxFileBytes": settings.upload_max_file_bytes,

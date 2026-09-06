@@ -35,6 +35,7 @@ const saving = ref(false)
 const saveError = ref('')
 const submitFlowPending = ref(false)
 const replacingTemplate = ref(false)
+const refreshingServiceStatus = ref(false)
 const savedInputSignature = ref('')
 const savedRelatedSignature = ref('')
 let calculationTimer: ReturnType<typeof setTimeout> | undefined
@@ -69,7 +70,7 @@ const formReadOnlyReason = computed(() => {
   if (!drafts.currentDraft) return '正在准备报销表单'
   if (submitFlowPending.value) return '正在提交，请稍候'
   if (drafts.currentDraft.status === 'EXPIRED') return '本次填写内容已过期，请重新填写'
-  if (drafts.currentDraft.status === 'LOCKED' || trackedSubmission.value) return '本次报销已提交，内容已锁定'
+  if (drafts.currentDraft.status === 'LOCKED' || trackedSubmission.value) return '本次报销内容已锁定，请查看提交进度'
   if (templateMismatch.value) return 'OA 表单已更新，请按新表单重新填写'
   return ''
 })
@@ -85,10 +86,17 @@ const currentFormInput = computed<ReimbursementDraftInput>(() => ({
 const inputDirty = computed(() => inputSignature(currentFormInput.value) !== savedInputSignature.value)
 const relatedDirty = computed(() => relatedSignature(selectedRelatedApprovals.value) !== savedRelatedSignature.value)
 const formDirty = computed(() => inputDirty.value || relatedDirty.value)
-const saveLabel = computed(() => trackedSubmission.value || drafts.currentDraft?.status === 'LOCKED' ? '已提交'
+const saveLabel = computed(() => trackedSubmission.value && submission.succeeded ? 'OA 已成功发起'
+  : trackedSubmission.value && submission.status === 'QUEUED' ? '已排队，内容已锁定'
+  : trackedSubmission.value || drafts.currentDraft?.status === 'LOCKED' ? '内容已锁定'
   : saveError.value ? '保存失败，内容仍保留在本页'
   : saving.value ? '正在保存…' : formDirty.value ? '等待保存…' : '已保存')
-const submissionButtonReason = computed(() => formReadOnlyReason.value || (drafts.busy ? '请等待材料处理完成' : ''))
+const submissionServiceReason = computed(() => submission.oaSubmissionEnabled === false
+  ? (trackedSubmission.value || drafts.currentDraft?.status === 'LOCKED'
+      ? 'OA提交服务未开启，请保留本次提交并稍后核对' : 'OA提交服务未开启，可继续填写')
+  : submission.oaSubmissionEnabled === null ? '正在确认 OA 提交服务状态' : '')
+const submissionButtonReason = computed(() => formReadOnlyReason.value || submissionServiceReason.value
+  || (drafts.busy ? '请等待材料处理完成' : ''))
 const previewDisabledReason = computed(() => expense.itemReadinessError
   || (!budgetCodeValue.value ? '请先选择预算代码' : '') || (submitFlowPending.value ? '正在提交，请稍候' : ''))
 const unresolvedOcrFiles = computed(() => drafts.files.filter((file) =>
@@ -210,7 +218,7 @@ function initializeWorkspace(force = false): Promise<void> {
 }
 function scheduleAutosave(): void {
   if (autosaveTimer) clearTimeout(autosaveTimer)
-  if (disposed || initializingWorkspace.value || formReadOnly.value || !formDirty.value) return
+  if (disposed || !sessionScope() || initializingWorkspace.value || formReadOnly.value || !formDirty.value) return
   autosaveTimer = setTimeout(() => { void flushAutosave().catch(() => undefined) }, 600)
 }
 async function flushAutosave(): Promise<void> {
@@ -332,16 +340,31 @@ async function retrySameSubmission(): Promise<void> {
   if (!draft) return
   try { await submission.submit(draft.id, draft.revision) } catch { /* Render the status error. */ }
 }
+async function refreshSubmissionService(refreshProgress = false): Promise<void> {
+  if (refreshingServiceStatus.value) return
+  refreshingServiceStatus.value = true
+  try {
+    await auth.refreshPublicConfig()
+    if (refreshProgress) await submission.pollNow()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '服务状态刷新失败，请重试')
+  } finally { refreshingServiceStatus.value = false }
+}
 onMounted(async () => { void health.check(); await auth.bootstrap(); await initializeWorkspace() })
 watch(() => sessionScope(), () => {
+  if (autosaveTimer) clearTimeout(autosaveTimer)
   if (sessionScope()) void initializeWorkspace()
   else { initializedScope = ''; initializationScope = '' }
 })
 watch([currentFormInput, selectedRelatedApprovals], scheduleAutosave, { deep: true })
 watch(budgetLabel, (label) => { expense.manualProject = true; expense.manualProjectText = label; expense.selectedProjectId = null })
-watch(() => [expense.includeSubsidy, expense.trip, expense.items], () => {
+watch(() => [sessionScope(), expense.includeSubsidy, expense.trip, expense.items], () => {
   if (calculationTimer) clearTimeout(calculationTimer)
-  calculationTimer = setTimeout(() => { void expense.refreshCalculations() }, 250)
+  const scope = sessionScope()
+  if (!scope || disposed) return
+  calculationTimer = setTimeout(() => {
+    if (!disposed && sessionScope() === scope) void expense.refreshCalculations()
+  }, 250)
 }, { deep: true })
 function warnBeforeUnload(event: BeforeUnloadEvent): void {
   if (!formReadOnly.value && formDirty.value) { event.preventDefault(); event.returnValue = '' }
@@ -609,6 +632,23 @@ onBeforeUnmount(() => {
               </div>
             </div>
             <el-alert
+              v-if="submissionServiceReason"
+              :title="submissionServiceReason"
+              type="warning"
+              :closable="false"
+              class="submission-status"
+              show-icon
+            >
+              <el-button
+                link
+                type="primary"
+                :loading="refreshingServiceStatus"
+                @click="refreshSubmissionService()"
+              >
+                刷新服务状态
+              </el-button>
+            </el-alert>
+            <el-alert
               v-if="saveError"
               :title="saveError"
               type="error"
@@ -654,14 +694,15 @@ onBeforeUnmount(() => {
                 </el-button>
                 <el-button
                   v-if="submission.submission && !submission.terminal"
-                  :loading="submission.polling"
-                  @click="submission.pollNow().catch(() => undefined)"
+                  :loading="refreshingServiceStatus"
+                  @click="refreshSubmissionService(true)"
                 >
                   刷新提交进度
                 </el-button>
                 <el-button
                   v-if="submission.requestError && !submission.submission && submission.idempotencyKey"
                   :loading="submission.submitting"
+                  :disabled="submission.oaSubmissionEnabled !== true"
                   @click="retrySameSubmission"
                 >
                   重试本次提交

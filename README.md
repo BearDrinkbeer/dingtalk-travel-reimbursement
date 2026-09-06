@@ -101,7 +101,7 @@ HTTPS 域名配置为应用可信域名。管理员使用 `ADMIN_USER_IDS` 配�
 
 当前免登 API：
 
-- `GET /api/config/public`：仅返回 CorpId、Client ID 和是否开放开发 Mock。
+- `GET /api/config/public`：返回 CorpId、Client ID、开发 Mock 开关、上传/费用条数限制及布尔值 `oaSubmissionEnabled`；后者直接对应 OA worker 配置，不返回应用 Secret 或 AgentId。
 - `POST /api/auth/dingtalk`：接收一次性 `authCode` 并建立服务端 Session。
 - `GET /api/me`：读取当前身份并轮换仅保存在前端内存中的 CSRF token。
 - `POST /api/me/department`：多部门用户从服务端确认过的部门中选择当前部门。
@@ -363,7 +363,7 @@ make deploy
 `http://127.0.0.1:8080/api/ready`，再由公司 HTTPS 入口反向代理该回环端口。发布前可执行
 `make verify`，一次完成后端测试/Lint、前端测试/类型检查/Lint/构建和部署静态检查。
 
-代码和现成环境文件中 `DINGTALK_OA_WORKER_ENABLED` 均默认为 `false`，上述命令不会自动消费已排队的 OA 提交。worker 关闭时点击正式提交仍会锁定草稿并建立持久任务；开启前必须确认没有会被意外消费的非终态任务。只有数据库迁移、模板 Schema/映射、权限、应用归属、任务清单和 readiness 预检全部通过，且已准备进行单次真实验收或正式接单时，才显式开启。`/api/ready` 只检查本地依赖和钉钉基础配置，不代替真实权限、模板目录或远端调用预检。
+代码和环境示例中 `DINGTALK_OA_WORKER_ENABLED` 均默认为 `false`，上述命令不会自动消费已排队的 OA 提交。worker 关闭时，前端根据 `oaSubmissionEnabled=false` 禁用新提交；后端对新提交返回 `503 / OA_SUBMISSION_DISABLED`，不生成快照、不锁定草稿、不创建任务，草稿仍可编辑。已有任务的重复提交和只读查询仍可恢复原记录。开启前必须确认没有会被意外消费的非终态任务。只有数据库迁移、模板 Schema/映射、权限、应用归属、任务清单和 readiness 预检全部通过，且已准备进行单次真实验收或正式接单时，才显式开启。`/api/ready` 只检查本地依赖和钉钉基础配置，不表示 worker 已开启，也不代替真实权限、模板目录或远端调用预检。
 
 ## 运维与隐私
 

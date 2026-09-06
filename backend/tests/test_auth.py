@@ -12,10 +12,14 @@ from app.core.security import token_hash
 from app.models.session import UserSession, utc_now
 
 
-def test_public_config_exposes_authoritative_upload_limits(client_factory) -> None:
+@pytest.mark.parametrize("worker_enabled", (False, True))
+def test_public_config_exposes_authoritative_upload_limits(
+    client_factory, worker_enabled: bool
+) -> None:
     client = client_factory(
         dingtalk_agent_id=1234567890,
         dingtalk_client_secret="secret-must-stay-server-side",
+        dingtalk_oa_worker_enabled=worker_enabled,
         upload_max_file_bytes=12 * 1024 * 1024,
         session_max_files=7,
         session_max_bytes=55 * 1024 * 1024,
@@ -25,6 +29,7 @@ def test_public_config_exposes_authoritative_upload_limits(client_factory) -> No
     response = client.get("/api/config/public")
 
     assert response.status_code == 200
+    assert response.json()["data"]["oaSubmissionEnabled"] is worker_enabled
     assert response.json()["data"]["uploadLimits"] == {
         "maxFiles": 7,
         "maxFileBytes": 12 * 1024 * 1024,

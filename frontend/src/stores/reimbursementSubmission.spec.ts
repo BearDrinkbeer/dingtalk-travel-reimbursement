@@ -85,8 +85,51 @@ describe('reimbursement submission store', () => {
     await expect(second).resolves.toEqual(task())
 
     expect(store.idempotencyKey).toBe(key)
-    expect(store.progressLabel).toBe('已提交，等待处理')
+    expect(store.progressLabel).toBe('本系统已接收，等待后台处理')
     expect(store.polling).toBe(true)
+  })
+
+  it('stops automatic polling when OA is disabled, preserves identity and permits a manual refresh', async () => {
+    vi.mocked(submitOaReimbursement).mockResolvedValue(task())
+    vi.mocked(getOaReimbursementSubmission).mockResolvedValue(task())
+    const store = useReimbursementSubmissionStore()
+    await store.submit('draft-1', 7)
+    const key = store.idempotencyKey
+    store.oaSubmissionEnabled = false
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(getOaReimbursementSubmission).not.toHaveBeenCalled()
+    expect(store.polling).toBe(false)
+    expect(store.idempotencyKey).toBe(key)
+    expect(store.status).toBe('QUEUED')
+    await store.pollNow()
+    expect(getOaReimbursementSubmission).toHaveBeenCalledOnce()
+    expect(store.polling).toBe(false)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(getOaReimbursementSubmission).toHaveBeenCalledOnce()
+    store.oaSubmissionEnabled = true
+    await vi.advanceTimersByTimeAsync(1_500)
+    expect(getOaReimbursementSubmission).toHaveBeenCalledTimes(2)
+    store.abort()
+  })
+
+  it('releases an unaccepted submission identity after an explicit disabled-service response', async () => {
+    vi.mocked(submitOaReimbursement).mockRejectedValue({
+      isAxiosError: true,
+      response: { status: 503, data: { error: { code: 'OA_SUBMISSION_DISABLED', message: 'OA提交服务未开启，可继续填写' } } },
+    })
+    const store = useReimbursementSubmissionStore()
+    await expect(store.submit('draft-1', 7)).rejects.toBeDefined()
+    expect(store.oaSubmissionEnabled).toBe(false)
+    expect(store.submission).toBeNull()
+    expect(store.idempotencyKey).toBeNull()
+    expect(store.errorMessage).toBe('OA提交服务未开启，可继续填写')
+    const rejectedKey = vi.mocked(submitOaReimbursement).mock.calls[0]![2]
+    store.oaSubmissionEnabled = true
+    vi.mocked(submitOaReimbursement).mockResolvedValue(task())
+    await store.submit('draft-1', 8)
+    expect(vi.mocked(submitOaReimbursement).mock.calls[1]?.[1]).toBe(8)
+    expect(vi.mocked(submitOaReimbursement).mock.calls[1]?.[2]).not.toBe(rejectedKey)
+    store.abort()
   })
 
   it('polls using pollAfterMs and stops at a terminal status', async () => {
@@ -179,6 +222,51 @@ describe('reimbursement submission store', () => {
       7,
       originalKey,
     ])
+  })
+
+  it('discovers an existing task after an unknown POST even while OA submission is disabled', async () => {
+    vi.mocked(submitOaReimbursement).mockRejectedValueOnce(new Error('response lost'))
+    const firstStore = useReimbursementSubmissionStore()
+    await expect(firstStore.submit('draft-1', 7)).rejects.toThrow('response lost')
+    const originalKey = firstStore.idempotencyKey
+    firstStore.abort()
+    setActivePinia(createPinia())
+    const store = useReimbursementSubmissionStore()
+    store.oaSubmissionEnabled = false
+    vi.mocked(getOaReimbursementSubmissionForDraft).mockResolvedValue(task())
+    await expect(store.restore('draft-1', { discoverByDraft: true, expectedRevision: 8 }))
+      .resolves.toEqual(task())
+    expect(store.idempotencyKey).toBe(originalKey)
+    expect(store.status).toBe('QUEUED')
+    expect(submitOaReimbursement).toHaveBeenCalledOnce()
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(getOaReimbursementSubmission).not.toHaveBeenCalled()
+    store.abort()
+  })
+
+  it('retains an unknown submission identity when disabled-service discovery cannot find a task', async () => {
+    vi.mocked(submitOaReimbursement).mockRejectedValueOnce(new Error('response lost'))
+    const firstStore = useReimbursementSubmissionStore()
+    await expect(firstStore.submit('draft-1', 7)).rejects.toThrow('response lost')
+    const originalKey = firstStore.idempotencyKey
+    firstStore.abort()
+    setActivePinia(createPinia())
+    const store = useReimbursementSubmissionStore()
+    store.oaSubmissionEnabled = false
+    vi.mocked(getOaReimbursementSubmissionForDraft).mockRejectedValue({
+      isAxiosError: true,
+      response: { status: 404, data: { error: { code: 'REIMBURSEMENT_SUBMISSION_NOT_FOUND' } } },
+    })
+    await expect(store.restore('draft-1')).resolves.toBeNull()
+    expect(store.idempotencyKey).toBe(originalKey)
+    expect(store.requestError).toContain('服务恢复后可重试本次提交')
+    expect(submitOaReimbursement).toHaveBeenCalledOnce()
+    store.oaSubmissionEnabled = true
+    vi.mocked(submitOaReimbursement).mockResolvedValue(task())
+    await store.submit('draft-1', 8)
+    expect(vi.mocked(submitOaReimbursement).mock.calls[1]?.slice(0, 3))
+      .toEqual(['draft-1', 7, originalKey])
+    store.abort()
   })
 
   it('does not create a submission while restoring a draft without a persisted record', async () => {

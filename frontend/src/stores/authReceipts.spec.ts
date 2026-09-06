@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   getMe,
+  getPublicConfig,
   logout as logoutRequest,
   selectDepartment as selectDepartmentRequest,
 } from '@/api/auth'
@@ -166,6 +167,38 @@ describe('authentication clears scoped client memory', () => {
     expect(drafts.drafts).toEqual([])
     expect(drafts.reimbursementOptions).toBeNull()
     expect(submission.submission).toBeNull()
+  })
+
+  it('loads and refreshes OA submission availability independently of authentication', async () => {
+    const config = {
+      corpId: 'corp', clientId: 'client', authMockEnabled: false, oaSubmissionEnabled: false,
+      uploadLimits: { maxFiles: 10, maxFileBytes: 1_000_000, maxSessionBytes: 10_000_000 },
+      expenseLimits: { maxItems: 100 },
+    }
+    vi.mocked(getPublicConfig).mockResolvedValue(config)
+    vi.mocked(getMe).mockResolvedValue(session())
+    const auth = useAuthStore()
+    await auth.bootstrap()
+    expect(auth.status).toBe('authenticated')
+    expect(useReimbursementSubmissionStore().oaSubmissionEnabled).toBe(false)
+    vi.mocked(getPublicConfig).mockResolvedValue({ ...config, oaSubmissionEnabled: true })
+    await auth.refreshPublicConfig()
+    expect(useReimbursementSubmissionStore().oaSubmissionEnabled).toBe(true)
+    expect(auth.status).toBe('authenticated')
+  })
+
+  it('ends the authenticated calculation scope while logout is still in flight', async () => {
+    const auth = useAuthStore()
+    auth.session = session()
+    auth.status = 'authenticated'
+    let finishLogout!: () => void
+    vi.mocked(logoutRequest).mockReturnValue(new Promise<void>((resolve) => { finishLogout = resolve }))
+    const pending = auth.logout()
+    expect(auth.status).not.toBe('authenticated')
+    finishLogout()
+    await pending
+    expect(auth.status).toBe('unauthorized')
+    expect(auth.session).toBeNull()
   })
 
   it('clears files, OCR candidates and reimbursement state after logout', async () => {

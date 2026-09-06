@@ -29,7 +29,7 @@ describe('health store', () => {
     await store.check()
 
     expect(store.available).toBe(true)
-    expect(store.label).toBe('服务已就绪')
+    expect(store.label).toBe('基础服务已就绪')
   })
 
   it('keeps the placeholder usable when the backend is unavailable', async () => {

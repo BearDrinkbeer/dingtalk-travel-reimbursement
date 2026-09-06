@@ -69,12 +69,18 @@ export const useAuthStore = defineStore('auth', () => {
     applySession(await getMe())
   }
 
-  async function runBootstrap(): Promise<void> {
-    status.value = 'loading'
-    errorMessage.value = ''
+  async function refreshPublicConfig() {
     const config = await getPublicConfig()
     useExpenseStore().setReceiptUploadLimits(config.uploadLimits)
     useExpenseStore().setExpenseItemLimit(config.expenseLimits.maxItems)
+    useReimbursementSubmissionStore().oaSubmissionEnabled = config.oaSubmissionEnabled === true
+    return config
+  }
+
+  async function runBootstrap(): Promise<void> {
+    status.value = 'loading'
+    errorMessage.value = ''
+    const config = await refreshPublicConfig()
     try {
       await refreshMe()
       return
@@ -129,6 +135,7 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   async function logout(): Promise<void> {
+    status.value = 'loading'
     useExpenseStore().reset()
     useReimbursementDraftStore().reset()
     useReimbursementSubmissionStore().reset()
@@ -136,6 +143,7 @@ export const useAuthStore = defineStore('auth', () => {
       await logoutRequest()
     } finally {
       clearAsUnauthorized()
+      status.value = 'unauthorized'
     }
   }
 
@@ -147,6 +155,7 @@ export const useAuthStore = defineStore('auth', () => {
     isAdmin,
     bootstrap,
     refreshMe,
+    refreshPublicConfig,
     useDevelopmentMock,
     selectDepartment,
     logout,

@@ -1,6 +1,8 @@
 import axios from 'axios'
 
 let csrfToken: string | null = null
+let authGeneration = 0
+const requestAuthGenerations = new WeakMap<object, number>()
 let unauthorizedHandler: (() => void) | null = null
 
 export const http = axios.create({
@@ -14,6 +16,7 @@ export const http = axios.create({
 
 export function setCsrfToken(token: string | null): void {
   csrfToken = token
+  authGeneration += 1
 }
 
 export function setUnauthorizedHandler(handler: (() => void) | null): void {
@@ -21,6 +24,7 @@ export function setUnauthorizedHandler(handler: (() => void) | null): void {
 }
 
 http.interceptors.request.use((config) => {
+  requestAuthGenerations.set(config, authGeneration)
   const method = config.method?.toUpperCase()
   if (csrfToken && method && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
     config.headers.set('X-CSRF-Token', csrfToken)
@@ -31,8 +35,9 @@ http.interceptors.request.use((config) => {
 http.interceptors.response.use(
   (response) => response,
   (error: unknown) => {
-    if (axios.isAxiosError(error) && error.response?.status === 401) {
-      csrfToken = null
+    if (axios.isAxiosError(error) && error.response?.status === 401
+      && error.config && requestAuthGenerations.get(error.config) === authGeneration) {
+      setCsrfToken(null)
       unauthorizedHandler?.()
     }
     return Promise.reject(error)

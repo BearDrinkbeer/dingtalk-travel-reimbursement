@@ -15,6 +15,7 @@ from pypdf import PdfReader
 from sqlalchemy import select
 from test_receipt_bundle import image_bytes, pdf_bytes
 
+from app.api import reimbursement_submissions as submission_api
 from app.core.errors import ApiError
 from app.database.base import Base
 from app.integrations.dingtalk.storage import (
@@ -687,8 +688,69 @@ def _worker(
     )
 
 
+def test_disabled_worker_rejects_new_submission_without_locking_draft(
+    client_factory, monkeypatch
+) -> None:
+    reimbursement_schema, travel_schema, travel_type = _schemas()
+    workflow = LocalWorkflowBoundary(reimbursement_schema, travel_schema)
+    client = client_factory(auth_mock_enabled=True, dingtalk_oa_worker_enabled=False)
+    csrf = str(mock_login(client)["csrfToken"])
+    draft_id, _source_file_ids = _persist_ready_draft(client, workflow, travel_type)
+    snapshot_calls = []
+    original_collect = submission_api.collect_snapshot_source
+
+    def collect_snapshot(*args, **kwargs):
+        snapshot_calls.append(kwargs["draft_id"])
+        return original_collect(*args, **kwargs)
+
+    monkeypatch.setattr(submission_api, "collect_snapshot_source", collect_snapshot)
+    submitted = client.post(
+        f"/api/oa/reimbursements/{draft_id}/submit",
+        json={"expectedRevision": 4},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "88888888-8888-4888-8888-888888888888",
+        },
+    )
+
+    assert submitted.status_code == 503, submitted.text
+    assert submitted.json()["error"]["code"] == "OA_SUBMISSION_DISABLED"
+    assert snapshot_calls == []
+    assert workflow.create_calls == 0
+    with client.app.state.database_session_factory() as database:
+        assert database.scalars(select(ReimbursementSubmission)).all() == []
+        assert database.scalars(select(ReimbursementUpload)).all() == []
+        draft = database.get(ReimbursementDraft, draft_id)
+        assert draft.status == ReimbursementDraftStatus.REVIEW_READY.value
+        assert draft.revision == 4
+        assert draft.locked_at is None
+        edited_input = json.loads(draft.input_json)
+        edited_input["items"][0]["description"] = "修改后的交通费用说明"
+
+    edited = client.put(
+        f"/api/reimbursements/drafts/{draft_id}",
+        json={
+            "expectedRevision": 4,
+            "input": edited_input,
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["data"]["revision"] == 5
+
+
+@pytest.fixture
+def enabled_manual_worker_client(client_factory, monkeypatch):
+    async def wait_for_manual_worker(_self, stop: asyncio.Event) -> None:
+        # These tests execute run_once explicitly against local OA boundaries.
+        await stop.wait()
+
+    monkeypatch.setattr(DurableOAReimbursementWorker, "run", wait_for_manual_worker)
+    return client_factory(auth_mock_enabled=True, dingtalk_oa_worker_enabled=True)
+
+
 def test_validation_shares_membership_pages_across_related_approvals(
-    client_factory,
+    enabled_manual_worker_client,
 ) -> None:
     reimbursement_schema, travel_schema, travel_type = _schemas()
     clock_value = [utc_now()]
@@ -706,7 +768,7 @@ def test_validation_shares_membership_pages_across_related_approvals(
         advance_validation_clock=advance_validation_clock,
     )
     storage = LocalStorageBoundary()
-    client = client_factory(auth_mock_enabled=True)
+    client = enabled_manual_worker_client
     csrf = str(mock_login(client)["csrfToken"])
     draft_id, _source_file_ids = _persist_ready_draft(
         client,
@@ -750,13 +812,13 @@ def test_validation_shares_membership_pages_across_related_approvals(
 
 
 def test_submit_worker_readback_and_cleanup_are_one_durable_local_flow(
-    client_factory,
+    enabled_manual_worker_client,
 ) -> None:
     reimbursement_schema, _travel_schema, travel_type = _schemas()
     travel_schema = _itinerary_schema()
     workflow = LocalWorkflowBoundary(reimbursement_schema, travel_schema)
     storage = LocalStorageBoundary(auto_rename_first=True)
-    client = client_factory(auth_mock_enabled=True)
+    client = enabled_manual_worker_client
     csrf = str(mock_login(client)["csrfToken"])
     draft_id, source_file_ids = _persist_ready_draft(client, workflow, travel_type)
     first_key = "11111111-1111-4111-8111-111111111111"
@@ -868,11 +930,13 @@ def test_submit_worker_readback_and_cleanup_are_one_durable_local_flow(
     assert workflow.create_calls == 1
 
 
-def test_transient_put_failure_retries_on_a_later_worker_claim(client_factory) -> None:
+def test_transient_put_failure_retries_on_a_later_worker_claim(
+    enabled_manual_worker_client,
+) -> None:
     reimbursement_schema, travel_schema, travel_type = _schemas()
     workflow = LocalWorkflowBoundary(reimbursement_schema, travel_schema)
     storage = LocalStorageBoundary(auto_rename_first=True, reject_put_at=2)
-    client = client_factory(auth_mock_enabled=True)
+    client = enabled_manual_worker_client
     csrf = str(mock_login(client)["csrfToken"])
     draft_id, _source_file_ids = _persist_ready_draft(client, workflow, travel_type)
     response = client.post(
@@ -925,12 +989,12 @@ def test_transient_put_failure_retries_on_a_later_worker_claim(client_factory) -
 
 
 def test_resume_generation_keeps_existing_pdf_without_duplicate_generation(
-    client_factory, monkeypatch
+    enabled_manual_worker_client, monkeypatch
 ) -> None:
     reimbursement_schema, travel_schema, travel_type = _schemas()
     workflow = LocalWorkflowBoundary(reimbursement_schema, travel_schema)
     storage = LocalStorageBoundary()
-    client = client_factory(auth_mock_enabled=True)
+    client = enabled_manual_worker_client
     csrf = str(mock_login(client)["csrfToken"])
     draft_id, sources = _persist_ready_draft(client, workflow, travel_type)
     response = client.post(
@@ -989,14 +1053,14 @@ def test_resume_generation_keeps_existing_pdf_without_duplicate_generation(
     ),
 )
 def test_damaged_locked_source_stops_before_any_remote_upload(
-    client_factory,
+    enabled_manual_worker_client,
     damage: str,
     expected_error_code: str,
 ) -> None:
     reimbursement_schema, travel_schema, travel_type = _schemas()
     workflow = LocalWorkflowBoundary(reimbursement_schema, travel_schema)
     storage = LocalStorageBoundary(auto_rename_first=True)
-    client = client_factory(auth_mock_enabled=True)
+    client = enabled_manual_worker_client
     csrf = str(mock_login(client)["csrfToken"])
     draft_id, _source_file_ids = _persist_ready_draft(client, workflow, travel_type)
     response = client.post(
@@ -1054,12 +1118,12 @@ def test_damaged_locked_source_stops_before_any_remote_upload(
 
 
 def test_unknown_second_commit_never_cleans_or_retries_remote_files(
-    client_factory,
+    enabled_manual_worker_client,
 ) -> None:
     reimbursement_schema, travel_schema, travel_type = _schemas()
     workflow = LocalWorkflowBoundary(reimbursement_schema, travel_schema)
     storage = LocalStorageBoundary(unknown_commit_at=2)
-    client = client_factory(auth_mock_enabled=True)
+    client = enabled_manual_worker_client
     csrf = str(mock_login(client)["csrfToken"])
     draft_id, _source_file_ids = _persist_ready_draft(client, workflow, travel_type)
     response = client.post(

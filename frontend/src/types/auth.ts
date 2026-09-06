@@ -20,6 +20,7 @@ export interface PublicConfig {
   corpId: string
   clientId: string
   authMockEnabled: boolean
+  oaSubmissionEnabled: boolean
   uploadLimits: ReceiptUploadLimits
   expenseLimits: ExpenseLimits
 }

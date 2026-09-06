@@ -5,6 +5,7 @@ import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { defineComponent, nextTick } from 'vue'
 
+import { getPublicConfig } from '@/api/auth'
 import { calculateTotals } from '@/api/expenses'
 import { fetchReadiness } from '@/api/health'
 import { searchProjects } from '@/api/projects'
@@ -13,6 +14,7 @@ import {
   deleteReimbursementDraft,
   deleteReimbursementDraftFile,
   getOaReimbursementOptions,
+  getOaReimbursementSubmission,
   getOaReimbursementSubmissionForDraft,
   getReimbursementDraft,
   listOaTravelApprovals,
@@ -38,6 +40,10 @@ import type {
 import ReimburseView from './ReimburseView.vue'
 
 vi.mock('@/api/health', () => ({ fetchReadiness: vi.fn() }))
+vi.mock('@/api/auth', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/api/auth')>(),
+  getPublicConfig: vi.fn(),
+}))
 vi.mock('@/api/projects', () => ({ searchProjects: vi.fn() }))
 vi.mock('@/api/expenses', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/api/expenses')>()
@@ -231,6 +237,11 @@ let serverDraft: ReimbursementDraft
 let serverFiles: ReimbursementDraftFile[]
 
 function installServerMocks(): void {
+  vi.mocked(getPublicConfig).mockResolvedValue({
+    corpId: 'corp', clientId: 'client', authMockEnabled: true, oaSubmissionEnabled: true,
+    uploadLimits: { maxFiles: 10, maxFileBytes: 1_000_000, maxSessionBytes: 10_000_000 },
+    expenseLimits: { maxItems: 100 },
+  })
   vi.mocked(fetchReadiness).mockResolvedValue({
     status: 'ready',
     checks: { database: 'ok', excelTemplate: 'ok', tempStorage: 'ok', ocr: 'disabled' },
@@ -303,7 +314,7 @@ function installServerMocks(): void {
   vi.mocked(submitOaReimbursement).mockResolvedValue(submissionResult())
 }
 
-async function mountView(): Promise<{
+async function mountView(setup?: (auth: ReturnType<typeof useAuthStore>) => void): Promise<{
   wrapper: VueWrapper
   expense: ReturnType<typeof useExpenseStore>
   drafts: ReturnType<typeof useReimbursementDraftStore>
@@ -319,6 +330,8 @@ async function mountView(): Promise<{
     isAdmin: true,
     csrfToken: 'synthetic-csrf',
   }
+  useReimbursementSubmissionStore().oaSubmissionEnabled = true
+  setup?.(auth)
   const expense = useExpenseStore()
   expense.categories = [
     { id: 'local_transport', name: '市内交通费', order: 1, manualSelectable: true },
@@ -367,12 +380,101 @@ describe('ReimburseView single-form OA flow', () => {
     document.body.innerHTML = ''
     window.sessionStorage.clear()
     vi.restoreAllMocks()
+    vi.useRealTimers()
   })
 
   async function saveCurrent(wrapper: VueWrapper): Promise<void> {
     await wrapper.findComponent(ExpenseSummaryCardStub).props('beforePreview')!()
     await flushPromises()
   }
+
+  it.each(['mock_required', 'department_required'] as const)(
+    'does not calculate before authentication and department selection (%s), then calculates after login',
+    async (status) => {
+      vi.useFakeTimers()
+      const { wrapper, expense } = await mountView((auth) => {
+        auth.status = status
+        if (status === 'mock_required') auth.session = null
+        else auth.session!.selectedDepartment = null
+      })
+      expense.reset()
+      await nextTick()
+      await vi.advanceTimersByTimeAsync(300)
+      expect(calculateTotals).not.toHaveBeenCalled()
+      const auth = useAuthStore()
+      auth.session = {
+        user: { userId: 'synthetic-user', name: '测试用户' },
+        departments: [{ id: '100', name: '测试部门' }],
+        selectedDepartment: { id: '100', name: '测试部门' },
+        isAdmin: true, csrfToken: 'new-csrf',
+      }
+      auth.status = 'authenticated'
+      await flushPromises()
+      await vi.advanceTimersByTimeAsync(300)
+      expect(calculateTotals).toHaveBeenCalledOnce()
+      wrapper.unmount()
+    },
+  )
+
+  it('cancels a pending calculation when authentication ends', async () => {
+    vi.useFakeTimers()
+    const { wrapper, expense } = await mountView()
+    await vi.advanceTimersByTimeAsync(300)
+    vi.mocked(calculateTotals).mockClear()
+    expense.items[0]!.amount = '45.00'
+    await nextTick()
+    useAuthStore().session = null
+    useAuthStore().status = 'unauthorized'
+    await nextTick()
+    await vi.advanceTimersByTimeAsync(300)
+    expect(calculateTotals).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('disables OA submission while keeping editing, saving and preview available when the worker is disabled', async () => {
+    const { wrapper, expense } = await mountView(() => {
+      useReimbursementSubmissionStore().oaSubmissionEnabled = false
+    })
+    expect(wrapper.text()).toContain('OA提交服务未开启，可继续填写')
+    expect(wrapper.text()).toContain('基础服务已就绪')
+    expect(visibleButton(wrapper, '提交 OA').attributes('disabled')).toBeDefined()
+    expect(wrapper.findComponent(ExpenseItemsCardStub).props('readonly')).toBe(false)
+    expect(wrapper.findComponent(ExpenseSummaryCardStub).props('previewDisabledReason')).toBe('')
+    expense.items[0]!.amount = '46.00'
+    await nextTick()
+    await saveCurrent(wrapper)
+    expect(updateReimbursementDraft).toHaveBeenCalled()
+    expect(submitOaReimbursement).not.toHaveBeenCalled()
+    await visibleButton(wrapper, '刷新服务状态').trigger('click')
+    await flushPromises()
+    expect(getPublicConfig).toHaveBeenCalledOnce()
+    expect(visibleButton(wrapper, '提交 OA').attributes('disabled')).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('restores queued work without polling a disabled worker and refreshes safely after service recovery', async () => {
+    vi.useFakeTimers()
+    serverDraft = makeDraft({ status: 'LOCKED', revision: 5 })
+    vi.mocked(getOaReimbursementSubmissionForDraft).mockResolvedValue(submissionResult())
+    vi.mocked(getOaReimbursementSubmission).mockResolvedValue(submissionResult())
+    const { wrapper } = await mountView(() => {
+      useReimbursementSubmissionStore().oaSubmissionEnabled = false
+    })
+    expect(wrapper.get('[data-testid="submission-status"]').text()).toContain('等待 OA 提交服务开启，尚未发起审批')
+    expect(wrapper.get('[data-testid="autosave-status"]').text()).toBe('已排队，内容已锁定')
+    expect(wrapper.text()).not.toContain('再报销一笔')
+    expect(wrapper.text()).not.toContain('重新填写')
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(getOaReimbursementSubmission).not.toHaveBeenCalled()
+    await visibleButton(wrapper, '刷新提交进度').trigger('click')
+    await flushPromises()
+    expect(getPublicConfig).toHaveBeenCalledOnce()
+    expect(getOaReimbursementSubmission).toHaveBeenCalledOnce()
+    await vi.advanceTimersByTimeAsync(1_500)
+    expect(getOaReimbursementSubmission).toHaveBeenCalledTimes(2)
+    expect(submitOaReimbursement).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
 
   it('loads DingTalk budget choices and restores one form without project or draft management', async () => {
     const { wrapper, expense, drafts } = await mountView()
@@ -654,10 +756,11 @@ describe('ReimburseView single-form OA flow', () => {
     expect(submitOaReimbursement).not.toHaveBeenCalled()
     expect(wrapper.text()).toContain('OA-20260904001')
     expect(wrapper.get('[data-testid="approval-link"]').attributes('href')).toContain('oa-process-1')
-    expect(wrapper.get('[data-testid="autosave-status"]').text()).toBe('已提交')
+    expect(wrapper.get('[data-testid="autosave-status"]').text()).toBe('OA 已成功发起')
     await visibleButton(wrapper, '再报销一笔').trigger('click')
     await flushPromises()
     expect(drafts.currentDraft?.id).toBe('draft-created')
+    expect(wrapper.get('[data-testid="autosave-status"]').text()).toBe('已保存')
     expect(wrapper.findComponent(ExpenseItemsCardStub).props('readonly')).toBe(false)
     expect(submitOaReimbursement).not.toHaveBeenCalled()
     wrapper.unmount()

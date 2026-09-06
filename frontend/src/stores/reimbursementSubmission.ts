@@ -1,6 +1,6 @@
 import axios from 'axios'
 import { defineStore } from 'pinia'
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 
 import { apiErrorCode, apiErrorMessage } from '@/api/errors'
 import {
@@ -43,7 +43,7 @@ const KNOWN_STATUSES = new Set<ReimbursementSubmissionStatus>([
 export const REIMBURSEMENT_SUBMISSION_PROGRESS_LABELS: Readonly<
   Record<ReimbursementSubmissionStatus, string>
 > = {
-  QUEUED: '已提交，等待处理',
+  QUEUED: '本系统已接收，等待后台处理',
   VALIDATING: '正在校验报销信息',
   GENERATING_EXCEL: '正在生成报销 Excel',
   UPLOADING: '正在上传审批附件',
@@ -147,6 +147,16 @@ function clearPersistedSubmissions(): void {
   }
 }
 
+function removePersistedSubmission(draftId: string): void {
+  try {
+    browserSessionStorage()?.setItem(STORAGE_KEY, JSON.stringify(
+      readPersistedSubmissions().filter((record) => record.draftId !== draftId),
+    ))
+  } catch {
+    // In-memory state remains usable when browser storage is unavailable.
+  }
+}
+
 function newIdempotencyKey(): string {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID()
   const bytes = new Uint8Array(16)
@@ -214,6 +224,7 @@ export const useReimbursementSubmissionStore = defineStore(
     const submitting = ref(false)
     const polling = ref(false)
     const requestError = ref('')
+    const oaSubmissionEnabled = ref<boolean | null>(null)
 
     let generation = 0
     let activeController: AbortController | null = null
@@ -230,6 +241,9 @@ export const useReimbursementSubmissionStore = defineStore(
     const succeeded = computed(() => status.value === 'SUBMITTED')
     const progressLabel = computed(() => {
       if (submission.value !== null) {
+        if (submission.value.status === 'QUEUED' && oaSubmissionEnabled.value === false) {
+          return '等待 OA 提交服务开启，尚未发起审批'
+        }
         return REIMBURSEMENT_SUBMISSION_PROGRESS_LABELS[submission.value.status]
       }
       return submitting.value ? '正在创建提交任务' : ''
@@ -296,7 +310,7 @@ export const useReimbursementSubmissionStore = defineStore(
 
     function schedulePoll(value: ReimbursementSubmission): void {
       clearPollTimer()
-      if (isTerminal(value.status) || activeDraftId.value !== value.draftId) {
+      if (oaSubmissionEnabled.value === false || isTerminal(value.status) || activeDraftId.value !== value.draftId) {
         polling.value = false
         return
       }
@@ -308,6 +322,10 @@ export const useReimbursementSubmissionStore = defineStore(
         void pollNow().catch(() => undefined)
       }, pollDelay(value.pollAfterMs))
     }
+
+    watch(oaSubmissionEnabled, () => {
+      if (submission.value !== null) schedulePoll(submission.value)
+    }, { flush: 'sync' })
 
     function adoptSubmission(
       value: ReimbursementSubmission,
@@ -356,6 +374,13 @@ export const useReimbursementSubmissionStore = defineStore(
       } catch (error) {
         if (accepts(requestGeneration, record.draftId) && !isCancellation(error)) {
           requestError.value = apiErrorMessage(error, '报销提交失败，请重试')
+          if (apiErrorCode(error) === 'OA_SUBMISSION_DISABLED') {
+            // This explicit rejection guarantees no task or draft lock was created.
+            oaSubmissionEnabled.value = false
+            memoryRecords.delete(record.draftId)
+            removePersistedSubmission(record.draftId)
+            idempotencyKey.value = null
+          }
         }
         throw error
       } finally {
@@ -386,6 +411,10 @@ export const useReimbursementSubmissionStore = defineStore(
           if (value === null) throw new Error('未找到可恢复的提交任务')
           return value
         })
+      }
+      if (oaSubmissionEnabled.value === false) {
+        requestError.value = 'OA提交服务未开启，可继续填写'
+        return Promise.reject(new Error(requestError.value))
       }
       const record: PersistedSubmission = {
         draftId,
@@ -420,7 +449,7 @@ export const useReimbursementSubmissionStore = defineStore(
         if (accepts(requestGeneration, record.draftId) && !isCancellation(error)) {
           requestError.value = apiErrorMessage(
             error,
-            '提交进度获取失败，系统将继续重试',
+            '提交进度获取失败，请刷新重试',
           )
           if (submission.value !== null) schedulePoll(submission.value)
         }
@@ -466,15 +495,21 @@ export const useReimbursementSubmissionStore = defineStore(
       if (!draftId) return Promise.reject(new Error('报销报销内容无效'))
       const requestGeneration = activateDraft(draftId)
       const record = recordForDraft(draftId)
-      if (record === null) {
+      if (record === null || (record.submissionId === null && oaSubmissionEnabled.value === false)) {
         const restoreOptions = typeof options === 'number' ? {} : options
-        if (restoreOptions.discoverByDraft !== true) return Promise.resolve(null)
+        if (record === null && restoreOptions.discoverByDraft !== true) return Promise.resolve(null)
         if (discoveryFlight?.draftId === draftId) return discoveryFlight.promise
+        if (record !== null) idempotencyKey.value = record.idempotencyKey
         const promise = discoverSubmissionForDraft(
           draftId,
-          restoreOptions.expectedRevision,
+          record?.expectedRevision ?? restoreOptions.expectedRevision,
           requestGeneration,
-        ).finally(() => {
+        ).then((value) => {
+          if (record !== null && value === null && accepts(requestGeneration, draftId)) {
+            requestError.value = '尚未找到本次提交记录，服务恢复后可重试本次提交'
+          }
+          return value
+        }).finally(() => {
           if (discoveryFlight?.promise === promise) discoveryFlight = null
         })
         discoveryFlight = { draftId, promise }
@@ -517,7 +552,7 @@ export const useReimbursementSubmissionStore = defineStore(
           expectedRevision: Number.isInteger(expectedRevision) && (expectedRevision ?? 0) > 0
             ? expectedRevision!
             : 1,
-          idempotencyKey: newIdempotencyKey(),
+          idempotencyKey: recordForDraft(draftId)?.idempotencyKey ?? newIdempotencyKey(),
           submissionId: value.submissionId,
         }
         adoptSubmission(value, record, requestGeneration)
@@ -567,6 +602,7 @@ export const useReimbursementSubmissionStore = defineStore(
       submitting,
       polling,
       requestError,
+      oaSubmissionEnabled,
       status,
       terminal,
       succeeded,

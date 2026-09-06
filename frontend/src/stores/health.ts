@@ -9,7 +9,7 @@ export const useHealthStore = defineStore('health', () => {
 
   const label = computed(() => {
     if (loading.value) return '正在连接服务…'
-    if (available.value === true) return '服务已就绪'
+    if (available.value === true) return '基础服务已就绪'
     if (available.value === false) return '服务暂不可用'
     return '尚未检查服务'
   })

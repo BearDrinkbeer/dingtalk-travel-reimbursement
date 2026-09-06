@@ -63,6 +63,12 @@ def submit_reimbursement(
         return success(_submission_data(existing))
 
     settings = request.app.state.settings
+    if not settings.dingtalk_oa_worker_enabled:
+        raise ApiError(
+            "OA_SUBMISSION_DISABLED",
+            "钉钉 OA 提交服务尚未启用，请联系管理员",
+            503,
+        )
     agent_id = settings.dingtalk_agent_id
     if agent_id is None:
         raise ApiError(
