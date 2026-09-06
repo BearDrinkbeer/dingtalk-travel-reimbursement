@@ -2,6 +2,9 @@ import type {
   ExcelExpenseItemInput,
   ExcelGeneratePayload,
   ExpenseTotals,
+  ExpenseItem,
+  ExcelProjectInput,
+  TripInput,
 } from '@/types/expenses'
 import type { OcrReceiptCandidate } from '@/types/receipts'
 import type { OaFormOption } from '@/types/oa'
@@ -12,11 +15,22 @@ export type ReimbursementDraftStatus =
   | 'LOCKED'
   | 'EXPIRED'
 
-export interface ReimbursementDraftExpenseItemInput extends ExcelExpenseItemInput {
+export interface ReimbursementDraftExpenseItemInput extends Omit<ExcelExpenseItemInput, 'date' | 'amount'> {
+  date: string | null
+  amount: string | null
   sourceFileId?: string
+  itineraryFileIds?: string[]
+  requiresItinerary?: boolean
+  transportType?: ExpenseItem['transportType']
+  originalCurrency?: string
+  originalAmount?: string
+  cnyAmountConfirmed?: boolean
+  requiresCnyConfirmation?: boolean
 }
 
-export interface ReimbursementDraftInput extends Omit<ExcelGeneratePayload, 'items'> {
+export interface ReimbursementDraftInput extends Omit<ExcelGeneratePayload, 'items' | 'project'> {
+  project?: ExcelProjectInput | null
+  editingState?: { includeSubsidy: boolean; trip: TripInput }
   ocrDispositionVersion: 0 | 1
   companyValue: string
   budgetCodeValue: string

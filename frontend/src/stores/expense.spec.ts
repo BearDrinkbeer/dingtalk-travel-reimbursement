@@ -345,7 +345,7 @@ describe('expense store', () => {
       description: '人工修改后的行程',
       amount: '455.00',
     })
-    expect(store.buildDraftExpenseItems()).toEqual([{
+    expect(store.buildDraftExpenseItems()).toEqual([expect.objectContaining({
       sourceFileId: 'file-edited',
       category: 'rail_fare',
       date: '2026-09-02',
@@ -353,10 +353,10 @@ describe('expense store', () => {
       description: '人工修改后的行程',
       amount: '455.00',
       receiptCount: 2,
-    }])
+    })])
   })
 
-  it('strips draft provenance from totals and Excel payloads', async () => {
+  it('keeps id and source for totals while stripping attachment metadata from Excel', async () => {
     vi.mocked(calculateTotals).mockResolvedValue({
       expenseTotal: '454.00',
       subsidyTotal: '0.00',
@@ -373,14 +373,16 @@ describe('expense store', () => {
 
     await store.refreshCalculations()
 
-    expect(calculateTotals).toHaveBeenCalledWith(null, [{
+    expect(calculateTotals).toHaveBeenCalledWith(null, [expect.objectContaining({
+      id: 'ocr-file-calculation',
+      source: 'ocr',
       category: 'rail_fare',
       date: '2026-09-01',
       displayDate: '2026-09-01',
       description: '北京南-合肥南',
       amount: '454.00',
       receiptCount: 1,
-    }])
+    })])
     expect(store.buildExcelPayload()?.items[0]).not.toHaveProperty('sourceFileId')
     expect(store.buildDraftExpenseItems()[0]).toHaveProperty(
       'sourceFileId',
@@ -411,6 +413,48 @@ describe('expense store', () => {
         confidence: '0.96',
       }),
     ])
+  })
+
+  it('keeps foreign original amounts separate from RMB and preserves explicit confirmation after reload', () => {
+    const store = useExpenseStore()
+    store.categories = MANUAL_CATEGORIES
+    const source = durableFile('foreign-file')
+    source.ocrResult = {
+      ...source.ocrResult!, type: 'foreign_receipt', amount: '97600000.00',
+      originalAmount: '97600000.00', originalCurrency: 'VND',
+      warnings: ['FOREIGN_CURRENCY_REQUIRES_CNY_AMOUNT'],
+    }
+    store.upsertDraftOcrItem(source)
+    expect(store.items[0]).toMatchObject({ amount: '', originalAmount: '97600000.00', originalCurrency: 'VND', cnyAmountConfirmed: false, requiresCnyConfirmation: true })
+    store.items[0]!.amount = '27800.00'
+    store.items[0]!.cnyAmountConfirmed = true
+    const input = store.buildDraftExpenseItems()
+    store.hydrateFromDraft(durableDraft(input), [source])
+    expect(store.items[0]).toMatchObject({ amount: '27800.00', originalAmount: '97600000.00', cnyAmountConfirmed: true })
+  })
+
+  it('keeps an unknown foreign currency pending and does not adopt its total as RMB', () => {
+    const store = useExpenseStore()
+    store.categories = MANUAL_CATEGORIES
+    const source = durableFile('unknown-currency')
+    source.ocrResult = { ...source.ocrResult!, type: 'foreign_receipt', originalCurrency: null, amount: '100.00' }
+    store.upsertDraftOcrItem(source)
+    expect(store.items[0]).toMatchObject({ amount: '', requiresCnyConfirmation: true, cnyAmountConfirmed: false })
+    expect(store.items[0]?.warnings).toContain('FOREIGN_CURRENCY_REQUIRES_CNY_AMOUNT')
+  })
+
+  it('preserves proof links through OCR retry and clears them when the proof file is deleted', () => {
+    const store = useExpenseStore()
+    store.categories = MANUAL_CATEGORIES
+    const source = durableFile('ride-source')
+    source.ocrResult = { ...source.ocrResult!, transportType: 'ride_hailing', requiresItinerary: true }
+    store.upsertDraftOcrItem(source)
+    store.items[0]!.itineraryFileIds = ['itinerary-file']
+    store.upsertDraftOcrItem(source)
+    expect(store.buildDraftExpenseItems()[0]).toMatchObject({ requiresItinerary: true, itineraryFileIds: ['itinerary-file'] })
+    store.removeDraftFileAssociation('itinerary-file')
+    expect(store.items[0]?.itineraryFileIds).toEqual([])
+    expect(store.items[0]?.requiresItinerary).toBe(true)
   })
 
   it('keeps integer-cent totals exact and supports item CRUD', () => {

@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { calculateTotals } from '@/api/expenses'
 import { http } from '@/api/http'
-import type { ExcelExpenseItemInput } from '@/types/expenses'
+import type { ExpenseItem } from '@/types/expenses'
 
 vi.mock('@/api/http', () => ({
   http: {
@@ -15,7 +15,7 @@ describe('expense calculation API', () => {
     vi.clearAllMocks()
   })
 
-  it('sends only calculation fields when a draft item carries provenance', async () => {
+  it('includes backend-required id and source while omitting attachment metadata', async () => {
     vi.mocked(http.post).mockResolvedValue({
       data: {
         data: {
@@ -40,13 +40,15 @@ describe('expense calculation API', () => {
       description: '机场至酒店',
       amount: '44.89',
       receiptCount: 1,
-    } satisfies ExcelExpenseItemInput & Record<string, unknown>
+    } satisfies ExpenseItem
 
     await calculateTotals(null, [draftItem])
 
     expect(http.post).toHaveBeenCalledWith('/calculate/totals', {
       trip: null,
       items: [{
+        id: 'ocr-file-1',
+        source: 'ocr',
         category: 'local_transport',
         date: '2026-09-01',
         displayDate: '2026-09-01',

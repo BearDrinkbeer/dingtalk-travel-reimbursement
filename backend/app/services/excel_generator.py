@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
+import unicodedata
 from copy import copy
 from dataclasses import dataclass
 from datetime import date
@@ -285,7 +287,19 @@ def generate_expense_workbook(
         write_safe_text(
             worksheet[EXCEL_TEMPLATE.project_cell],
             project.display_text,
-            max_length=320,
+            max_length=2048,
+        )
+        # The budget label may be longer than a short project name. Keep the
+        # template's wrapping and expand its header row for readable printouts.
+        project_cell = worksheet[EXCEL_TEMPLATE.project_cell]
+        text_width = sum(
+            2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+            for char in project.display_text
+        )
+        column_width = sum(worksheet.column_dimensions[key].width for key in ("G", "H", "I"))
+        header_height = math.ceil(text_width / max(1, column_width - 2)) * 16
+        worksheet.row_dimensions[project_cell.row].height = min(
+            409.5, max(worksheet.row_dimensions[project_cell.row].height or 35, header_height)
         )
 
         lines = _ordered_lines(items, trip, subsidy)

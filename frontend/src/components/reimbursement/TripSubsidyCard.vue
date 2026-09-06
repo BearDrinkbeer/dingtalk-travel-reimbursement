@@ -141,14 +141,6 @@ const tripTypes: Array<{ id: TripType; name: string }> = [
           </p>
         </div>
       </template>
-      <el-alert
-        v-if="expense.calculationError"
-        :title="expense.calculationError"
-        type="error"
-        :closable="false"
-        class="calculation-alert"
-        role="alert"
-      />
       <div
         v-if="expense.includeSubsidy && expense.totals?.subsidy"
         class="subsidy-preview"

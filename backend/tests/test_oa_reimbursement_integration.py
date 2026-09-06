@@ -11,7 +11,9 @@ import pytest
 from conftest import mock_login
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
+from pypdf import PdfReader
 from sqlalchemy import select
+from test_receipt_bundle import image_bytes, pdf_bytes
 
 from app.core.errors import ApiError
 from app.database.base import Base
@@ -582,8 +584,8 @@ def _persist_ready_draft(
         )
         files: list[ReimbursementDraftFile] = []
         for sort_order, role, name, extension, media_type, content in (
-            (3, "EXPENSE_SOURCE", "发票.pdf", "pdf", "application/pdf", b"%PDF-invoice"),
-            (8, "ATTACHMENT_ONLY", "行程单.png", "png", "image/png", b"PNG-itinerary"),
+            (3, "EXPENSE_SOURCE", "发票.pdf", "pdf", "application/pdf", pdf_bytes("Invoice")),
+            (8, "ATTACHMENT_ONLY", "行程单.png", "png", "image/png", image_bytes()),
         ):
             reservation = client.app.state.reimbursement_staging.new_reservation(
                 StagingArea.DRAFTS,
@@ -783,7 +785,7 @@ def test_submit_worker_readback_and_cleanup_are_one_durable_local_flow(
         "status": ReimbursementSubmissionStatus.SUBMITTED.value,
         "processInstanceId": OA_INSTANCE_ID,
         "businessId": OA_BUSINESS_ID,
-    }.items() <= polled.json()["data"].items()
+    }.items() <= polled.json()["data"].items(), polled.text
     refreshed = client.post(
         f"/api/oa/reimbursements/{draft_id}/submit",
         json={"expectedRevision": 999},
@@ -803,14 +805,14 @@ def test_submit_worker_readback_and_cleanup_are_one_durable_local_flow(
     assert [item["fileId"] for item in attachment_values] == [
         "remote-file-0",
         "remote-file-1",
-        "remote-file-2",
     ]
-    assert [item["fileName"] for item in attachment_values[:2]] == [
-        "发票(1).pdf",
-        "行程单.png",
-    ]
+    assert attachment_values[0]["fileName"] == "票据汇总(1).pdf"
     assert attachment_values[-1]["fileName"].endswith(".xlsx")
-    assert [item.file_name for item in storage.put_files[:2]] == ["发票.pdf", "行程单.png"]
+    assert len(storage.put_files) == 2
+    assert storage.put_files[0].file_name == "票据汇总.pdf"
+    bundle_pages = PdfReader(io.BytesIO(storage.put_files[0].content)).pages
+    assert len(bundle_pages) == 2
+    assert bundle_pages[0].extract_text() == "Invoice"
     load_workbook(io.BytesIO(storage.put_files[-1].content))
 
     with client.app.state.database_session_factory() as database:
@@ -824,15 +826,12 @@ def test_submit_worker_readback_and_cleanup_are_one_durable_local_flow(
         assert submission.status == ReimbursementSubmissionStatus.SUBMITTED.value
         assert submission.approval_url.startswith("dingtalk://dingtalkclient/action/openapp?")
         assert [item.role for item in uploads] == [
-            ReimbursementUploadRole.ORIGINAL.value,
-            ReimbursementUploadRole.ORIGINAL.value,
+            ReimbursementUploadRole.GENERATED_PDF.value,
             ReimbursementUploadRole.GENERATED_EXCEL.value,
         ]
-        assert [item.sort_order for item in uploads] == [0, 1, 2]
-        assert [item.file_name for item in uploads[:2]] == [
-            "发票(1).pdf",
-            "行程单.png",
-        ]
+        assert [item.sort_order for item in uploads] == [0, 1]
+        assert uploads[0].file_name == "票据汇总(1).pdf"
+        assert all(item.source_draft_file_id is None for item in uploads)
         assert {item.upload_status for item in uploads} == {
             ReimbursementUploadStatus.LINKED.value
         }
@@ -902,9 +901,8 @@ def test_transient_put_failure_retries_on_a_later_worker_claim(client_factory) -
         assert [item.upload_status for item in uploads] == [
             ReimbursementUploadStatus.COMMITTED.value,
             ReimbursementUploadStatus.PUTTING.value,
-            ReimbursementUploadStatus.PENDING.value,
         ]
-        assert uploads[0].file_name == "发票(1).pdf"
+        assert uploads[0].file_name == "票据汇总(1).pdf"
         assert uploads[1].put_started_at is not None
         assert uploads[1].commit_started_at is None
         assert submission.status == ReimbursementSubmissionStatus.FAILED_RETRYABLE.value
@@ -916,16 +914,71 @@ def test_transient_put_failure_retries_on_a_later_worker_claim(client_factory) -
     polled = client.get(f"/api/oa/reimbursements/submissions/{submission_id}")
     assert polled.status_code == 200
     assert polled.json()["data"]["status"] == ReimbursementSubmissionStatus.SUBMITTED.value
-    assert storage.commit_calls == 3
-    assert [item.file_name for item in storage.put_files[:3]] == [
-        "发票.pdf",
-        "行程单.png",
-        "行程单.png",
-    ]
+    assert storage.commit_calls == 2
+    assert storage.put_files[0].file_name == "票据汇总.pdf"
+    assert storage.put_files[1].file_name == storage.put_files[2].file_name
+    assert storage.put_files[1].file_name.endswith(".xlsx")
     assert [(item.file_id, item.file_name) for item in storage.probed] == [
-        ("remote-file-0", "发票(1).pdf")
+        ("remote-file-0", "票据汇总(1).pdf")
     ]
     assert workflow.create_calls == 1
+
+
+def test_resume_generation_keeps_existing_pdf_without_duplicate_generation(
+    client_factory, monkeypatch
+) -> None:
+    reimbursement_schema, travel_schema, travel_type = _schemas()
+    workflow = LocalWorkflowBoundary(reimbursement_schema, travel_schema)
+    storage = LocalStorageBoundary()
+    client = client_factory(auth_mock_enabled=True)
+    csrf = str(mock_login(client)["csrfToken"])
+    draft_id, sources = _persist_ready_draft(client, workflow, travel_type)
+    response = client.post(
+        f"/api/oa/reimbursements/{draft_id}/submit",
+        json={"expectedRevision": 4},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "77777777-7777-4777-8777-777777777777",
+        },
+    )
+    assert response.status_code == 202, response.text
+    submission_id = response.json()["data"]["submissionId"]
+    original_excel = SnapshotSubmissionMaterializer.generate_excel
+    original_bundle = SnapshotSubmissionMaterializer.generate_bundle
+    calls = {"pdf": 0, "excel": 0}
+
+    def generate_bundle(self, job):
+        calls["pdf"] += 1
+        return original_bundle(self, job)
+
+    def generate_excel(self, job):
+        calls["excel"] += 1
+        if calls["excel"] == 1:
+            raise ApiError("REIMBURSEMENT_STAGING_UNAVAILABLE", "temporary failure", 503)
+        return original_excel(self, job)
+
+    monkeypatch.setattr(SnapshotSubmissionMaterializer, "generate_bundle", generate_bundle)
+    monkeypatch.setattr(SnapshotSubmissionMaterializer, "generate_excel", generate_excel)
+    now = [utc_now()]
+    worker = _worker(client, workflow, storage, clock=lambda: now[0])
+    assert asyncio.run(worker.run_once())
+    with client.app.state.database_session_factory() as database:
+        upload = database.scalar(select(ReimbursementUpload).where(
+            ReimbursementUpload.submission_id == submission_id
+        ))
+        assert upload is not None and upload.role == "GENERATED_PDF"
+        pdf_id = upload.id
+        assert {database.get(ReimbursementDraftFile, source).file_status for source in sources} == {
+            ReimbursementDraftFileStatus.ACTIVE.value
+        }
+    now[0] += timedelta(seconds=10)
+    assert asyncio.run(worker.run_once())
+    assert calls == {"pdf": 1, "excel": 2}
+    assert len(storage.put_files) == 2
+    assert workflow.create_calls == 1
+    with client.app.state.database_session_factory() as database:
+        upload = database.get(ReimbursementUpload, pdf_id)
+        assert upload is not None and upload.upload_status == "LINKED"
 
 
 @pytest.mark.parametrize(
@@ -935,7 +988,7 @@ def test_transient_put_failure_retries_on_a_later_worker_claim(client_factory) -
         ("corrupt", "REIMBURSEMENT_LOCAL_FILE_CHANGED"),
     ),
 )
-def test_damaged_locked_file_after_one_commit_cleans_orphan_and_never_retries(
+def test_damaged_locked_source_stops_before_any_remote_upload(
     client_factory,
     damage: str,
     expected_error_code: str,
@@ -962,25 +1015,18 @@ def test_damaged_locked_file_after_one_commit_cleans_orphan_and_never_retries(
     submission_id = response.json()["data"]["submissionId"]
 
     with client.app.state.database_session_factory() as database:
-        originals = database.scalars(
-            select(ReimbursementUpload)
-            .where(
-                ReimbursementUpload.submission_id == submission_id,
-                ReimbursementUpload.role == ReimbursementUploadRole.ORIGINAL.value,
-            )
-            .order_by(ReimbursementUpload.sort_order)
-        ).all()
-        damaged = originals[1]
+        damaged = database.get(ReimbursementDraftFile, _source_file_ids[1])
+        assert damaged is not None
         if damage == "missing":
             assert client.app.state.reimbursement_staging.delete(
-                damaged.local_storage_key,
+                damaged.storage_key,
                 expected_size=damaged.size_bytes,
                 expected_sha256=damaged.sha256,
             )
         else:
             damaged_path = (
                 client.app.state.reimbursement_staging.root
-                / damaged.local_storage_key
+                / damaged.storage_key
             )
             damaged_path.write_bytes(b"corrupted locked attachment")
 
@@ -996,15 +1042,10 @@ def test_damaged_locked_file_after_one_commit_cleans_orphan_and_never_retries(
         ).all()
         assert submission is not None
         assert submission.status == ReimbursementSubmissionStatus.FAILED_FINAL.value
-        assert [item.upload_status for item in uploads] == [
-            ReimbursementUploadStatus.CLEANED.value,
-            ReimbursementUploadStatus.PENDING.value,
-            ReimbursementUploadStatus.PENDING.value,
-        ]
+        assert uploads == []
         assert submission.last_error_code == expected_error_code
-    assert [
-        (item.file_id, item.file_name) for item in storage.recycled
-    ] == [("remote-file-0", "发票(1).pdf")]
+    assert storage.recycled == []
+    assert storage.put_files == []
     assert workflow.create_calls == 0
     first_round = (len(storage.put_files), storage.commit_calls, len(storage.recycled))
 
@@ -1047,7 +1088,6 @@ def test_unknown_second_commit_never_cleans_or_retries_remote_files(
         assert [item.upload_status for item in uploads] == [
             ReimbursementUploadStatus.COMMITTED.value,
             ReimbursementUploadStatus.COMMIT_UNCERTAIN.value,
-            ReimbursementUploadStatus.PENDING.value,
         ]
     assert storage.recycled == []
     assert workflow.create_calls == 0

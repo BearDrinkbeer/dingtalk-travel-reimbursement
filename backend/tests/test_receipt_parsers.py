@@ -570,3 +570,234 @@ def test_builtin_category_keywords_can_be_removed_from_the_active_rules() -> Non
 
     assert default_result.category is ExpenseCategory.LODGING
     assert removed_result.category is ExpenseCategory.OTHER
+
+
+@pytest.mark.parametrize("amount_lines", [("金额 115.10元",), ("金额", "115.10元")])
+def test_physical_taxi_meter_ticket_reads_total_not_unit_price(
+    amount_lines: tuple[str, ...],
+) -> None:
+    parsed = ReceiptParserRegistry().parse(
+        lines(
+            "安徽通用机打发票",
+            "车号 皖A12345",
+            "工号 000000",
+            "日期 2026-07-13",
+            "单价 3.00元",
+            "里程 40.6Km",
+            "等候 00:00:11",
+            *amount_lines,
+        ),
+        ParseContext(2026),
+    )
+    assert parsed.receipt_type == "taxi_receipt"
+    assert parsed.category is ExpenseCategory.LOCAL_TRANSPORT
+    assert parsed.amount == Decimal("115.10")
+    assert parsed.date == date(2026, 7, 13)
+    assert parsed.transport_type == "taxi"
+    assert not parsed.requires_itinerary
+
+
+@pytest.mark.parametrize("amount_lines", [(), ("金额", "单价 3.00元"), ("金额", "里程 115.10km")])
+def test_physical_taxi_missing_total_never_uses_meter_or_unit_price(
+    amount_lines: tuple[str, ...],
+) -> None:
+    parsed = ReceiptParserRegistry().parse(
+        lines(
+            "出租车发票", "车号 A12345", "工号 123456", "里程 40.6Km", "单价 ￥3.00", *amount_lines
+        ),
+        ParseContext(2026),
+    )
+    assert parsed.amount is None
+    assert "MISSING_AMOUNT" in parsed.warnings
+
+
+@pytest.mark.parametrize(
+    ("evidence", "expected_type", "required"),
+    [
+        (("交通工具类型 网约车",), "ride_hailing", True),
+        (("网约车服务",), "ride_hailing", True),
+        (("滴滴出行", "旅客运输服务", "交通工具类型 出租车"), "ride_hailing", True),
+        (("曹操出行 行程单",), "ride_hailing", True),
+        (("交通工具类型 出租汽车",), "taxi", False),
+        (("客运服务费",), None, False),
+        (("滴滴出行广告推广",), None, False),
+        (("交通工具类型 铁路",), "rail", False),
+    ],
+)
+def test_itinerary_requirement_uses_transport_evidence_not_category_alone(
+    evidence: tuple[str, ...],
+    expected_type: str | None,
+    required: bool,
+) -> None:
+    parsed = ReceiptParserRegistry().parse(
+        lines("电子发票", "日期 2026-07-13", "价税合计 ￥20.00", *evidence),
+        ParseContext(2026),
+    )
+    assert parsed.transport_type == expected_type
+    assert parsed.requires_itinerary is required
+    if required:
+        assert parsed.category is ExpenseCategory.LOCAL_TRANSPORT
+
+
+@pytest.mark.parametrize(
+    ("currency", "printed", "expected"),
+    [
+        ("VND", "97,600,000", "97600000.00"),
+        ("VND", "97.600.000", "97600000.00"),
+        ("VND", "97 600 000", "97600000.00"),
+        ("EUR", "1.234,56", "1234.56"),
+        ("EUR", "1 234,56", "1234.56"),
+        ("USD", "1,234.56", "1234.56"),
+        ("CHF", "1'234.56", "1234.56"),
+        ("CHF", "1’234.56", "1234.56"),
+        ("VND", "97\u202f600\u202f000", "97600000.00"),
+        ("EUR", "1234,56", "1234.56"),
+        ("USD", "1234.50", "1234.50"),
+        ("JPY", "1,234", "1234.00"),
+        ("USD", "1234", "1234.00"),
+    ],
+)
+def test_foreign_totals_keep_original_currency_separate_from_rmb(
+    currency: str,
+    printed: str,
+    expected: str,
+) -> None:
+    parsed = ReceiptParserRegistry().parse(
+        lines("Guest invoice Hotel", "2026-06-18", f"Total {printed} {currency}"),
+        ParseContext(2026),
+    )
+    assert parsed.receipt_type == "foreign_receipt"
+    assert parsed.original_currency == currency
+    assert parsed.original_amount == Decimal(expected)
+    assert parsed.amount is None
+    assert parsed.date == date(2026, 6, 18)
+    assert parsed.category is ExpenseCategory.LODGING
+    assert "FOREIGN_CURRENCY_REQUIRES_CNY_AMOUNT" in parsed.warnings
+
+
+@pytest.mark.parametrize(
+    "printed",
+    [
+        "1,234,56",
+        "12,34,567",
+        "1.234,567",
+        "-100.00",
+        "(100.00)",
+        "8%",
+        "1234567890123",
+        "-US$100.00",
+        "-USD100.00",
+        "2026-07-13",
+    ],
+)
+def test_foreign_invalid_or_ambiguous_number_never_becomes_partial_amount(printed: str) -> None:
+    parsed = ReceiptParserRegistry().parse(
+        lines("Invoice USD", f"Total {printed}"),
+        ParseContext(2026),
+    )
+    assert parsed.original_amount is None
+    assert parsed.amount is None
+
+
+def test_vietnamese_hotel_total_and_multiple_stay_dates_remain_editable() -> None:
+    parsed = ReceiptParserRegistry().parse(
+        lines(
+            "KHÁCH SẠN",
+            "GUEST INVOICE",
+            "18/4/2026",
+            "18/6/2026",
+            "Số Tiền (Amount)",
+            "97,600,000",
+            "VND",
+            "Thuế VAT (8%)",
+            "VND",
+            "Phí quẹt thẻ (3,5%)",
+            "VND",
+            "Tổng tiền (Total)",
+            "97,600,000",
+            "VND",
+        ),
+        ParseContext(2026),
+    )
+    assert parsed.original_amount == Decimal("97600000.00")
+    assert parsed.original_currency == "VND"
+    assert parsed.amount is None
+    assert parsed.date is None
+    assert "MULTIPLE_RECEIPT_DATES" in parsed.warnings
+    assert parsed.transport_type == "hotel"
+
+
+@pytest.mark.parametrize(
+    ("values", "amount"),
+    [
+        (("Subtotal USD 100.00", "Tax total USD 8.00", "Total USD 108.00"), Decimal("108.00")),
+        (("Sub total USD 100.00", "VAT total USD 8.00"), None),
+        (("Total tax USD 8.00", "Subtotal USD 100.00"), None),
+        (("Total USD 100.00", "Grand total USD 108.00"), Decimal("108.00")),
+        (("Total", "VAT 8.00", "USD 108.00"), None),
+        (("Total", "USD", "108.00"), Decimal("108.00")),
+        (("Total USD 108.00", "Total USD 109.00"), None),
+    ],
+)
+def test_foreign_total_does_not_choose_subtotal_tax_or_arbitrary_later_number(
+    values: tuple[str, ...],
+    amount: Decimal | None,
+) -> None:
+    parsed = ReceiptParserRegistry().parse(lines("Invoice USD", *values), ParseContext(2026))
+    assert parsed.original_amount == amount
+    assert parsed.amount is None
+
+
+@pytest.mark.parametrize(
+    ("values", "currency"),
+    [
+        (("Total $108.00",), None),
+        (("Total US$108.00",), "USD"),
+        (("Total HK$108.00",), "HKD"),
+        (("Total €108,00",), "EUR"),
+        (("Total USD108.00",), "USD"),
+        (("Total 108.00VND",), "VND"),
+        (("Total USD 108.00", "CNY 760.00"), None),
+        (("Total 108.00",), None),
+    ],
+)
+def test_foreign_currency_symbols_and_missing_currency_do_not_guess_rmb(
+    values: tuple[str, ...],
+    currency: str | None,
+) -> None:
+    parsed = ReceiptParserRegistry().parse(lines("Invoice", *values), ParseContext(2026))
+    assert parsed.original_currency == currency
+    assert parsed.amount is None
+    assert "CURRENCY_REQUIRES_REVIEW" in parsed.warnings if currency is None else True
+
+
+@pytest.mark.parametrize(
+    ("printed", "expected"),
+    [
+        ("18/6/2026", date(2026, 6, 18)),
+        ("6/18/2026", date(2026, 6, 18)),
+        ("2026-6-1", date(2026, 6, 1)),
+        ("6/7/2026", None),
+        ("7/7/2026", date(2026, 7, 7)),
+        ("18/6/26", None),
+        ("31/2/2026", None),
+    ],
+)
+def test_foreign_numeric_dates_are_not_silently_swapped(
+    printed: str,
+    expected: date | None,
+) -> None:
+    parsed = ReceiptParserRegistry().parse(
+        lines("Receipt EUR", f"Invoice date {printed}", "Total 10.00"),
+        ParseContext(2026),
+    )
+    assert parsed.date == expected
+
+
+def test_domestic_english_heading_and_rmb_do_not_trigger_foreign_conversion() -> None:
+    parsed = ReceiptParserRegistry().parse(
+        lines("电子发票 Invoice", "CNY", "价税合计 ￥108.00", "Total 108.00"),
+        ParseContext(2026),
+    )
+    assert parsed.amount == Decimal("108.00")
+    assert parsed.original_currency is None

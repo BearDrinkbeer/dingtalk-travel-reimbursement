@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from conftest import mock_login
 
+from app.core.errors import ApiError
 from app.integrations.dingtalk.workflow import (
     FormOption,
     WorkflowFormValue,
@@ -26,7 +27,7 @@ from app.models.reimbursement import (
     ReimbursementSubmissionStatus,
     utc_now,
 )
-from app.schemas.reimbursements import RelatedApprovalSelectionInput
+from app.schemas.reimbursements import ReimbursementDraftInput, RelatedApprovalSelectionInput
 from app.services import reimbursement_drafts
 
 
@@ -91,7 +92,7 @@ def _input() -> dict[str, object]:
         "ocrDispositionVersion": 1,
         "companyValue": "北京",
         "budgetCodeValue": "26007",
-        "project": {"mode": "manual", "text": "P-001 示例项目"},
+        "project": {"mode": "manual", "text": "MES 项目"},
         "trip": {
             "tripType": "business",
             "startDate": "2026-09-01",
@@ -107,6 +108,10 @@ def _input() -> dict[str, object]:
                 "description": "打车费",
                 "amount": "44.89",
                 "receiptCount": 1,
+                "itineraryFileIds": [],
+                "requiresItinerary": False,
+                "cnyAmountConfirmed": False,
+                "requiresCnyConfirmation": False,
             }
         ],
         "dismissedOcrFileIds": [],
@@ -119,6 +124,18 @@ def _install_catalog(monkeypatch) -> None:
         "require_submission_ready_catalog",
         lambda _database: _catalog(),
     )
+
+
+def _assert_unresolved_provenance(client, draft_id: str) -> None:
+    with client.app.state.database_session_factory() as database:
+        draft = database.get(ReimbursementDraft, draft_id)
+        with pytest.raises(ApiError, match="请确认每张已识别票据"):
+            reimbursement_drafts.validate_draft_file_references(
+                database,
+                draft_id=draft_id,
+                draft_input=ReimbursementDraftInput.model_validate_json(draft.input_json),
+                require_terminal_disposition=True,
+            )
 
 
 def _create(client, headers: dict[str, str], body: dict[str, object] | None = None):
@@ -448,13 +465,13 @@ def test_legacy_draft_save_does_not_revive_a_removed_ocr_line(
         headers=headers,
     )
 
-    assert unresolved.status_code == 409
-    assert unresolved.json()["error"]["code"] == "REIMBURSEMENT_DRAFT_NOT_READY"
+    assert unresolved.status_code == 200
+    _assert_unresolved_provenance(client, draft_id)
 
     decided = {**legacy, "ocrDispositionVersion": 1, "dismissedOcrFileIds": [file_id]}
     saved = client.put(
         f"/api/reimbursements/drafts/{draft_id}",
-        json={"expectedRevision": 1, "input": decided},
+        json={"expectedRevision": 2, "input": decided},
         headers=headers,
     )
     assert saved.status_code == 200, saved.text
@@ -486,8 +503,8 @@ def test_legacy_edited_ocr_line_stays_unresolved_until_explicitly_ignored(
         headers=headers,
     )
 
-    assert unresolved.status_code == 409
-    assert unresolved.json()["error"]["code"] == "REIMBURSEMENT_DRAFT_NOT_READY"
+    assert unresolved.status_code == 200
+    _assert_unresolved_provenance(client, draft_id)
     explicit = {
         **legacy,
         "ocrDispositionVersion": 1,
@@ -495,13 +512,11 @@ def test_legacy_edited_ocr_line_stays_unresolved_until_explicitly_ignored(
     }
     saved = client.put(
         f"/api/reimbursements/drafts/{draft_id}",
-        json={"expectedRevision": 1, "input": explicit},
+        json={"expectedRevision": 2, "input": explicit},
         headers=headers,
     )
     assert saved.status_code == 200, saved.text
-    assert saved.json()["data"]["input"]["items"][0]["description"] == (
-        "用户修改后的打车费"
-    )
+    assert saved.json()["data"]["input"]["items"][0]["description"] == ("用户修改后的打车费")
 
 
 def test_legacy_duplicate_exact_lines_are_ambiguous_and_not_auto_bound(
@@ -525,11 +540,11 @@ def test_legacy_duplicate_exact_lines_are_ambiguous_and_not_auto_bound(
         headers=headers,
     )
 
-    assert unresolved.status_code == 409
-    assert unresolved.json()["error"]["code"] == "REIMBURSEMENT_DRAFT_NOT_READY"
+    assert unresolved.status_code == 200
+    _assert_unresolved_provenance(client, draft_id)
 
 
-def test_v1_save_rejects_a_terminal_ocr_file_without_an_exact_disposition(
+def test_autosave_preserves_unresolved_ocr_but_review_requires_disposition(
     client_factory,
     monkeypatch,
 ) -> None:
@@ -546,10 +561,10 @@ def test_v1_save_rejects_a_terminal_ocr_file_without_an_exact_disposition(
         headers=headers,
     )
 
-    assert saved.status_code == 409
-    assert saved.json()["error"]["code"] == "REIMBURSEMENT_DRAFT_NOT_READY"
+    assert saved.status_code == 200
+    _assert_unresolved_provenance(client, draft_id)
     loaded = client.get(f"/api/reimbursements/drafts/{draft_id}")
-    assert loaded.json()["data"]["revision"] == 1
+    assert loaded.json()["data"]["revision"] == 2
 
 
 def test_draft_rejects_duplicate_or_overlapping_ocr_file_dispositions(
@@ -604,10 +619,7 @@ def test_update_validates_ocr_file_provenance_inside_the_owned_draft(
         headers=headers,
     )
     assert rejected_link.status_code == 422
-    assert (
-        rejected_link.json()["error"]["code"]
-        == "REIMBURSEMENT_DRAFT_FILE_REFERENCE_INVALID"
-    )
+    assert rejected_link.json()["error"]["code"] == "REIMBURSEMENT_DRAFT_FILE_REFERENCE_INVALID"
 
     dismissed_from_other_draft = _input()
     dismissed_from_other_draft["dismissedOcrFileIds"] = [foreign_file_id]
@@ -618,8 +630,7 @@ def test_update_validates_ocr_file_provenance_inside_the_owned_draft(
     )
     assert rejected_dismissal.status_code == 422
     assert (
-        rejected_dismissal.json()["error"]["code"]
-        == "REIMBURSEMENT_DRAFT_FILE_REFERENCE_INVALID"
+        rejected_dismissal.json()["error"]["code"] == "REIMBURSEMENT_DRAFT_FILE_REFERENCE_INVALID"
     )
 
     attachment_id = _add_active_file(
@@ -636,9 +647,7 @@ def test_update_validates_ocr_file_provenance_inside_the_owned_draft(
         headers=headers,
     )
     assert rejected_role.status_code == 422
-    assert rejected_role.json()["error"]["code"] == (
-        "REIMBURSEMENT_DRAFT_FILE_REFERENCE_INVALID"
-    )
+    assert rejected_role.json()["error"]["code"] == ("REIMBURSEMENT_DRAFT_FILE_REFERENCE_INVALID")
 
     own_file_id = _add_active_file(client, target_draft_id, record_disposition=False)
     valid = _input()
@@ -794,10 +803,7 @@ def test_draft_owner_is_not_enumerable_and_department_binding_is_rechecked(
         headers=owner_headers,
     )
     assert delete_mismatch.status_code == 409
-    assert (
-        delete_mismatch.json()["error"]["code"]
-        == "REIMBURSEMENT_DRAFT_DEPARTMENT_MISMATCH"
-    )
+    assert delete_mismatch.json()["error"]["code"] == "REIMBURSEMENT_DRAFT_DEPARTMENT_MISMATCH"
     assert owner.get("/api/reimbursements/drafts").json()["data"]["items"] == []
 
 
@@ -839,10 +845,7 @@ def test_stale_revision_and_invalid_oa_options_leave_the_draft_unchanged(
         headers=headers,
     )
     assert delete_conflict.status_code == 409
-    assert (
-        delete_conflict.json()["error"]["code"]
-        == "REIMBURSEMENT_DRAFT_REVISION_CONFLICT"
-    )
+    assert delete_conflict.json()["error"]["code"] == "REIMBURSEMENT_DRAFT_REVISION_CONFLICT"
 
     invalid = _input()
     invalid["companyValue"] = "客户端伪造公司"

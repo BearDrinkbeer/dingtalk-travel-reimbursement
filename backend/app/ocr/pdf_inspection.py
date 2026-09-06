@@ -211,6 +211,7 @@ def inspect_single_page_pdf(
     limits: PdfLimits,
     *,
     extract_text: bool,
+    max_pages: int = 1,
 ) -> PdfInspection:
     """Validate cheap PDF metadata without decoding image streams."""
 
@@ -219,9 +220,11 @@ def inspect_single_page_pdf(
         if reader.is_encrypted:
             raise ApiError("ENCRYPTED_PDF_UNSUPPORTED", "不支持加密 PDF", 400)
         page_count = len(reader.pages)
-        if page_count != 1:
+        if page_count < 1 or page_count > max_pages:
             code = "MULTI_PAGE_PDF_UNSUPPORTED" if page_count > 1 else "INVALID_PDF"
             message = "每个 PDF 必须只包含一张票据" if page_count > 1 else "PDF 没有有效页面"
+            if max_pages > 1 and page_count > max_pages:
+                code, message = "PDF_PAGE_LIMIT_EXCEEDED", f"行程单 PDF 最多支持 {max_pages} 页"
             raise ApiError(code, message, 400)
         page = reader.pages[0]
         width_points = float(page.mediabox.width)
@@ -241,6 +244,24 @@ def inspect_single_page_pdf(
         _decoded_page_bytes(page, limits)
         resource_inspection = _ResourceInspection(limits, set(), set())
         resource_inspection.inspect_resources(resources, depth=0)
+
+        # Supporting itineraries may span pages, but every page is checked
+        # before storage/printing; OCR itself retains the one-receipt limit.
+        for extra_page in list(reader.pages)[1:]:
+            width = float(extra_page.mediabox.width)
+            height = float(extra_page.mediabox.height)
+            extra_width = round(width * limits.render_dpi / 72)
+            extra_height = round(height * limits.render_dpi / 72)
+            if width <= 0 or height <= 0:
+                raise ApiError("INVALID_PDF", "PDF 页面尺寸无效", 400)
+            if (
+                extra_width > limits.max_dimension
+                or extra_height > limits.max_dimension
+                or extra_width * extra_height > limits.max_render_pixels
+            ):
+                raise ApiError("PDF_PAGE_TOO_LARGE", "PDF 页面渲染尺寸超过限制", 400)
+            _decoded_page_bytes(extra_page, limits)
+            resource_inspection.inspect_resources(_raw_get(extra_page, "/Resources"), depth=0)
 
         text = ""
         layout_text = ""

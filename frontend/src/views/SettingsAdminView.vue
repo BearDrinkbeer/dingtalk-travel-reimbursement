@@ -15,9 +15,6 @@ import SubsidyRateSettingsCard from '@/components/settings/SubsidyRateSettingsCa
           <RouterLink to="/">
             报销单
           </RouterLink>
-          <RouterLink to="/admin/projects">
-            项目管理
-          </RouterLink>
           <RouterLink
             to="/admin/settings"
             aria-current="page"

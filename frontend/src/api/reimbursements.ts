@@ -297,6 +297,19 @@ export async function getReimbursementDraftExcelPreview(
   }
 }
 
+export async function getReimbursementFileContent(
+  draftId: string,
+  fileId: string,
+  options: ReimbursementRequestOptions = {},
+): Promise<Blob> {
+  const response = await http.get<Blob>(`${fileUrl(draftId, fileId)}/content`, {
+    responseType: 'blob',
+    signal: options.signal,
+    timeout: 60_000,
+  }).catch(normalizeBlobApiError)
+  return response.data
+}
+
 export async function downloadReimbursementDraftExcelPreview(
   draftId: string,
   expectedRevision: number,

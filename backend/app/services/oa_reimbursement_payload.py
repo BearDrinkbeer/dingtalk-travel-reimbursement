@@ -36,7 +36,6 @@ from app.integrations.dingtalk.workflow import (
     form_schema_from_dict,
     serialize_create_process_instance_command,
 )
-from app.models.project import Project
 from app.models.reimbursement import (
     ReimbursementDraftFile,
     ReimbursementDraftFileRole,
@@ -46,7 +45,7 @@ from app.models.reimbursement import (
     ReimbursementOcrStatus,
     utc_now,
 )
-from app.schemas.excel import ExcelExpenseItemInput, ManualProjectInput, SelectedProjectInput
+from app.schemas.excel import ExcelExpenseItemInput
 from app.schemas.expenses import TripInput, TripPurpose
 from app.schemas.primitives import DecimalString, MinuteTime, StrictCalendarDate
 from app.schemas.reimbursements import (
@@ -57,6 +56,7 @@ from app.services.excel_generator import (
     XLSX_MEDIA_TYPE,
     ResolvedProject,
     build_download_filename,
+    sanitize_filename_component,
 )
 from app.services.oa_template_profiles import (
     REIMBURSEMENT_LOGICAL_FIELD_SPECS,
@@ -65,6 +65,8 @@ from app.services.oa_template_profiles import (
 )
 from app.services.reimbursement_drafts import (
     DraftActor,
+    apply_ocr_evidence,
+    complete_expense_items,
     require_owned_draft,
     validate_and_calculate_input,
     validate_draft_file_references,
@@ -74,7 +76,7 @@ from app.services.reimbursement_staging import (
     ReimbursementStagingError,
 )
 
-SNAPSHOT_VERSION = 1
+SNAPSHOT_VERSION = 2
 _MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
 _SIGNED_INT64_MAX = 9_223_372_036_854_775_807
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -156,8 +158,8 @@ class SnapshotTemplate(_SnapshotModel):
 class SnapshotProject(_SnapshotModel):
     mode: Literal["selected", "manual"]
     selected_id: PositiveInt | None = None
-    manual_text: ShortText | None = None
-    display_text: Annotated[str, StringConstraints(min_length=1, max_length=320)]
+    manual_text: LongText | None = None
+    display_text: LongText
     filename_component: Annotated[str, StringConstraints(min_length=1, max_length=255)]
 
     @model_validator(mode="after")
@@ -192,6 +194,15 @@ class SnapshotExpenseItem(_SnapshotModel):
     amount: DecimalString
     receipt_count: Annotated[int, Field(strict=True, ge=1, le=10_000)]
     source_file_id: Annotated[str, StringConstraints(min_length=1, max_length=36)] | None = None
+    itinerary_file_ids: tuple[
+        Annotated[str, StringConstraints(min_length=1, max_length=36)], ...
+    ] = ()
+    requires_itinerary: bool = False
+    transport_type: Literal["ride_hailing", "taxi", "rail", "hotel", "other"] | None = None
+    original_currency: Annotated[str, StringConstraints(pattern=r"^[A-Z]{3}$")] | None = None
+    original_amount: DecimalString | None = None
+    cny_amount_confirmed: bool = False
+    requires_cny_confirmation: bool = False
 
 
 class SnapshotInput(_SnapshotModel):
@@ -207,11 +218,7 @@ class SnapshotInput(_SnapshotModel):
 
     @model_validator(mode="after")
     def validate_ocr_dispositions(self) -> SnapshotInput:
-        source_ids = [
-            item.source_file_id
-            for item in self.items
-            if item.source_file_id is not None
-        ]
+        source_ids = [item.source_file_id for item in self.items if item.source_file_id is not None]
         dismissed_ids = list(self.dismissed_ocr_file_ids)
         if len(source_ids) != len(set(source_ids)):
             raise ValueError("OCR source file ids must be unique")
@@ -272,9 +279,9 @@ class SnapshotExcel(_SnapshotModel):
     template_sha256: Sha256Text
     file_name: ShortText
     file_type: Literal["xlsx"] = "xlsx"
-    media_type: Literal[
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    ] = XLSX_MEDIA_TYPE
+    media_type: Literal["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"] = (
+        XLSX_MEDIA_TYPE
+    )
 
 
 class SnapshotTravelPeriod(_SnapshotModel):
@@ -295,7 +302,7 @@ class SnapshotFormValue(_SnapshotModel):
 
 
 class ReimbursementSnapshot(_SnapshotModel):
-    snapshot_version: Literal[SNAPSHOT_VERSION] = SNAPSHOT_VERSION
+    snapshot_version: Literal[1, 2] = SNAPSHOT_VERSION
     draft_id: Annotated[str, StringConstraints(min_length=1, max_length=36)]
     draft_revision: PositiveInt
     identity: SnapshotIdentity
@@ -406,19 +413,16 @@ def collect_snapshot_source(
         mutable=True,
         now=utc_now(),
     )
-    if (
-        draft.status != ReimbursementDraftStatus.REVIEW_READY.value
-        or draft.locked_at is not None
-    ):
+    if draft.status != ReimbursementDraftStatus.REVIEW_READY.value or draft.locked_at is not None:
         raise ApiError(
             "REIMBURSEMENT_DRAFT_NOT_READY",
-            "请完成并确认报销草稿后再提交",
+            "请完成并确认报销内容后再提交",
             409,
         )
     if draft.revision != expected_revision:
         raise ApiError(
             "REIMBURSEMENT_DRAFT_REVISION_CONFLICT",
-            "草稿已在其他页面更新，请刷新后重试",
+            "报销内容已在其他页面更新，请刷新后重试",
             409,
         )
 
@@ -432,7 +436,8 @@ def collect_snapshot_source(
     try:
         draft_input = ReimbursementDraftInput.model_validate_json(draft.input_json)
     except ValidationError:
-        raise _snapshot_error("报销草稿数据损坏，请重新创建") from None
+        raise _snapshot_error("报销数据损坏，请重新填写") from None
+    draft_input = apply_ocr_evidence(database, draft_id=draft.id, draft_input=draft_input)
     calculation = validate_and_calculate_input(
         database,
         catalog=catalog,
@@ -441,7 +446,7 @@ def collect_snapshot_source(
         validate_project=True,
     )
     if calculation.canonical_json != draft.input_json:
-        raise _snapshot_error("报销草稿不是规范格式，请重新保存后再提交")
+        raise _snapshot_error("报销内容已变化，请重新确认后再提交")
 
     related_rows = database.scalars(
         select(ReimbursementDraftRelatedApproval)
@@ -472,21 +477,31 @@ def collect_snapshot_source(
             409,
         )
     active_files = tuple(
-        item
-        for item in all_files
-        if item.file_status == ReimbursementDraftFileStatus.ACTIVE.value
+        item for item in all_files if item.file_status == ReimbursementDraftFileStatus.ACTIVE.value
     )
     validate_draft_file_references(
         database,
         draft_id=draft.id,
         draft_input=draft_input,
         require_terminal_disposition=True,
+        require_submission_proofs=True,
     )
     # Upload sort_order is the compact manifest order, not the draft's
     # historical slot. Deleted draft files may legitimately leave gaps.
+    ordered_ids = list(
+        dict.fromkeys(
+            file_id
+            for item in draft_input.items
+            for file_id in ([item.source_file_id] if item.source_file_id else [])
+            + item.itinerary_file_ids
+        )
+    )
+    active_by_id = {item.id: item for item in active_files}
+    ordered_files = [active_by_id[file_id] for file_id in ordered_ids]
+    ordered_files.extend(item for item in active_files if item.id not in set(ordered_ids))
     originals = tuple(
         _original_source(item, manifest_order=manifest_order)
-        for manifest_order, item in enumerate(active_files)
+        for manifest_order, item in enumerate(ordered_files)
     )
     if not originals:
         raise ApiError(
@@ -514,7 +529,12 @@ def collect_snapshot_source(
         identity=identity,
         catalog=catalog,
         draft_input=draft_input,
-        resolved_project=_resolve_project(database, draft_input),
+        resolved_project=ResolvedProject(
+            display_text=_mapped_option(catalog, "budgetCode", draft_input.budget_code_value).label,
+            filename_component=sanitize_filename_component(
+                _mapped_option(catalog, "budgetCode", draft_input.budget_code_value).label
+            ),
+        ),
         totals_data=calculation.totals_data,
         related_approvals=related,
         original_files=originals,
@@ -537,7 +557,12 @@ def build_snapshot(source: SnapshotSource) -> ReimbursementSnapshot:
         end_date = max(item.end_date for item in source.related_approvals)
         duration_days = (end_date - start_date).days + 1
         template = _snapshot_template(source.catalog)
-        project = _snapshot_project(source.draft_input, source.resolved_project)
+        project = SnapshotProject(
+            mode="manual",
+            manual_text=budget.label,
+            display_text=budget.label,
+            filename_component=sanitize_filename_component(budget.label),
+        )
         trip = _snapshot_trip(source.draft_input)
         items = tuple(_snapshot_expense_item(item) for item in source.draft_input.items)
         subsidy = _snapshot_subsidy(source.totals_data.get("subsidy"))
@@ -548,7 +573,7 @@ def build_snapshot(source: SnapshotSource) -> ReimbursementSnapshot:
             template_sha256=source.excel_template_sha256,
             file_name=build_download_filename(
                 source.identity.name,
-                source.resolved_project.filename_component,
+                project.filename_component,
             ),
         )
         form_values = _snapshot_form_values(
@@ -580,9 +605,7 @@ def build_snapshot(source: SnapshotSource) -> ReimbursementSnapshot:
                 project=project,
                 trip=trip,
                 items=items,
-                dismissed_ocr_file_ids=tuple(
-                    source.draft_input.dismissed_ocr_file_ids
-                ),
+                dismissed_ocr_file_ids=tuple(source.draft_input.dismissed_ocr_file_ids),
             ),
             subsidy=subsidy,
             totals=totals,
@@ -602,7 +625,20 @@ def build_snapshot(source: SnapshotSource) -> ReimbursementSnapshot:
 
 def serialize_snapshot(snapshot: ReimbursementSnapshot) -> str:
     snapshot = _require_snapshot(snapshot)
-    return _canonical_json(snapshot.model_dump(mode="json", by_alias=True))
+    value = snapshot.model_dump(mode="json", by_alias=True)
+    if snapshot.snapshot_version == 1:
+        for item in value["input"]["items"]:
+            for key in (
+                "itineraryFileIds",
+                "requiresItinerary",
+                "transportType",
+                "originalCurrency",
+                "originalAmount",
+                "cnyAmountConfirmed",
+                "requiresCnyConfirmation",
+            ):
+                item.pop(key, None)
+    return _canonical_json(value)
 
 
 def snapshot_sha256(snapshot: ReimbursementSnapshot) -> str:
@@ -629,7 +665,7 @@ def parse_snapshot(
 
 def snapshot_excel_input(snapshot: ReimbursementSnapshot) -> ExcelGenerationInput:
     snapshot = _require_snapshot(snapshot)
-    request = _draft_input_from_snapshot(snapshot)
+    request = draft_input_from_snapshot(snapshot)
     subsidy = _subsidy_from_snapshot(snapshot.subsidy)
     totals = _totals_from_snapshot(snapshot.totals)
     return ExcelGenerationInput(
@@ -640,12 +676,7 @@ def snapshot_excel_input(snapshot: ReimbursementSnapshot) -> ExcelGenerationInpu
             filename_component=snapshot.input.project.filename_component,
         ),
         trip=request.trip,
-        items=tuple(
-            ExcelExpenseItemInput.model_validate(
-                item.model_dump(mode="json", by_alias=True, exclude={"source_file_id"})
-            )
-            for item in request.items
-        ),
+        items=tuple(complete_expense_items(request)),
         subsidy=subsidy,
         totals=totals,
     )
@@ -783,29 +814,6 @@ def _snapshot_identity(
         raise ApiError("UNAUTHORIZED", "登录身份数据无效，请重新进入", 401) from None
 
 
-def _resolve_project(database: Session, draft_input: ReimbursementDraftInput) -> ResolvedProject:
-    project_input = draft_input.project
-    if isinstance(project_input, ManualProjectInput):
-        return ResolvedProject(
-            display_text=project_input.text,
-            filename_component=project_input.text,
-        )
-    if not isinstance(project_input, SelectedProjectInput):
-        raise _snapshot_error("报销项目数据无效，请重新选择")
-    project = database.get(Project, project_input.id)
-    if project is None or not project.enabled:
-        raise ApiError("PROJECT_NOT_FOUND", "项目不存在或已停用", 404)
-    display = (
-        f"{project.project_code} {project.project_name}"
-        if project.project_code
-        else project.project_name
-    )
-    return ResolvedProject(
-        display_text=display,
-        filename_component=project.project_code or project.project_name,
-    )
-
-
 def _related_source(item: ReimbursementDraftRelatedApproval) -> RelatedApprovalSource:
     return RelatedApprovalSource(
         sort_order=item.sort_order,
@@ -941,25 +949,6 @@ def _snapshot_template(catalog: OaTemplateCatalogContract) -> SnapshotTemplate:
     )
 
 
-def _snapshot_project(
-    draft_input: ReimbursementDraftInput,
-    resolved: ResolvedProject,
-) -> SnapshotProject:
-    if isinstance(draft_input.project, ManualProjectInput):
-        return SnapshotProject(
-            mode="manual",
-            manual_text=draft_input.project.text,
-            display_text=resolved.display_text,
-            filename_component=resolved.filename_component,
-        )
-    return SnapshotProject(
-        mode="selected",
-        selected_id=draft_input.project.id,
-        display_text=resolved.display_text,
-        filename_component=resolved.filename_component,
-    )
-
-
 def _snapshot_trip(draft_input: ReimbursementDraftInput) -> SnapshotTrip | None:
     trip = draft_input.trip
     if trip is None:
@@ -987,6 +976,13 @@ def _snapshot_expense_item(
         amount=item.amount,
         receipt_count=item.receipt_count,
         source_file_id=item.source_file_id,
+        itinerary_file_ids=tuple(item.itinerary_file_ids),
+        requires_itinerary=item.requires_itinerary,
+        transport_type=item.transport_type,
+        original_currency=item.original_currency,
+        original_amount=item.original_amount,
+        cny_amount_confirmed=item.cny_amount_confirmed,
+        requires_cny_confirmation=item.requires_cny_confirmation,
     )
 
 
@@ -1164,9 +1160,7 @@ def _validate_snapshot_semantics(snapshot: ReimbursementSnapshot) -> None:
         snapshot.related_approvals
     ):
         raise ValueError("related approval sort orders must be unique")
-    if len({item.sort_order for item in snapshot.original_files}) != len(
-        snapshot.original_files
-    ):
+    if len({item.sort_order for item in snapshot.original_files}) != len(snapshot.original_files):
         raise ValueError("original file sort orders must be unique")
     if len({item.process_instance_id for item in snapshot.related_approvals}) != len(
         snapshot.related_approvals
@@ -1243,11 +1237,9 @@ def _validate_template_snapshot(snapshot: ReimbursementSnapshot) -> None:
 
 
 def _validate_business_snapshot(snapshot: ReimbursementSnapshot) -> None:
-    request = _draft_input_from_snapshot(snapshot)
+    request = draft_input_from_snapshot(snapshot)
     source_file_id_values = [
-        item.source_file_id
-        for item in snapshot.input.items
-        if item.source_file_id is not None
+        item.source_file_id for item in snapshot.input.items if item.source_file_id is not None
     ]
     dismissed_file_id_values = list(snapshot.input.dismissed_ocr_file_ids)
     if len(source_file_id_values) != len(set(source_file_id_values)):
@@ -1276,9 +1268,37 @@ def _validate_business_snapshot(snapshot: ReimbursementSnapshot) -> None:
         raise ValueError("expense source OCR must be complete before submission")
     if terminal_expense_file_ids != source_file_ids | dismissed_file_ids:
         raise ValueError("terminal OCR files require an exact disposition")
+    if snapshot.snapshot_version >= 2:
+        support_ids = {
+            item.draft_file_id
+            for item in snapshot.original_files
+            if item.processing_role == ReimbursementDraftFileRole.ATTACHMENT_ONLY.value
+        }
+        for item in snapshot.input.items:
+            if len(item.itinerary_file_ids) != len(set(item.itinerary_file_ids)) or not set(
+                item.itinerary_file_ids
+            ).issubset(support_ids):
+                raise ValueError("itinerary must reference active support files")
+            if (
+                item.requires_itinerary or item.transport_type == "ride_hailing"
+            ) and not item.itinerary_file_ids:
+                raise ValueError("ride-hailing requires itinerary")
+            if (
+                (
+                    item.requires_cny_confirmation
+                    or (item.original_currency and item.original_currency != "CNY")
+                )
+                and not item.cny_amount_confirmed
+            ):
+                raise ValueError("foreign receipts require a confirmed CNY amount")
+        if (
+            snapshot.input.project.display_text != snapshot.selections.budget_code.label
+            or snapshot.input.project.manual_text != snapshot.selections.budget_code.label
+        ):
+            raise ValueError("workbook project must match the budget label")
     subsidy = _subsidy_from_snapshot(snapshot.subsidy)
     totals = _totals_from_snapshot(snapshot.totals)
-    expected_totals = calculate_expense_totals(list(request.items), subsidy)
+    expected_totals = calculate_expense_totals(complete_expense_items(request), subsidy)
     if (
         money_string(expected_totals.expense_total) != money_string(totals.expense_total)
         or money_string(expected_totals.subsidy_total) != money_string(totals.subsidy_total)
@@ -1290,11 +1310,10 @@ def _validate_business_snapshot(snapshot: ReimbursementSnapshot) -> None:
     if subsidy is not None:
         if request.trip is None:
             raise ValueError("subsidy requires trip input")
-        if (
-            subsidy.calendar_days
-            != (request.trip.end_date - request.trip.start_date).days + 1
-            or money_string(subsidy.effective_days * subsidy.daily_rate)
-            != money_string(subsidy.total)
+        if subsidy.calendar_days != (
+            request.trip.end_date - request.trip.start_date
+        ).days + 1 or money_string(subsidy.effective_days * subsidy.daily_rate) != money_string(
+            subsidy.total
         ):
             raise ValueError("snapshot subsidy mismatch")
     elif request.trip is not None:
@@ -1363,7 +1382,7 @@ def _validate_business_snapshot(snapshot: ReimbursementSnapshot) -> None:
         raise ValueError("generated Excel name mismatch")
 
 
-def _draft_input_from_snapshot(snapshot: ReimbursementSnapshot) -> ReimbursementDraftInput:
+def draft_input_from_snapshot(snapshot: ReimbursementSnapshot) -> ReimbursementDraftInput:
     project = snapshot.input.project
     project_value: dict[str, object]
     if project.mode == "selected":
@@ -1425,7 +1444,8 @@ def _validate_attachment_manifest(
     if not isinstance(attachments, Sequence) or isinstance(attachments, (str, bytes)):
         raise _snapshot_error("审批附件清单无效，请稍后重试")
     values = tuple(attachments)
-    if len(values) != len(snapshot.original_files) + 1 or any(
+    expected_count = 2 if snapshot.snapshot_version >= 2 else len(snapshot.original_files) + 1
+    if len(values) != expected_count or any(
         not isinstance(item, ApprovalAttachment) for item in values
     ):
         raise _snapshot_error("审批附件数量与提交快照不一致，请稍后重试")
@@ -1433,7 +1453,14 @@ def _validate_attachment_manifest(
     identities = {(item.space_id, item.file_id) for item in values}
     if len(spaces) != 1 or len(identities) != len(values):
         raise _snapshot_error("审批附件标识不一致，请稍后重试")
-    for source, attachment in zip(snapshot.original_files, values[:-1], strict=True):
+    if snapshot.snapshot_version >= 2:
+        if values[0].file_type.lower().removeprefix(".") != "pdf" or values[0].file_size <= 0:
+            raise _snapshot_error("票据汇总 PDF 必须位于附件清单首位")
+    for source, attachment in zip(
+        snapshot.original_files if snapshot.snapshot_version == 1 else (),
+        values[:-1] if snapshot.snapshot_version == 1 else (),
+        strict=True,
+    ):
         if source.size_bytes != attachment.file_size or not _equivalent_file_type(
             source.file_type,
             attachment.file_type,
@@ -1443,10 +1470,7 @@ def _validate_attachment_manifest(
     # DingTalk may safely de-duplicate the committed name (for example by
     # adding "(1)"). Role/order and type prove this is the generated workbook;
     # the OA value must retain the authoritative name returned by commit.
-    if (
-        generated.file_type.lower().removeprefix(".") != "xlsx"
-        or generated.file_size <= 0
-    ):
+    if generated.file_type.lower().removeprefix(".") != "xlsx" or generated.file_size <= 0:
         raise _snapshot_error("生成的报销 Excel 必须位于附件清单最后")
     return values
 

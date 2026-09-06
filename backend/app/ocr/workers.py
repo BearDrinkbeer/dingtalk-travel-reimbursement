@@ -128,13 +128,14 @@ def inspect_pdf_worker(
     path: str,
     raw_limits: dict[str, int],
     raw_worker_limits: dict[str, int],
+    max_pages: int = 1,
 ) -> dict[str, Any]:
     """Process entry point for upload-time PDF metadata validation."""
 
     try:
         apply_worker_limits(raw_worker_limits)
         inspection = inspect_single_page_pdf(
-            Path(path), PdfLimits(**raw_limits), extract_text=False
+            Path(path), PdfLimits(**raw_limits), extract_text=False, max_pages=max_pages
         )
         return {
             "ok": True,

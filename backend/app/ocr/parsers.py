@@ -16,6 +16,7 @@ from app.ocr.extractors import (
     uses_invoice_date_as_occurrence,
 )
 from app.ocr.keyword_defaults import DEFAULT_RECEIPT_KEYWORD_RULES
+from app.ocr.special_receipts import ForeignReceiptParser, PhysicalTaxiReceiptParser
 from app.ocr.types import (
     BaseReceiptParser,
     OcrLine,
@@ -37,6 +38,49 @@ _PASSENGER_TRANSPORT_KEYWORDS = (
     "客运服务费",
     "交通工具类型",
 )
+_RIDE_HAILING_PROVIDERS = (
+    "滴滴出行",
+    "滴滴快车",
+    "滴滴专车",
+    "曹操出行",
+    "t3出行",
+    "首汽约车",
+    "花小猪",
+    "高德打车",
+)
+
+
+def _with_transport_evidence(parsed: ParsedExpense, lines: list[OcrLine]) -> ParsedExpense:
+    if parsed.transport_type is not None:
+        return parsed
+    text = " ".join(line.text.casefold() for line in lines)
+    transport = extract_passenger_transport_type(lines)
+    ride_hailing = (
+        transport == "网约车"
+        or any(
+            phrase in text for phrase in ("网约车服务", "网约车发票", "网约车行程", "网络预约出租")
+        )
+        or (
+            any(provider in text for provider in _RIDE_HAILING_PROVIDERS)
+            and any(
+                service in text for service in ("旅客运输", "客运", "运输服务", "行程单", "出租车")
+            )
+        )
+    )
+    if ride_hailing:
+        return replace(
+            parsed,
+            category=ExpenseCategory.LOCAL_TRANSPORT,
+            transport_type="ride_hailing",
+            requires_itinerary=True,
+        )
+    if parsed.category is ExpenseCategory.RAIL_FARE:
+        return replace(parsed, transport_type="rail")
+    if parsed.category is ExpenseCategory.LODGING:
+        return replace(parsed, transport_type="hotel")
+    if transport in {"出租车", "出租汽车"}:
+        return replace(parsed, transport_type="taxi")
+    return parsed
 
 
 def is_passenger_transport_text(text: str) -> bool:
@@ -227,7 +271,12 @@ class ReceiptParserRegistry:
     ) -> None:
         rules = DEFAULT_RECEIPT_KEYWORD_RULES if keyword_rules is None else keyword_rules
         self._parsers = (
-            (TrainTicketParser(), GenericInvoiceParser(keyword_rules=rules))
+            (
+                ForeignReceiptParser(),
+                PhysicalTaxiReceiptParser(),
+                TrainTicketParser(),
+                GenericInvoiceParser(keyword_rules=rules),
+            )
             if parsers is None
             else parsers
         )
@@ -252,7 +301,9 @@ class ReceiptParserRegistry:
             return parsed
         category = next(iter(matches))
         warnings = tuple(
-            warning for warning in parsed.warnings if warning != MANUAL_REVIEW_REQUIRED
+            warning
+            for warning in parsed.warnings
+            if warning != MANUAL_REVIEW_REQUIRED or parsed.receipt_type == "foreign_receipt"
         )
         return replace(parsed, category=category, warnings=warnings)
 
@@ -262,4 +313,4 @@ class ReceiptParserRegistry:
             parsed = self._fallback.parse(lines, context)
         else:
             parsed = parser.parse(lines, context)
-        return self._apply_keyword_fallback(parsed, lines)
+        return _with_transport_evidence(self._apply_keyword_fallback(parsed, lines), lines)

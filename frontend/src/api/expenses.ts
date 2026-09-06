@@ -2,7 +2,7 @@ import { http } from './http'
 import type { ApiEnvelope } from '@/types/auth'
 import type {
   ExpenseCategoryMetadata,
-  ExcelExpenseItemInput,
+  ExpenseItem,
   ExpenseTotals,
   SubsidyResult,
   TripInput,
@@ -20,11 +20,13 @@ export async function calculateSubsidy(input: TripInput): Promise<SubsidyResult>
 
 export async function calculateTotals(
   trip: TripInput | null,
-  items: readonly ExcelExpenseItemInput[],
+  items: readonly ExpenseItem[],
 ): Promise<ExpenseTotals> {
   const response = await http.post<ApiEnvelope<ExpenseTotals>>('/calculate/totals', {
     trip,
     items: items.map((item) => ({
+      id: item.id,
+      source: item.source,
       category: item.category,
       date: item.date,
       displayDate: item.displayDate,

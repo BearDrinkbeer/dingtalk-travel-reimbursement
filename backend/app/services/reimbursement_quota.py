@@ -40,6 +40,10 @@ from app.services.reimbursement_staging import (
 )
 
 _GENERATED_EXCEL_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+_GENERATED_ROLES = {
+    ReimbursementUploadRole.GENERATED_EXCEL.value,
+    ReimbursementUploadRole.GENERATED_PDF.value,
+}
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _ACTIVE_DRAFT_STATUSES = frozenset(
     {ReimbursementDraftStatus.DRAFT.value, ReimbursementDraftStatus.REVIEW_READY.value}
@@ -253,12 +257,16 @@ class ReimbursementQuotaCoordinator:
         file_name: str,
         reserved_bytes: int,
         expires_at: datetime,
+        role: ReimbursementUploadRole = ReimbursementUploadRole.GENERATED_EXCEL,
     ) -> QuotaReservation:
         _require_positive_size(reserved_bytes)
         _require_sort_order(sort_order)
         normalized_name = _required_text(file_name, maximum=255)
-        if not normalized_name.casefold().endswith(".xlsx"):
-            raise ValueError("generated workbook name must end in .xlsx")
+        if not isinstance(role, ReimbursementUploadRole) or role not in _GENERATED_ROLES:
+            raise ValueError("generated file role is invalid")
+        extension = "pdf" if role == ReimbursementUploadRole.GENERATED_PDF else "xlsx"
+        if not normalized_name.casefold().endswith(f".{extension}"):
+            raise ValueError(f"generated file name must end in .{extension}")
         now = utc_now()
         expiry = _naive_utc(expires_at)
         if expiry <= now:
@@ -267,7 +275,7 @@ class ReimbursementQuotaCoordinator:
         staging_reservation = self._staging.new_reservation(
             StagingArea.GENERATED,
             lease.submission_id,
-            "xlsx",
+            extension,
             reserved_bytes=reserved_bytes,
         )
 
@@ -285,7 +293,7 @@ class ReimbursementQuotaCoordinator:
                         submission_id=submission.id,
                         draft_id=submission.draft_id,
                         source_draft_file_id=None,
-                        role=ReimbursementUploadRole.GENERATED_EXCEL.value,
+                        role=role.value,
                         sort_order=sort_order,
                         local_storage_key=staging_reservation.storage_key,
                         local_part_storage_key=staging_reservation.part_storage_key,
@@ -293,8 +301,10 @@ class ReimbursementQuotaCoordinator:
                         reserved_bytes=reserved_bytes,
                         reservation_expires_at=expiry,
                         file_name=normalized_name,
-                        file_type="xlsx",
-                        media_type=_GENERATED_EXCEL_MEDIA_TYPE,
+                        file_type=extension,
+                        media_type=(
+                            "application/pdf" if extension == "pdf" else _GENERATED_EXCEL_MEDIA_TYPE
+                        ),
                         size_bytes=None,
                         sha256=None,
                         upload_status=ReimbursementUploadStatus.PENDING.value,
@@ -739,7 +749,7 @@ class ReimbursementQuotaCoordinator:
                     ReimbursementSubmission.id == ReimbursementUpload.submission_id,
                 )
                 .where(
-                    ReimbursementUpload.role == ReimbursementUploadRole.GENERATED_EXCEL.value,
+                    ReimbursementUpload.role.in_(_GENERATED_ROLES),
                     ReimbursementUpload.local_status.in_(
                         {
                             ReimbursementUploadLocalStatus.RESERVED.value,
@@ -950,7 +960,7 @@ class ReimbursementQuotaCoordinator:
                 )
                 .where(
                     ReimbursementUpload.id == reservation.record_id,
-                    ReimbursementUpload.role == ReimbursementUploadRole.GENERATED_EXCEL.value,
+                    ReimbursementUpload.role.in_(_GENERATED_ROLES),
                     ReimbursementUpload.local_storage_key == expected.storage_key,
                     ReimbursementUpload.local_part_storage_key == expected.part_storage_key,
                     ReimbursementUpload.reserved_bytes == expected.reserved_bytes,
@@ -1004,7 +1014,7 @@ class ReimbursementQuotaCoordinator:
                 )
                 .where(
                     ReimbursementUpload.id == reservation.record_id,
-                    ReimbursementUpload.role == ReimbursementUploadRole.GENERATED_EXCEL.value,
+                    ReimbursementUpload.role.in_(_GENERATED_ROLES),
                     ReimbursementUpload.local_storage_key == expected.storage_key,
                     ReimbursementUpload.reserved_bytes == expected.reserved_bytes,
                     *_submission_lease_conditions(authority, now=now),

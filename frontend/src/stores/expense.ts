@@ -307,7 +307,11 @@ export const useExpenseStore = defineStore('expense', () => {
     const warnings = new Set(candidate.warnings.filter((warning) => warning.trim()))
     if (!candidateCategory) warnings.add('MANUAL_REVIEW_REQUIRED')
     if (!isCalendarDate(candidate.date)) warnings.add('MISSING_DATE')
-    const amountCents = candidate.amount === null ? null : moneyToCents(candidate.amount)
+    const foreign = Boolean(candidate.originalCurrency && candidate.originalCurrency !== 'CNY')
+      || candidate.type === 'foreign_receipt'
+      || candidate.warnings.includes('FOREIGN_CURRENCY_REQUIRES_CNY_AMOUNT')
+    if (foreign) warnings.add('FOREIGN_CURRENCY_REQUIRES_CNY_AMOUNT')
+    const amountCents = foreign || candidate.amount === null ? null : moneyToCents(candidate.amount)
     if (amountCents === null) {
       warnings.add('MISSING_AMOUNT')
     }
@@ -326,6 +330,12 @@ export const useExpenseStore = defineStore('expense', () => {
     const id = receipt.ocrItemId ?? `ocr-${receipt.tempId}`
     const item: ExpenseItem = {
       id,
+      transportType: candidate.transportType,
+      requiresItinerary: candidate.requiresItinerary || candidate.transportType === 'ride_hailing',
+      originalCurrency: candidate.originalCurrency ?? undefined,
+      originalAmount: candidate.originalAmount ?? undefined,
+      cnyAmountConfirmed: false,
+      requiresCnyConfirmation: foreign,
       category: category.id,
       date: isCalendarDate(candidate.date) ? candidate.date : undefined,
       displayDate: isCalendarDate(candidate.date) ? candidate.date : '',
@@ -374,7 +384,11 @@ export const useExpenseStore = defineStore('expense', () => {
     )
     const validDate = isCalendarDate(candidate.date) ? candidate.date : undefined
     if (!validDate) warnings.add('MISSING_DATE')
-    const amountCents = candidate.amount === null ? null : moneyToCents(candidate.amount)
+    const foreign = Boolean(candidate.originalCurrency && candidate.originalCurrency !== 'CNY')
+      || candidate.type === 'foreign_receipt'
+      || candidate.warnings.includes('FOREIGN_CURRENCY_REQUIRES_CNY_AMOUNT')
+    if (foreign) warnings.add('FOREIGN_CURRENCY_REQUIRES_CNY_AMOUNT')
+    const amountCents = foreign || candidate.amount === null ? null : moneyToCents(candidate.amount)
     if (amountCents === null) warnings.add('MISSING_AMOUNT')
     const description = candidate.description?.trim()
       || (candidate.status === 'failed' ? file.name : candidate.categoryName.trim())
@@ -383,6 +397,13 @@ export const useExpenseStore = defineStore('expense', () => {
     return {
       id: `ocr-${file.id}`,
       sourceFileId: file.id,
+      transportType: candidate.transportType,
+      requiresItinerary: candidate.requiresItinerary || candidate.transportType === 'ride_hailing',
+      itineraryFileIds: [],
+      originalCurrency: candidate.originalCurrency ?? undefined,
+      originalAmount: candidate.originalAmount ?? undefined,
+      cnyAmountConfirmed: false,
+      requiresCnyConfirmation: foreign,
       category: categoryId,
       date: validDate,
       displayDate: validDate ?? '',
@@ -400,7 +421,10 @@ export const useExpenseStore = defineStore('expense', () => {
     if (!item) return false
     const index = items.value.findIndex((existing) => existing.id === item.id)
     if (index < 0 && items.value.length >= maxExpenseItems.value) return false
-    if (index >= 0) items.value[index] = item
+    if (index >= 0) {
+      item.itineraryFileIds = items.value[index]?.itineraryFileIds ?? []
+      items.value[index] = item
+    }
     else items.value.push(item)
     dismissedOcrFileIds.value = dismissedOcrFileIds.value.filter((id) => id !== file.id)
     if (file.ocrResult?.error?.code === 'OCR_DISABLED') ocrUnavailable.value = true
@@ -418,16 +442,16 @@ export const useExpenseStore = defineStore('expense', () => {
     ocrUnavailable.value = false
 
     const project = draft.input.project
-    manualProject.value = project.mode === 'manual'
-    manualProjectText.value = project.mode === 'manual' ? project.text : ''
-    selectedProjectId.value = project.mode === 'selected'
+    manualProject.value = project?.mode === 'manual'
+    manualProjectText.value = project?.mode === 'manual' ? project.text : ''
+    selectedProjectId.value = project?.mode === 'selected'
       && Number.isSafeInteger(project.id)
       && project.id > 0
       ? project.id
       : null
 
-    const persistedTrip = draft.input.trip
-    includeSubsidy.value = persistedTrip !== null
+    const persistedTrip = draft.input.editingState?.trip ?? draft.input.trip
+    includeSubsidy.value = draft.input.editingState?.includeSubsidy ?? draft.input.trip !== null
     Object.assign(trip, {
       tripType: persistedTrip?.tripType ?? 'business',
       startDate: persistedTrip?.startDate ?? '',
@@ -457,7 +481,7 @@ export const useExpenseStore = defineStore('expense', () => {
     const linkedFileIds = new Set<string>()
     const persistedItems = Array.isArray(draft.input.items) ? draft.input.items : []
     items.value = persistedItems.map((persisted, index) => {
-      const amountCents = moneyToCents(persisted.amount)
+      const amountCents = moneyToCents(persisted.amount ?? '')
       const validDate = isCalendarDate(persisted.date) ? persisted.date : undefined
       const sourceFileId = typeof persisted.sourceFileId === 'string'
         ? persisted.sourceFileId.trim()
@@ -467,6 +491,13 @@ export const useExpenseStore = defineStore('expense', () => {
       return {
         id: sourceFileId ? `ocr-${sourceFileId}` : `draft-${draft.id}-item-${index}`,
         ...(sourceFileId ? { sourceFileId } : {}),
+        transportType: persisted.transportType ?? candidate?.transportType,
+        itineraryFileIds: [...(persisted.itineraryFileIds ?? [])],
+        requiresItinerary: persisted.requiresItinerary || candidate?.requiresItinerary || false,
+        originalCurrency: persisted.originalCurrency ?? candidate?.originalCurrency,
+        originalAmount: persisted.originalAmount ?? candidate?.originalAmount,
+        cnyAmountConfirmed: persisted.cnyAmountConfirmed ?? false,
+        requiresCnyConfirmation: persisted.requiresCnyConfirmation ?? candidate?.requiresCnyConfirmation ?? false,
         category: typeof persisted.category === 'string' ? persisted.category : '',
         date: validDate,
         displayDate: typeof persisted.displayDate === 'string'
@@ -569,6 +600,9 @@ export const useExpenseStore = defineStore('expense', () => {
   function removeDraftFileAssociation(fileId: string): void {
     const previousLength = items.value.length
     items.value = items.value.filter((item) => item.sourceFileId !== fileId)
+    for (const item of items.value) {
+      item.itineraryFileIds = item.itineraryFileIds?.filter((id) => id !== fileId)
+    }
     dismissedOcrFileIds.value = dismissedOcrFileIds.value.filter((id) => id !== fileId)
     if (items.value.length !== previousLength) {
       totals.value = null
@@ -609,7 +643,7 @@ export const useExpenseStore = defineStore('expense', () => {
     }
     calculating.value = true
     try {
-      const result = await calculateTotals(payload, excelExpenseItems())
+      const result = await calculateTotals(payload, items.value)
       if (version === calculationVersion) {
         totals.value = result
         calculatedSignature.value = calculationSignature(payload)
@@ -676,11 +710,18 @@ export const useExpenseStore = defineStore('expense', () => {
   function buildDraftExpenseItems(): ReimbursementDraftExpenseItemInput[] {
     return items.value.map((item) => ({
       ...(item.sourceFileId ? { sourceFileId: item.sourceFileId } : {}),
+      transportType: item.transportType,
+      itineraryFileIds: [...(item.itineraryFileIds ?? [])],
+      requiresItinerary: item.requiresItinerary ?? false,
+      originalCurrency: item.originalCurrency,
+      originalAmount: item.originalAmount,
+      cnyAmountConfirmed: item.cnyAmountConfirmed ?? false,
+      requiresCnyConfirmation: item.requiresCnyConfirmation ?? false,
       category: item.category,
-      date: item.date ?? '',
+      date: item.date || null,
       displayDate: item.displayDate,
       description: item.description,
-      amount: item.amount,
+      amount: item.amount || null,
       receiptCount: item.receiptCount,
     }))
   }

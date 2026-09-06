@@ -14,6 +14,30 @@ from app.services import readiness
 from app.services.reimbursement_staging import ReimbursementStaging
 
 
+def test_database_readiness_accepts_actual_migration_head_and_rejects_old_schema(
+    settings_factory, tmp_path, monkeypatch
+):
+    from alembic import command
+    from alembic.config import Config
+
+    from app.core.config import get_settings
+
+    settings = settings_factory(database_url=f"sqlite:///{tmp_path / 'ready-migrated.db'}")
+    monkeypatch.setenv("DATABASE_URL", settings.database_url)
+    get_settings.cache_clear()
+    config = Config()
+    config.set_main_option("script_location", str(Path(__file__).parents[1] / "migrations"))
+    engine = create_database_engine(settings.database_url)
+    try:
+        command.upgrade(config, "20260904_0011")
+        assert readiness._database_ready(engine) is False
+        command.upgrade(config, "head")
+        assert readiness._database_ready(engine) is True
+    finally:
+        engine.dispose()
+        get_settings.cache_clear()
+
+
 class _SchemaWithout:
     def __init__(
         self,

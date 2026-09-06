@@ -848,7 +848,15 @@ def test_ocr_failure_and_symlink_are_persisted_without_content_or_path_leak(
 
 def test_excel_preview_recalculates_from_saved_draft_without_submission_side_effects(
     client_factory,
+    monkeypatch,
 ) -> None:
+    from test_reimbursement_drafts import _catalog
+
+    from app.services import reimbursement_files
+
+    monkeypatch.setattr(
+        reimbursement_files, "require_submission_ready_catalog", lambda _: _catalog()
+    )
     client = client_factory(auth_mock_enabled=True)
     csrf = str(mock_login(client)["csrfToken"])
     draft_id = _insert_draft(client, amount="44.89")
@@ -867,6 +875,7 @@ def test_excel_preview_recalculates_from_saved_draft_without_submission_side_eff
     try:
         worksheet = workbook.active
         assert str(worksheet[EXCEL_TEMPLATE.total_amount_cell].value) == "244.89"
+        assert worksheet[EXCEL_TEMPLATE.project_cell].value == "MES 项目"
     finally:
         workbook.close()
     with client.app.state.database_session_factory() as database:

@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from app.domain.categories import ExpenseCategory
 
@@ -49,6 +49,10 @@ class ParsedExpense:
     amount: Decimal | None
     confidence: float
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    requires_itinerary: bool = False
+    transport_type: Literal["ride_hailing", "taxi", "rail", "hotel", "other"] | None = None
+    original_currency: str | None = None
+    original_amount: Decimal | None = None
 
 
 class LocalOcrEngine(Protocol):

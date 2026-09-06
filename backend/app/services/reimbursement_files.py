@@ -21,7 +21,6 @@ from app.core.config import Settings
 from app.core.errors import ApiError
 from app.domain.expenses import ExpenseTotals, calculate_expense_totals
 from app.domain.subsidy import SubsidyCalculation, calculate_subsidy
-from app.models.project import Project
 from app.models.reimbursement import (
     ReimbursementDraft,
     ReimbursementDraftFile,
@@ -31,7 +30,6 @@ from app.models.reimbursement import (
     ReimbursementUpload,
     utc_now,
 )
-from app.schemas.excel import ManualProjectInput
 from app.schemas.reimbursements import ReimbursementDraftInput
 from app.services.application_settings import get_expense_settings
 from app.services.excel_generator import (
@@ -40,6 +38,7 @@ from app.services.excel_generator import (
     generate_expense_workbook,
 )
 from app.services.multipart_uploads import prepare_spool_directory
+from app.services.oa_template_profiles import require_submission_ready_catalog
 from app.services.ocr_service import (
     OcrService,
     failed_expense_payload,
@@ -49,9 +48,13 @@ from app.services.process_jobs import KillableProcessRunner
 from app.services.receipt_keywords import load_receipt_keyword_rules
 from app.services.reimbursement_drafts import (
     DraftActor,
+    apply_ocr_evidence,
     bump_owned_draft_revision,
+    complete_expense_items,
     detach_draft_file_from_input,
+    require_complete_draft_input,
     require_owned_draft,
+    validate_and_calculate_input,
 )
 from app.services.reimbursement_quota import (
     DraftFileOwner,
@@ -180,6 +183,31 @@ def list_draft_files(
     return draft.revision, [_snapshot(item) for item in files]
 
 
+def read_draft_file_content(
+    database: Session,
+    *,
+    actor: DraftActor,
+    draft_id: str,
+    file_id: str,
+    staging: ReimbursementStaging,
+) -> tuple[DraftFileSnapshot, bytes]:
+    draft = require_owned_draft(database, draft_id=draft_id, actor=actor)
+    if draft.expires_at <= utc_now() or draft.status == "EXPIRED":
+        raise ApiError("REIMBURSEMENT_DRAFT_EXPIRED", "报销资料已过期，请重新上传", 409)
+    file = _snapshot(_require_active_file(database, draft_id=draft.id, file_id=file_id))
+    if file.media_type not in {"application/pdf", "image/png", "image/jpeg"}:
+        raise ApiError("UNSUPPORTED_FILE_TYPE", "此文件类型不能预览", 415)
+    try:
+        content = staging.read_bytes(
+            file.storage_key, expected_size=file.size_bytes, expected_sha256=file.sha256
+        )
+    except (StagingIntegrityError, StagingObjectNotFound, StagingLayoutError, OSError):
+        raise ApiError(
+            "REIMBURSEMENT_DRAFT_FILE_CHANGED", "附件已丢失或内容发生变化，请重新上传", 409
+        ) from None
+    return file, content
+
+
 async def persist_draft_upload(
     *,
     upload: UploadFile,
@@ -195,7 +223,13 @@ async def persist_draft_upload(
 ) -> DraftFileMutationResult:
     size_bytes, first_bytes, worker_path = _inspect_upload_spool(upload, settings=settings)
     upload_type = validate_upload_type(upload.filename, first_bytes)
-    await validate_new_file(worker_path, upload_type.extension, settings, process_runner)
+    await validate_new_file(
+        worker_path,
+        upload_type.extension,
+        settings,
+        process_runner,
+        supporting_pdf=processing_role is ReimbursementDraftFileRole.ATTACHMENT_ONLY,
+    )
 
     with session_factory() as database:
         draft = require_owned_draft(
@@ -216,7 +250,7 @@ async def persist_draft_upload(
         if int(retained_file_count or 0) >= settings.session_max_files:
             raise ApiError(
                 "REIMBURSEMENT_FILE_LIMIT",
-                f"每张报销草稿最多保留 {settings.session_max_files} 个文件",
+                f"每次报销最多保留 {settings.session_max_files} 个文件",
                 413,
             )
         retained_bytes = database.scalar(
@@ -228,7 +262,7 @@ async def persist_draft_upload(
         if int(retained_bytes or 0) + size_bytes > settings.session_max_bytes:
             raise ApiError(
                 "REIMBURSEMENT_DRAFT_STORAGE_LIMIT",
-                "当前报销草稿的文件总量超过限制",
+                "当前报销的文件总量超过限制",
                 413,
             )
         maximum_sort_order = database.scalar(
@@ -648,7 +682,7 @@ async def generate_draft_excel_preview(
         department_name=snapshot.department_name,
         project=snapshot.project,
         trip=snapshot.input.trip,
-        items=snapshot.input.items,
+        items=complete_expense_items(snapshot.input),
         subsidy=snapshot.subsidy,
         totals=snapshot.totals,
     )
@@ -679,7 +713,7 @@ def _workbook_preview_snapshot(
     except ValidationError as exc:
         raise ApiError(
             "REIMBURSEMENT_DRAFT_INVALID",
-            "草稿内容无法生成 Excel，请重新保存",
+            "报销内容无法生成 Excel，请重新确认填写内容",
             409,
         ) from exc
     if len(draft_input.items) > settings.expense_max_items:
@@ -688,7 +722,20 @@ def _workbook_preview_snapshot(
             f"当前部署每张报销单最多处理 {settings.expense_max_items} 条费用明细",
             422,
         )
-    project = _resolve_project(database, draft_input)
+    draft_input = apply_ocr_evidence(database, draft_id=draft.id, draft_input=draft_input)
+    require_complete_draft_input(draft_input)
+    catalog = require_submission_ready_catalog(database)
+    calculation = validate_and_calculate_input(
+        database,
+        catalog=catalog,
+        draft_input=draft_input,
+        max_items=settings.expense_max_items,
+        validate_project=True,
+    )
+    draft_input = ReimbursementDraftInput.model_validate(calculation.input_data)
+    project = ResolvedProject(
+        display_text=draft_input.project.text, filename_component=draft_input.project.text
+    )
     subsidy = None
     if draft_input.trip is not None:
         expense_settings = get_expense_settings(database)
@@ -701,7 +748,7 @@ def _workbook_preview_snapshot(
             confirmed_effective_days=draft_input.trip.confirmed_effective_days,
             no_subsidy_exception=draft_input.trip.no_subsidy_exception,
         )
-    totals = calculate_expense_totals(draft_input.items, subsidy)
+    totals = calculate_expense_totals(complete_expense_items(draft_input), subsidy)
     return WorkbookPreviewSnapshot(
         canonical_input_json=draft.input_json,
         input=draft_input,
@@ -710,26 +757,6 @@ def _workbook_preview_snapshot(
         project=project,
         subsidy=subsidy,
         totals=totals,
-    )
-
-
-def _resolve_project(database: Session, draft_input: ReimbursementDraftInput) -> ResolvedProject:
-    if isinstance(draft_input.project, ManualProjectInput):
-        return ResolvedProject(
-            display_text=draft_input.project.text,
-            filename_component=draft_input.project.text,
-        )
-    project = database.get(Project, draft_input.project.id)
-    if project is None or not project.enabled:
-        raise ApiError("PROJECT_NOT_FOUND", "项目不存在或已停用", 404)
-    display = (
-        f"{project.project_code} {project.project_name}"
-        if project.project_code
-        else project.project_name
-    )
-    return ResolvedProject(
-        display_text=display,
-        filename_component=project.project_code or project.project_name,
     )
 
 
@@ -990,7 +1017,7 @@ def _mark_ocr_interrupted(
     payload = failed_expense_payload(
         file_id,
         "OCR_RESULT_CONFLICT",
-        "草稿在识别期间已变更，请重试",
+        "报销内容在识别期间已变更，请重试",
     )
     _set_ocr_failed_without_revision(
         session_factory,
@@ -1083,7 +1110,7 @@ def _require_revision(draft: ReimbursementDraft, expected_revision: int) -> None
 def _revision_conflict_error() -> ApiError:
     return ApiError(
         "REIMBURSEMENT_DRAFT_REVISION_CONFLICT",
-        "草稿已在其他操作中更新，请刷新后重试",
+        "报销内容已在其他操作中更新，请刷新后重试",
         409,
     )
 

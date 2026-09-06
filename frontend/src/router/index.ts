@@ -15,8 +15,7 @@ const router = createRouter({
     {
       path: '/admin/projects',
       name: 'admin-projects',
-      component: () => import('@/views/ProjectAdminView.vue'),
-      meta: { requiresAdmin: true },
+      redirect: { name: 'reimburse' },
     },
     {
       path: '/admin/settings',

@@ -275,6 +275,10 @@ def test_ocr_requires_one_file_and_isolates_separate_requests(client_factory) ->
         "description": "北京南-合肥南",
         "amount": "454.00",
         "receiptCount": 1,
+        "requiresItinerary": False,
+        "transportType": "rail",
+        "originalCurrency": None,
+        "originalAmount": None,
         "source": "ocr",
         "confidence": "0.60",
         "warnings": [],
@@ -698,3 +702,83 @@ def test_paddle_recovers_passenger_route_from_separate_header_guided_cell_crops(
     assert pipeline.calls == 1
     assert len(crop_regions) == 2
     assert OcrLine("行程路线：甲方园区(北门)-乙方酒店(南门)", 0.97) in lines
+
+
+def test_foreign_receipt_api_keeps_original_amount_out_of_cny_field(client_factory) -> None:
+    engine = FakeOcrEngine(
+        {
+            "*": [
+                OcrLine("GUEST INVOICE KHÁCH SẠN", 0.98),
+                OcrLine("18/4/2026", 0.98),
+                OcrLine("18/6/2026", 0.98),
+                OcrLine("Tổng tiền (Total) 97,600,000 VND", 0.98),
+            ]
+        }
+    )
+    client = client_factory(auth_mock_enabled=True, ocr_enabled=True, ocr_engine=engine)
+    csrf = str(mock_login(client)["csrfToken"])
+    upload = upload_one(client, csrf, "hotel.png", image_bytes(), "image/png")
+    file_id = upload.json()["data"]["files"][0]["id"]
+    response = client.post(
+        "/api/ocr",
+        headers={"X-CSRF-Token": csrf},
+        json={"fileIds": [file_id], "tripYear": 2026},
+    )
+    assert response.status_code == 200
+    item = response.json()["data"]["items"][0]
+    assert item["originalCurrency"] == "VND"
+    assert item["originalAmount"] == "97600000.00"
+    assert item["amount"] is None
+    assert item["date"] is None
+    assert item["transportType"] == "hotel"
+    assert item["requiresItinerary"] is False
+    assert "FOREIGN_CURRENCY_REQUIRES_CNY_AMOUNT" in item["warnings"]
+    assert "MULTIPLE_RECEIPT_DATES" in item["warnings"]
+
+
+@pytest.mark.asyncio
+async def test_complete_foreign_pdf_text_does_not_repeat_ocr_for_manual_confirmation(
+    settings_factory,
+    tmp_path: Path,
+) -> None:
+    class ForeignPdfRunner:
+        calls = 0
+
+        async def run(self, _function, *_args, **_kwargs):
+            self.calls += 1
+            return {
+                "ok": True,
+                "source": "pdf_text",
+                "lines": [
+                    ("Hotel invoice", 0.98),
+                    ("18/4/2026", 0.98),
+                    ("18/6/2026", 0.98),
+                    ("Total $108.00", 0.98),
+                ],
+            }
+
+    runner = ForeignPdfRunner()
+    settings = settings_factory(
+        ocr_enabled=True,
+        ocr_detection_model_dir=tmp_path / "det",
+        ocr_recognition_model_dir=tmp_path / "rec",
+    )
+    stored = StoredFile(
+        temp_id="hotel-1",
+        path=tmp_path / "hotel.pdf",
+        extension="pdf",
+        media_type="application/pdf",
+        size=10,
+        original_name="hotel.pdf",
+    )
+    parsed = await OcrService(settings, None, runner).recognize_file(  # type: ignore[arg-type]
+        stored,
+        reference_year=2026,
+    )
+    assert runner.calls == 1
+    assert str(parsed.original_amount) == "108.00"
+    assert parsed.amount is None
+    assert parsed.original_currency is None
+    assert parsed.date is None
+    assert "CURRENCY_REQUIRES_REVIEW" in parsed.warnings
+    assert "MULTIPLE_RECEIPT_DATES" in parsed.warnings

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from datetime import date, datetime
@@ -276,15 +277,27 @@ def _source(*, original_count: int = 2) -> SnapshotSource:
 
 
 def _attachments(snapshot) -> tuple[ApprovalAttachment, ...]:
-    originals = tuple(
-        ApprovalAttachment(
-            space_id="space-1",
-            file_id=f"remote-{index}",
-            file_name=f"钉钉可能重命名-{index}.{source.file_type}",
-            file_size=source.size_bytes,
-            file_type=source.file_type,
+    originals = (
+        (
+            ApprovalAttachment(
+                space_id="space-1",
+                file_id="remote-bundle",
+                file_name="票据汇总.pdf",
+                file_size=12345,
+                file_type="pdf",
+            ),
         )
-        for index, source in enumerate(snapshot.original_files)
+        if snapshot.snapshot_version >= 2
+        else tuple(
+            ApprovalAttachment(
+                space_id="space-1",
+                file_id=f"remote-{index}",
+                file_name=f"钉钉可能重命名-{index}.{source.file_type}",
+                file_size=source.size_bytes,
+                file_type=source.file_type,
+            )
+            for index, source in enumerate(snapshot.original_files)
+        )
     )
     return originals + (
         ApprovalAttachment(
@@ -303,7 +316,7 @@ def test_snapshot_is_versioned_canonical_immutable_and_hash_verified() -> None:
 
     serialized = serialize_snapshot(first)
     assert serialized == serialize_snapshot(second)
-    assert json.loads(serialized)["snapshotVersion"] == 1
+    assert json.loads(serialized)["snapshotVersion"] == 2
     assert parse_snapshot(serialized, expected_sha256=snapshot_sha256(first)) == first
     assert len(first.template.fields) == 10
     assert first.template.schema_fingerprint in first.template.schema_canonical_json
@@ -312,9 +325,7 @@ def test_snapshot_is_versioned_canonical_immutable_and_hash_verified() -> None:
         "source-file-1",
     ]
     assert first.input.items[0].source_file_id == "source-file-0"
-    assert json.loads(serialized)["input"]["items"][0]["sourceFileId"] == (
-        "source-file-0"
-    )
+    assert json.loads(serialized)["input"]["items"][0]["sourceFileId"] == ("source-file-0")
     assert json.loads(serialized)["input"]["ocrDispositionVersion"] == 1
     assert json.loads(serialized)["input"]["dismissedOcrFileIds"] == []
     with pytest.raises(ValidationError):
@@ -328,11 +339,51 @@ def test_snapshot_parser_rejects_noncanonical_unknown_version_and_wrong_hash() -
     with pytest.raises(ApiError, match="快照"):
         parse_snapshot(" " + serialized)
     value = json.loads(serialized)
-    value["snapshotVersion"] = 2
+    value["snapshotVersion"] = 99
     with pytest.raises(ApiError, match="快照"):
         parse_snapshot(json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True))
     with pytest.raises(ApiError, match="校验"):
         parse_snapshot(serialized, expected_sha256="0" * 64)
+
+
+def test_v1_snapshot_canonical_bytes_and_legacy_attachments_remain_readable() -> None:
+    value = json.loads(serialize_snapshot(build_snapshot(_source())))
+    value["snapshotVersion"] = 1
+    for item in value["input"]["items"]:
+        for key in (
+            "itineraryFileIds",
+            "requiresItinerary",
+            "transportType",
+            "originalCurrency",
+            "originalAmount",
+            "cnyAmountConfirmed",
+            "requiresCnyConfirmation",
+        ):
+            item.pop(key)
+    original = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    parsed = parse_snapshot(original, expected_sha256=hashlib.sha256(original.encode()).hexdigest())
+    assert serialize_snapshot(parsed) == original
+    assert (
+        len(json.loads(build_create_command(parsed, _attachments(parsed)).form_values[-1].value))
+        == 3
+    )
+
+
+def test_snapshot_rejects_missing_proof_and_unconfirmed_foreign_amount() -> None:
+    source = _source()
+    for changes in (
+        {"requires_itinerary": True},
+        {"original_currency": "VND", "original_amount": Decimal("97600000.00")},
+        {"original_currency": None, "requires_cny_confirmation": True},
+    ):
+        items = [
+            source.draft_input.items[0].model_copy(update=changes),
+            source.draft_input.items[1],
+        ]
+        with pytest.raises(ApiError):
+            build_snapshot(
+                replace(source, draft_input=source.draft_input.model_copy(update={"items": items}))
+            )
 
 
 def test_snapshot_rejects_a_terminal_ocr_file_without_a_disposition() -> None:
@@ -343,24 +394,48 @@ def test_snapshot_rejects_a_terminal_ocr_file_without_a_disposition() -> None:
         build_snapshot(unlinked)
 
 
+def test_unknown_foreign_currency_confirmation_survives_snapshot_and_worker_readback() -> None:
+    source = _source()
+    items = [
+        source.draft_input.items[0].model_copy(
+            update={"requires_cny_confirmation": True, "cny_amount_confirmed": True}
+        ),
+        source.draft_input.items[1],
+    ]
+    snapshot = build_snapshot(
+        replace(source, draft_input=source.draft_input.model_copy(update={"items": items}))
+    )
+    serialized = serialize_snapshot(snapshot)
+    recovered = parse_snapshot(serialized, expected_sha256=snapshot_sha256(snapshot))
+    assert recovered.input.items[0].original_currency is None
+    assert recovered.input.items[0].requires_cny_confirmation is True
+    assert recovered.input.items[0].cny_amount_confirmed is True
+    tampered = recovered.model_copy(
+        update={
+            "input": recovered.input.model_copy(
+                update={
+                    "items": (
+                        recovered.input.items[0].model_copy(update={"cny_amount_confirmed": False}),
+                        recovered.input.items[1],
+                    )
+                }
+            )
+        }
+    )
+    with pytest.raises(ValidationError, match="confirmed CNY amount"):
+        build_create_command(tampered, _attachments(snapshot))
+
+
 def test_snapshot_consumers_revalidate_forged_model_copies() -> None:
     snapshot = build_snapshot(_source())
     source_id = snapshot.input.items[0].source_file_id
     assert source_id is not None
-    unknown_snapshot_version = snapshot.model_copy(update={"snapshot_version": 2})
+    unknown_snapshot_version = snapshot.model_copy(update={"snapshot_version": 99})
     legacy_version = snapshot.model_copy(
-        update={
-            "input": snapshot.input.model_copy(
-                update={"ocr_disposition_version": 0}
-            )
-        }
+        update={"input": snapshot.input.model_copy(update={"ocr_disposition_version": 0})}
     )
     overlapping = snapshot.model_copy(
-        update={
-            "input": snapshot.input.model_copy(
-                update={"dismissed_ocr_file_ids": (source_id,)}
-            )
-        }
+        update={"input": snapshot.input.model_copy(update={"dismissed_ocr_file_ids": (source_id,)})}
     )
     duplicate_source = snapshot.model_copy(
         update={
@@ -368,9 +443,7 @@ def test_snapshot_consumers_revalidate_forged_model_copies() -> None:
                 update={
                     "items": (
                         snapshot.input.items[0],
-                        snapshot.input.items[1].model_copy(
-                            update={"source_file_id": source_id}
-                        ),
+                        snapshot.input.items[1].model_copy(update={"source_file_id": source_id}),
                     )
                 }
             )
@@ -387,9 +460,7 @@ def test_snapshot_consumers_revalidate_forged_model_copies() -> None:
         update={
             "original_files": (
                 snapshot.original_files[0],
-                snapshot.original_files[1].model_copy(
-                    update={"processing_role": "BAD"}
-                ),
+                snapshot.original_files[1].model_copy(update={"processing_role": "BAD"}),
             )
         }
     )
@@ -397,9 +468,7 @@ def test_snapshot_consumers_revalidate_forged_model_copies() -> None:
         update={
             "original_files": (
                 snapshot.original_files[0],
-                snapshot.original_files[1].model_copy(
-                    update={"ocr_status": "RUNNING"}
-                ),
+                snapshot.original_files[1].model_copy(update={"ocr_status": "RUNNING"}),
             )
         }
     )
@@ -465,14 +534,16 @@ def test_builds_all_ten_oa_fields_and_round_trips_exact_request() -> None:
     assert values[7]["value"] == "1058.39"
     assert json.loads(values[8]["value"]) == ["travel-instance-1"]
     assert [item["fileId"] for item in json.loads(values[9]["value"])] == [
-        "remote-0",
-        "remote-1",
+        "remote-bundle",
         "remote-excel",
     ]
-    assert parse_create_command(
-        serialized,
-        expected_sha256=create_command_sha256(command),
-    ) == command
+    assert (
+        parse_create_command(
+            serialized,
+            expected_sha256=create_command_sha256(command),
+        )
+        == command
+    )
 
 
 def test_create_command_parser_rejects_noncanonical_and_tampered_request() -> None:
@@ -491,16 +562,14 @@ def test_create_command_parser_rejects_noncanonical_and_tampered_request() -> No
         parse_create_command(tampered, expected_sha256=expected_sha256)
 
 
-def test_attachment_manifest_requires_original_order_then_generated_excel() -> None:
+def test_attachment_manifest_requires_bundle_then_generated_excel() -> None:
     snapshot = build_snapshot(_source())
-    original_one, original_two, generated = _attachments(snapshot)
+    bundle, generated = _attachments(snapshot)
 
-    with pytest.raises(ApiError, match="顺序"):
-        build_create_command(snapshot, (original_two, original_one, generated))
-    with pytest.raises(ApiError, match="顺序"):
-        build_create_command(snapshot, (original_one, generated, original_two))
+    with pytest.raises(ApiError, match="首位"):
+        build_create_command(snapshot, (generated, bundle))
     with pytest.raises(ApiError, match="数量"):
-        build_create_command(snapshot, (original_one, generated))
+        build_create_command(snapshot, (bundle,))
 
     renamed_excel = ApprovalAttachment(
         space_id=generated.space_id,
@@ -509,7 +578,7 @@ def test_attachment_manifest_requires_original_order_then_generated_excel() -> N
         file_size=generated.file_size,
         file_type=generated.file_type,
     )
-    command = build_create_command(snapshot, (original_one, original_two, renamed_excel))
+    command = build_create_command(snapshot, (bundle, renamed_excel))
     assert json.loads(command.form_values[-1].value)[-1]["fileName"].endswith("(1).xlsx")
 
 
@@ -526,7 +595,7 @@ def test_excel_input_is_rebuilt_only_for_the_frozen_template(tmp_path: Path) -> 
 
     assert excel_input.employee_name == "测试员工"
     assert excel_input.department_name == "工业物联二部"
-    assert excel_input.project.display_text == "26007 MES 项目"
+    assert excel_input.project.display_text == "26007 项目"
     assert excel_input.totals.total_amount == Decimal("1058.39")
     assert not hasattr(excel_input.items[0], "source_file_id")
     verify_excel_template(snapshot, template)

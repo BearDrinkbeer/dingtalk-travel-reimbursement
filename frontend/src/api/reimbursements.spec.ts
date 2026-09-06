@@ -9,6 +9,7 @@ import {
   getOaReimbursementSubmission,
   getOaReimbursementSubmissionForDraft,
   getReimbursementDraft,
+  getReimbursementFileContent,
   getReimbursementDraftExcelPreview,
   getOaReimbursementOptions,
   listOaTravelApprovals,
@@ -54,6 +55,16 @@ const input: ReimbursementDraftInput = {
 describe('persistent reimbursement API', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+  })
+
+  it('fetches an original attachment as a blob through the authenticated API client', async () => {
+    const blob = new Blob(['pdf'], { type: 'application/pdf' })
+    const signal = new AbortController().signal
+    vi.mocked(http.get).mockResolvedValue({ data: blob })
+    await expect(getReimbursementFileContent('draft/1', 'file 2', { signal })).resolves.toBe(blob)
+    expect(http.get).toHaveBeenCalledWith('/reimbursements/drafts/draft%2F1/files/file%202/content', {
+      responseType: 'blob', signal, timeout: 60_000,
+    })
   })
 
   it('loads strongly typed OA options and travel approvals with cancellation', async () => {

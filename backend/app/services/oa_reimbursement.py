@@ -36,9 +36,12 @@ from app.integrations.dingtalk.workflow import (
     WorkflowProcessInstance,
 )
 from app.models.reimbursement import (
+    ReimbursementDraftFile,
+    ReimbursementDraftFileStatus,
     ReimbursementSubmission,
     ReimbursementSubmissionStatus,
     ReimbursementUpload,
+    ReimbursementUploadRole,
     ReimbursementUploadStatus,
 )
 from app.services.excel_generator import generate_expense_workbook
@@ -46,12 +49,19 @@ from app.services.oa_reimbursement_payload import (
     ReimbursementSnapshot,
     build_create_command,
     create_command_sha256,
+    draft_input_from_snapshot,
     parse_create_command,
     parse_snapshot,
     serialize_create_command,
     snapshot_excel_input,
     verify_excel_template,
 )
+from app.services.receipt_bundle import (
+    RECEIPT_BUNDLE_FILENAME,
+    ReceiptBundleSource,
+    generate_receipt_bundle,
+)
+from app.services.reimbursement_drafts import validate_draft_file_references
 from app.services.reimbursement_quota import (
     ReimbursementQuotaCoordinator,
     ReimbursementQuotaError,
@@ -80,7 +90,9 @@ from app.services.reimbursement_submissions import (
     complete_orphan_cleanup,
     fail_submission_final,
     fail_submission_retryable,
+    finalize_bundled_source_release,
     finalize_local_upload_release,
+    list_due_bundled_source_release_candidates,
     list_due_linked_local_release_candidates,
     mark_oa_create_uncertain,
     mark_submission_manual_review,
@@ -541,6 +553,29 @@ class SnapshotSubmissionMaterializer:
             )
         return result.filename, snapshot.excel.media_type, result.content
 
+    def generate_bundle(self, job: SubmissionJob) -> tuple[str, str, bytes]:
+        snapshot = self._snapshot(job)
+
+        def sources():
+            for source in snapshot.original_files:
+                upload = SubmissionUpload(
+                    id=source.draft_file_id,
+                    status_version=1,
+                    status=ReimbursementUploadStatus.PENDING,
+                    file_name=source.file_name,
+                    file_type=source.file_type,
+                    media_type=source.media_type,
+                    size_bytes=source.size_bytes,
+                    sha256=source.sha256,
+                    local_storage_key=source.storage_key,
+                )
+                yield ReceiptBundleSource(
+                    source.file_name, source.file_type, self.read_upload(job, upload)
+                )
+
+        content = generate_receipt_bundle(sources(), max_bytes=self._staging.max_object_bytes)
+        return RECEIPT_BUNDLE_FILENAME, "application/pdf", content
+
     def read_upload(self, _job: SubmissionJob, upload: SubmissionUpload) -> bytes:
         if not upload.local_storage_key:
             raise ApiError(
@@ -894,7 +929,29 @@ class DatabaseSubmissionState:
         job = self.load_job(lease)
         if job.snapshot_json != snapshot_json or job.snapshot_sha256 != snapshot_sha256:
             raise ReimbursementSubmissionConflict("submission snapshot changed")
-        generated = tuple(item for item in job.uploads if item.role == "GENERATED_EXCEL")
+        snapshot = parse_snapshot(snapshot_json, expected_sha256=snapshot_sha256)
+        if snapshot.snapshot_version >= 2:
+            self._ensure_generated_file(
+                lease, job, role=ReimbursementUploadRole.GENERATED_PDF, sort_order=0,
+                generate=self._materializer.generate_bundle,
+            )
+        self._ensure_generated_file(
+            lease, job, role=ReimbursementUploadRole.GENERATED_EXCEL,
+            sort_order=(1 if snapshot.snapshot_version >= 2 else len(snapshot.original_files)),
+            generate=self._materializer.generate_excel,
+        )
+        return lease
+
+    def _ensure_generated_file(
+        self,
+        lease: SubmissionLease,
+        job: SubmissionJob,
+        *,
+        role: ReimbursementUploadRole,
+        sort_order: int,
+        generate: Callable[[SubmissionJob], tuple[str, str, bytes]],
+    ) -> None:
+        generated = tuple(item for item in job.uploads if item.role == role.value)
         if len(generated) > 1:
             raise ApiError(
                 "REIMBURSEMENT_SUBMISSION_CORRUPTED",
@@ -908,7 +965,7 @@ class DatabaseSubmissionState:
                 and existing.size_bytes is not None
                 and existing.sha256 is not None
             ):
-                return lease
+                return
             if existing.status is ReimbursementUploadStatus.DISCARDED:
                 with self._session_factory() as database:
                     remove_discarded_generated_upload(
@@ -925,7 +982,7 @@ class DatabaseSubmissionState:
                     503,
                 )
 
-        file_name, _media_type, content = self._materializer.generate_excel(job)
+        file_name, _media_type, content = generate(job)
         if len(content) > self._staging.max_object_bytes:
             raise ApiError(
                 "REIMBURSEMENT_EXCEL_TOO_LARGE",
@@ -937,8 +994,9 @@ class DatabaseSubmissionState:
         try:
             reservation = self._quota.reserve_generated_upload(
                 quota_lease,
-                sort_order=len(tuple(item for item in job.uploads if item.role == "ORIGINAL")),
+                sort_order=sort_order,
                 file_name=file_name,
+                role=role,
                 reserved_bytes=len(content),
                 expires_at=_utc_now()
                 + timedelta(seconds=self._generated_reservation_seconds),
@@ -961,7 +1019,6 @@ class DatabaseSubmissionState:
         except Exception:
             self._release_failed_generated(quota_lease, reservation)
             raise
-        return lease
 
     def begin_upload_put(
         self,
@@ -1135,6 +1192,39 @@ class DatabaseSubmissionState:
         reconciliation_deadline_at: datetime,
     ) -> SubmissionLease:
         with self._session_factory() as database:
+            submission = database.get(ReimbursementSubmission, lease.submission_id)
+            if submission is None:
+                raise ReimbursementSubmissionConflict("submission disappeared")
+            snapshot = parse_snapshot(
+                submission.form_snapshot_json, expected_sha256=submission.snapshot_sha256
+            )
+            if snapshot.snapshot_version >= 2:
+                validate_draft_file_references(
+                    database,
+                    draft_id=submission.draft_id,
+                    draft_input=draft_input_from_snapshot(snapshot),
+                    require_terminal_disposition=True,
+                    require_submission_proofs=True,
+                )
+                sources = database.scalars(select(ReimbursementDraftFile).where(
+                    ReimbursementDraftFile.draft_id == submission.draft_id,
+                    ReimbursementDraftFile.file_status == ReimbursementDraftFileStatus.ACTIVE.value,
+                )).all()
+                actual = {
+                    (item.id, item.storage_key, item.size_bytes, item.sha256, item.processing_role)
+                    for item in sources
+                }
+                expected = {
+                    (item.draft_file_id, item.storage_key, item.size_bytes, item.sha256,
+                     item.processing_role)
+                    for item in snapshot.original_files
+                }
+                if actual != expected:
+                    raise ApiError(
+                        "REIMBURSEMENT_ATTACHMENT_MANIFEST_CHANGED",
+                        "待提交票据与已确认内容不一致，请重新确认",
+                        409,
+                    )
             changed = checkpoint_oa_create(
                 database,
                 lease=_quota_lease(lease),
@@ -1264,6 +1354,31 @@ class LinkedLocalFileMaintenance:
                     extra={
                         "submission_id": candidate.submission_id,
                         "upload_id": candidate.upload_id,
+                        "exception_type": type(exc).__name__,
+                    },
+                )
+        with self._session_factory() as database:
+            source_candidates = list_due_bundled_source_release_candidates(database, limit=limit)
+        for candidate in source_candidates:
+            try:
+                await asyncio.to_thread(
+                    self._staging.delete,
+                    candidate.storage_key,
+                    expected_size=candidate.size_bytes,
+                    expected_sha256=candidate.sha256,
+                    missing_ok=True,
+                )
+                with self._session_factory() as database:
+                    finalize_bundled_source_release(database, candidate=candidate, now=release_at)
+                released += 1
+            except ReimbursementSubmissionConflict:
+                continue
+            except Exception as exc:
+                logger.error(
+                    "Bundled reimbursement source could not be released",
+                    extra={
+                        "submission_id": candidate.submission_id,
+                        "draft_file_id": candidate.file_id,
                         "exception_type": type(exc).__name__,
                     },
                 )
@@ -2398,6 +2513,14 @@ def _validate_original_manifest(
     snapshot: ReimbursementSnapshot,
     uploads: Sequence[SubmissionUpload],
 ) -> None:
+    if snapshot.snapshot_version >= 2:
+        if any(item.role == ReimbursementUploadRole.ORIGINAL.value for item in uploads):
+            raise ApiError(
+                "REIMBURSEMENT_ATTACHMENT_MANIFEST_CHANGED",
+                "票据汇总提交不应包含单独原始附件",
+                409,
+            )
+        return
     originals = tuple(
         item
         for item in sorted(uploads, key=lambda value: (value.sort_order, value.id))

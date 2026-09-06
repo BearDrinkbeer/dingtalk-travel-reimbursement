@@ -45,6 +45,12 @@ def parsed_expense_payload(file_id: str, parsed: ParsedExpense) -> dict[str, obj
         "description": parsed.description,
         "amount": money_string(parsed.amount) if parsed.amount is not None else None,
         "receiptCount": 1,
+        "requiresItinerary": parsed.requires_itinerary,
+        "transportType": parsed.transport_type,
+        "originalCurrency": parsed.original_currency,
+        "originalAmount": (
+            money_string(parsed.original_amount) if parsed.original_amount is not None else None
+        ),
         "source": "ocr",
         "confidence": f"{max(0.0, min(1.0, parsed.confidence)):.2f}",
         "warnings": list(parsed.warnings),
@@ -63,6 +69,10 @@ def failed_expense_payload(file_id: str, code: str, message: str) -> dict[str, o
         "description": None,
         "amount": None,
         "receiptCount": 1,
+        "requiresItinerary": False,
+        "transportType": None,
+        "originalCurrency": None,
+        "originalAmount": None,
         "source": "ocr",
         "confidence": "0.00",
         "warnings": ["MANUAL_REVIEW_REQUIRED"],
@@ -219,6 +229,10 @@ class OcrService:
         parsed: ParsedExpense,
         lines: list[OcrLine],
     ) -> bool:
+        if parsed.receipt_type == "foreign_receipt":
+            # Foreign values deliberately leave CNY amount empty. Date/currency
+            # ambiguity requires confirmation, not another expensive OCR pass.
+            return parsed.original_amount is None
         if not cls._has_required_fields(parsed):
             return True
         if parsed.receipt_type != "invoice":

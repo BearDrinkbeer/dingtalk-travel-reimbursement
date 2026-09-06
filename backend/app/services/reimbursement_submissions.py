@@ -127,6 +127,27 @@ class LinkedLocalReleaseCandidate:
     source_draft_file_id: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class BundledSourceReleaseCandidate:
+    submission_id: str
+    file_id: str
+    storage_key: str
+    size_bytes: int
+    sha256: str
+
+
+def _require_bundle_manifest(
+    submission: ReimbursementSubmission, uploads: list[ReimbursementUpload]
+) -> None:
+    if submission.snapshot_version >= 2 and [
+        (item.role, item.sort_order) for item in sorted(uploads, key=lambda item: item.sort_order)
+    ] != [
+        (ReimbursementUploadRole.GENERATED_PDF.value, 0),
+        (ReimbursementUploadRole.GENERATED_EXCEL.value, 1),
+    ]:
+        raise ReimbursementSubmissionConflict("submission requires exactly the PDF and Excel")
+
+
 def create_submission(
     database: Session,
     *,
@@ -145,7 +166,8 @@ def create_submission(
 
     The caller must build ``form_snapshot_json`` from the same Session directly
     before this call. This function performs the draft CAS, submission insert,
-    and original-file manifest insert in one transaction, then commits it.
+    and legacy original-file manifest insert in one transaction, then commits it.
+    Version 2 source files remain draft records; only the PDF/Excel become uploads.
     """
 
     _require_actor(actor)
@@ -290,7 +312,7 @@ def create_submission(
         )
         database.add(submission)
         database.flush()
-        for manifest_order, source in enumerate(source_files):
+        for manifest_order, source in enumerate(source_files if snapshot_version == 1 else ()):
             database.add(
                 ReimbursementUpload(
                     id=new_uuid(),
@@ -643,6 +665,7 @@ def checkpoint_oa_create(
         raise ReimbursementSubmissionConflict(
             "OA create requires an original/generated upload manifest"
         )
+    _require_bundle_manifest(current, uploads)
     if any(
         item.upload_status != ReimbursementUploadStatus.COMMITTED.value for item in uploads
     ):
@@ -762,6 +785,7 @@ def mark_submission_submitted(
         raise ReimbursementSubmissionConflict(
             "submission cannot finish before every upload is linked"
         )
+    _require_bundle_manifest(current, uploads)
     values: dict[str, object] = {
         "business_id": _required_text(business_id, maximum=128),
         "approval_url": _required_text(approval_url, maximum=2048),
@@ -1398,7 +1422,7 @@ def remove_discarded_generated_upload(
     expected_status_version: int,
     now: datetime | None = None,
 ) -> bool:
-    """Remove a terminal failed Excel reservation before reserving its retry."""
+    """Remove a terminal failed generated-file reservation before its retry."""
 
     changed_at = _naive_utc(now) if now is not None else utc_now()
     upload = _require_leased_upload(
@@ -1411,7 +1435,10 @@ def remove_discarded_generated_upload(
         now=changed_at,
     )
     if (
-        upload.role != ReimbursementUploadRole.GENERATED_EXCEL.value
+        upload.role not in {
+            ReimbursementUploadRole.GENERATED_EXCEL.value,
+            ReimbursementUploadRole.GENERATED_PDF.value,
+        }
         or upload.upload_status != ReimbursementUploadStatus.DISCARDED.value
         or upload.local_status != ReimbursementUploadLocalStatus.DELETED.value
         or upload.local_deleted_at is None
@@ -1427,8 +1454,7 @@ def remove_discarded_generated_upload(
                 ReimbursementUpload.id == upload.id,
                 ReimbursementUpload.submission_id == lease.submission_id,
                 ReimbursementUpload.status_version == expected_status_version,
-                ReimbursementUpload.role
-                == ReimbursementUploadRole.GENERATED_EXCEL.value,
+                ReimbursementUpload.role == upload.role,
                 ReimbursementUpload.upload_status
                 == ReimbursementUploadStatus.DISCARDED.value,
                 ReimbursementUpload.local_status
@@ -1812,6 +1838,91 @@ def finalize_local_upload_release(
         database.rollback()
         raise
     return expected_status_version + 1
+
+
+def _bundled_source_release_query():
+    # A source is not a remote upload. Delete it only after the complete immutable
+    # two-file manifest has been read back, linked and marked SUBMITTED.
+    return (
+        select(ReimbursementDraftFile, ReimbursementSubmission)
+        .join(
+            ReimbursementSubmission,
+            ReimbursementSubmission.draft_id == ReimbursementDraftFile.draft_id,
+        )
+        .where(
+            ReimbursementSubmission.snapshot_version >= 2,
+            ReimbursementSubmission.status == ReimbursementSubmissionStatus.SUBMITTED.value,
+            ReimbursementSubmission.process_instance_id.is_not(None),
+            ReimbursementDraftFile.file_status == ReimbursementDraftFileStatus.ACTIVE.value,
+            ReimbursementDraftFile.size_bytes.is_not(None),
+            ReimbursementDraftFile.sha256.is_not(None),
+            ~exists(select(ReimbursementUpload.id).where(
+                ReimbursementUpload.submission_id == ReimbursementSubmission.id,
+                ReimbursementUpload.upload_status != ReimbursementUploadStatus.LINKED.value,
+            )),
+            exists(select(ReimbursementUpload.id).where(
+                ReimbursementUpload.submission_id == ReimbursementSubmission.id,
+                ReimbursementUpload.role == ReimbursementUploadRole.GENERATED_PDF.value,
+                ReimbursementUpload.upload_status == ReimbursementUploadStatus.LINKED.value,
+            )),
+            exists(select(ReimbursementUpload.id).where(
+                ReimbursementUpload.submission_id == ReimbursementSubmission.id,
+                ReimbursementUpload.role == ReimbursementUploadRole.GENERATED_EXCEL.value,
+                ReimbursementUpload.upload_status == ReimbursementUploadStatus.LINKED.value,
+            )),
+        )
+    )
+
+
+def list_due_bundled_source_release_candidates(
+    database: Session, *, limit: int = 100
+) -> tuple[BundledSourceReleaseCandidate, ...]:
+    _require_positive_integer(limit, name="limit")
+    if limit > 1000:
+        raise ValueError("limit must not exceed 1000")
+    rows = database.execute(
+        _bundled_source_release_query().order_by(ReimbursementDraftFile.id).limit(limit)
+    ).all()
+    candidates = []
+    for source, submission in rows:
+        # Only immutable snapshot source identities are covered by the bundle.
+        snapshot_files = json.loads(submission.form_snapshot_json).get("originalFiles", [])
+        if not any(
+            entry.get("draftFileId") == source.id
+            and entry.get("storageKey") == source.storage_key
+            and entry.get("sizeBytes") == source.size_bytes
+            and entry.get("sha256") == source.sha256
+            for entry in snapshot_files
+        ):
+            continue
+        candidates.append(BundledSourceReleaseCandidate(
+            submission.id, source.id, source.storage_key, int(source.size_bytes), str(source.sha256)
+        ))
+    database.rollback()
+    return tuple(candidates)
+
+
+def finalize_bundled_source_release(
+    database: Session, *, candidate: BundledSourceReleaseCandidate, now: datetime | None = None
+) -> None:
+    changed_at = _naive_utc(now) if now is not None else utc_now()
+    row = database.execute(_bundled_source_release_query().where(
+        ReimbursementSubmission.id == candidate.submission_id,
+        ReimbursementDraftFile.id == candidate.file_id,
+        ReimbursementDraftFile.storage_key == candidate.storage_key,
+        ReimbursementDraftFile.size_bytes == candidate.size_bytes,
+        ReimbursementDraftFile.sha256 == candidate.sha256,
+    )).first()
+    if row is None:
+        database.rollback()
+        raise ReimbursementSubmissionConflict("bundled source release candidate changed")
+    source, _submission = row
+    source.file_status = ReimbursementDraftFileStatus.PURGED.value
+    source.part_storage_key = None
+    source.reservation_expires_at = None
+    source.purged_at = changed_at
+    source.updated_at = changed_at
+    database.commit()
 
 
 def recover_expired_submission_leases(

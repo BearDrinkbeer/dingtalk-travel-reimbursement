@@ -188,8 +188,11 @@ def test_concurrent_database_reservations_admit_only_one_writer(tmp_path: Path) 
     second_engine.dispose()
 
 
-def test_generated_excel_reservation_is_owned_by_the_active_submission_lease(
+@pytest.mark.parametrize("role", [ReimbursementUploadRole.GENERATED_EXCEL,
+                                 ReimbursementUploadRole.GENERATED_PDF])
+def test_generated_reservation_is_owned_by_the_active_submission_lease(
     tmp_path: Path,
+    role: ReimbursementUploadRole,
 ) -> None:
     engine = create_database_engine(f"sqlite:///{tmp_path / 'quota.db'}")
     Base.metadata.create_all(engine)
@@ -219,7 +222,10 @@ def test_generated_excel_reservation_is_owned_by_the_active_submission_lease(
     reservation = coordinator.reserve_generated_upload(
         lease,
         sort_order=2,
-        file_name="差旅费报销单.xlsx",
+        file_name=(
+            "票据汇总.pdf" if role is ReimbursementUploadRole.GENERATED_PDF else "报销单.xlsx"
+        ),
+        role=role,
         reserved_bytes=80,
         expires_at=utc_now() + timedelta(minutes=5),
     )
@@ -227,7 +233,10 @@ def test_generated_excel_reservation_is_owned_by_the_active_submission_lease(
     with Session(engine) as database:
         upload = database.get(ReimbursementUpload, reservation.record_id)
         assert upload is not None
-        assert upload.role == ReimbursementUploadRole.GENERATED_EXCEL.value
+        assert upload.role == role.value
+        assert upload.file_type == (
+            "pdf" if role is ReimbursementUploadRole.GENERATED_PDF else "xlsx"
+        )
         assert upload.local_status == ReimbursementUploadLocalStatus.RESERVED.value
         assert upload.local_storage_key == reservation.staging.storage_key
         assert upload.local_part_storage_key == reservation.staging.part_storage_key
@@ -1326,8 +1335,11 @@ def test_delete_owned_draft_resumes_its_intent_after_storage_failure(
     engine.dispose()
 
 
+@pytest.mark.parametrize("role", [ReimbursementUploadRole.GENERATED_EXCEL,
+                                 ReimbursementUploadRole.GENERATED_PDF])
 def test_expired_reclaim_skips_an_active_submission_then_frees_its_stale_reservation(
     tmp_path: Path,
+    role: ReimbursementUploadRole,
 ) -> None:
     engine = create_database_engine(f"sqlite:///{tmp_path / 'quota.db'}")
     Base.metadata.create_all(engine)
@@ -1355,7 +1367,10 @@ def test_expired_reclaim_skips_an_active_submission_then_frees_its_stale_reserva
     reservation = coordinator.reserve_generated_upload(
         lease,
         sort_order=0,
-        file_name="差旅费报销单.xlsx",
+        file_name=(
+            "票据汇总.pdf" if role is ReimbursementUploadRole.GENERATED_PDF else "报销单.xlsx"
+        ),
+        role=role,
         reserved_bytes=70,
         expires_at=utc_now() + timedelta(minutes=1),
     )

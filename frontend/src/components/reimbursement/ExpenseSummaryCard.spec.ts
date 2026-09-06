@@ -67,7 +67,7 @@ describe('ExpenseSummaryCard', () => {
     await button.trigger('click')
 
     expect(preview).toHaveBeenCalledOnce()
-    expect(wrapper.text()).toContain('服务器会重新生成最终 Excel')
+    expect(wrapper.text()).toContain('正式提交时生成最终报销单和票据汇总 PDF')
     expect(wrapper.text()).not.toContain('生成并下载 Excel')
     wrapper.unmount()
   })

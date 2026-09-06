@@ -555,7 +555,7 @@ describe('persistent reimbursement draft store', () => {
     expect(store.loadingCurrentDraft).toBe(false)
   })
 
-  it('rejects an equal-revision failure refresh superseded by a newer mutation', async () => {
+  it('serializes the next mutation behind a failed operation and uses the refreshed revision', async () => {
     vi.mocked(createReimbursementDraft).mockResolvedValue(draft())
     const staleDraft = deferred<ReimbursementDraft>()
     const staleFiles = deferred<Awaited<ReturnType<typeof listReimbursementDraftFiles>>>()
@@ -569,7 +569,7 @@ describe('persistent reimbursement draft store', () => {
     vi.mocked(listReimbursementDraftFiles).mockReturnValue(staleFiles.promise)
     vi.mocked(recognizeReimbursementDraftFile).mockResolvedValue({
       draftId: 'draft-1',
-      revision: 2,
+      revision: 3,
       file: { ...serverFile(), ocrStatus: 'COMPLETE' },
     })
     const store = useReimbursementDraftStore()
@@ -579,7 +579,8 @@ describe('persistent reimbursement draft store', () => {
     const removing = store.removeFile('file-1')
     void removing.catch(() => undefined)
     await vi.waitFor(() => expect(getReimbursementDraft).toHaveBeenCalledOnce())
-    await store.recognizeFile('file-1', 2026)
+    const recognizing = store.recognizeFile('file-1', 2026)
+    expect(recognizeReimbursementDraftFile).not.toHaveBeenCalled()
     staleDraft.resolve(draft('draft-1', 2))
     staleFiles.resolve({
       draftId: 'draft-1',
@@ -587,8 +588,12 @@ describe('persistent reimbursement draft store', () => {
       items: [{ ...serverFile(), status: 'DELETING' }],
     })
     await expect(removing).rejects.toBe(failure)
+    await recognizing
 
-    expect(store.currentDraft?.revision).toBe(2)
+    expect(recognizeReimbursementDraftFile).toHaveBeenCalledWith(
+      'draft-1', 'file-1', { expectedRevision: 2, tripYear: 2026 }, expect.any(Object),
+    )
+    expect(store.currentDraft?.revision).toBe(3)
     expect(store.files[0]?.status).toBe('ACTIVE')
     expect(store.files[0]?.ocrStatus).toBe('COMPLETE')
   })
@@ -820,7 +825,7 @@ describe('persistent reimbursement draft store', () => {
     expect(store.files.map((file) => file.id)).toEqual(['authoritative-file'])
     expect(store.revisionConflict).toBe(false)
     expect(store.mutationError).toContain('草稿已过期')
-    expect(store.mutationError).toContain('已同步草稿最新状态')
+    expect(store.mutationError).toContain('已同步报销内容最新状态')
   })
 
   it('refreshes a non-current summary after any draft deletion failure', async () => {
@@ -857,7 +862,7 @@ describe('persistent reimbursement draft store', () => {
     expect(store.currentDraft?.revision).toBe(1)
     expect(store.files.map((file) => file.id)).toEqual(['current-file'])
     expect(store.mutationError).toContain('删除结果确认失败')
-    expect(store.mutationError).toContain('已同步草稿最新状态')
+    expect(store.mutationError).toContain('已同步报销内容最新状态')
   })
 
   it('tombstones a draft opened after its non-current deletion began', async () => {
@@ -1073,7 +1078,7 @@ describe('persistent reimbursement draft store', () => {
     expect(store.files[0]?.status).toBe('DELETING')
     expect(store.revisionConflict).toBe(false)
     expect(store.mutationError).toContain('文件物理清理失败')
-    expect(store.mutationError).toContain('已同步草稿最新状态')
+    expect(store.mutationError).toContain('已同步报销内容最新状态')
   })
 
   it('reloads authoritative state after an upload failure without replaying upload', async () => {
@@ -1097,7 +1102,7 @@ describe('persistent reimbursement draft store', () => {
     expect(store.currentDraft?.revision).toBe(2)
     expect(store.files.map((file) => file.id)).toEqual(['reserved-file'])
     expect(store.mutationError).toContain('票据文件处理超过资源限制')
-    expect(store.mutationError).toContain('已同步草稿最新状态')
+    expect(store.mutationError).toContain('已同步报销内容最新状态')
   })
 
   it('reloads authoritative state after an OCR failure without replaying OCR', async () => {
@@ -1124,7 +1129,7 @@ describe('persistent reimbursement draft store', () => {
     expect(store.currentDraft?.revision).toBe(2)
     expect(store.files[0]?.ocrStatus).toBe('FAILED')
     expect(store.mutationError).toContain('票据识别超时，请手工填写')
-    expect(store.mutationError).toContain('已同步草稿最新状态')
+    expect(store.mutationError).toContain('已同步报销内容最新状态')
   })
 
   it('reset aborts in-flight upload and ignores a late successful response', async () => {

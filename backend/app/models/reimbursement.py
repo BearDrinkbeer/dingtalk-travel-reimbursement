@@ -85,6 +85,7 @@ class ReimbursementSubmissionStatus(StrEnum):
 class ReimbursementUploadRole(StrEnum):
     ORIGINAL = "ORIGINAL"
     GENERATED_EXCEL = "GENERATED_EXCEL"
+    GENERATED_PDF = "GENERATED_PDF"
 
 
 class ReimbursementUploadStatus(StrEnum):
@@ -545,6 +546,13 @@ class ReimbursementUpload(Base):
             sqlite_where=text("role = 'GENERATED_EXCEL'"),
             postgresql_where=text("role = 'GENERATED_EXCEL'"),
         ),
+        Index(
+            "uq_reimbursement_uploads_generated_pdf",
+            "submission_id",
+            unique=True,
+            sqlite_where=text("role = 'GENERATED_PDF'"),
+            postgresql_where=text("role = 'GENERATED_PDF'"),
+        ),
         UniqueConstraint(
             "local_storage_key",
             name="uq_reimbursement_uploads_local_storage_key",
@@ -567,7 +575,8 @@ class ReimbursementUpload(Base):
         ),
         CheckConstraint(
             "(role = 'ORIGINAL' AND source_draft_file_id IS NOT NULL) OR "
-            "(role = 'GENERATED_EXCEL' AND source_draft_file_id IS NULL)",
+            "(role IN ('GENERATED_EXCEL', 'GENERATED_PDF') "
+            "AND source_draft_file_id IS NULL)",
             name="ck_reimbursement_uploads_source_role",
         ),
         CheckConstraint("sort_order >= 0", name="ck_reimbursement_uploads_sort_order"),
@@ -1118,7 +1127,32 @@ _SQLITE_REIMBURSEMENT_SAFETY_TRIGGERS = (
     """,
 )
 
-for _trigger_ddl in _SQLITE_REIMBURSEMENT_SAFETY_TRIGGERS:
+_SQLITE_BUNDLE_MANIFEST_TRIGGERS = tuple(
+    f"""
+    CREATE TRIGGER trg_reimbursement_submissions_bundle_manifest_{operation.lower()}
+    BEFORE {operation} ON reimbursement_submissions
+    WHEN NEW.snapshot_version >= 2 AND NEW.status = 'SUBMITTED'
+         AND (
+             (SELECT count(*) FROM reimbursement_uploads WHERE submission_id = NEW.id) != 2
+             OR NOT EXISTS (
+                 SELECT 1 FROM reimbursement_uploads
+                 WHERE submission_id = NEW.id AND role = 'GENERATED_PDF'
+                   AND sort_order = 0 AND upload_status = 'LINKED'
+             )
+             OR NOT EXISTS (
+                 SELECT 1 FROM reimbursement_uploads
+                 WHERE submission_id = NEW.id AND role = 'GENERATED_EXCEL'
+                   AND sort_order = 1 AND upload_status = 'LINKED'
+             )
+         )
+    BEGIN
+        SELECT RAISE(ABORT, 'submitted reimbursement requires PDF and Excel');
+    END
+    """
+    for operation in ("INSERT", "UPDATE")
+)
+
+for _trigger_ddl in _SQLITE_REIMBURSEMENT_SAFETY_TRIGGERS + _SQLITE_BUNDLE_MANIFEST_TRIGGERS:
     event.listen(
         ReimbursementUpload.__table__,
         "after_create",

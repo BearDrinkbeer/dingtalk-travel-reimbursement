@@ -1,18 +1,20 @@
 # 钉钉 OA 差旅报销集成设计
 
-文档状态：与当前实现对齐，生产验收前基线；数据库迁移基线：`20260904_0011`；适用技术栈：Vue 3 + TypeScript、FastAPI、SQLite、钉钉企业内部应用。
+文档状态：与当前实现对齐，生产验收前基线；数据库迁移基线：`20260906_0012`；适用技术栈：Vue 3 + TypeScript、FastAPI、SQLite、钉钉企业内部应用。
 
 ## 1. 要实现的结果
 
 员工从钉钉工作台打开“智能差旅报销”，在一个页面内完成以下事情：
 
-1. 选择所属公司、预算代码和报销项目；
+1. 选择钉钉表单提供的所属公司和预算代码；预算代码的完整显示文字就是 Excel 内的项目；
 2. 选择发票、车票、行程单等原始文件并上传一次；
-3. 检查并修改 OCR 生成的费用明细；
+3. 在同一份费用列表内检查、修改和预览票据，为网约车费用选择对应行程单；国外票据另行确认人民币报销金额；
 4. 从本人已通过的出差审批中选择需要关联的审批单；
 5. 点击一次“确认并提交到钉钉 OA”。
 
-点击确认后，服务器锁定这次填写的数据，重新计算金额并生成最终报销 Excel。服务器把员工上传的原始文件和这个 Excel 一起传到钉钉审批附件空间，然后一次性创建正式的“差旅费报销申请”。关联出差审批写入钉钉的关联审批控件，原始文件和 Excel 写入同一个附件控件。
+页面自动保存尚未填完的内容，重新打开时恢复最近一笔报销或它的提交结果。员工只需填写和最终确认；提交成功后可点击“再报销一笔”。
+
+点击确认后，服务器先保存最新填写内容，再锁定数据、重新计算金额，生成最终报销 Excel，并把发票、行程单等材料合成 `票据汇总.pdf`。服务器将这两个文件上传到钉钉审批附件空间，一次性创建正式的“差旅费报销申请”。出差审批写入关联审批控件；同一个附件控件中只有“票据汇总 PDF + 报销单 Excel”两份文件，便于下载打印。
 
 员工不需要下载 Excel，也不需要再手工选择 Excel 上传。Windows、macOS、Android 和 iOS 使用的都是同一套 H5 流程；设备只负责第一次选择本机文件，后续生成、上传和发起 OA 都由服务器完成。
 
@@ -22,8 +24,10 @@
 
 | 名词 | 简单解释 |
 |---|---|
-| 报销草稿 | 员工提交前保存在本系统里的报销内容，不是钉钉 OA 草稿 |
+| 本次报销内容 | 系统自动保存的填写内容；服务端为兼容已有接口仍使用 `draftId` 和 `reimbursement_drafts` 命名 |
 | 报销 Excel | 本系统根据员工最终确认的数据生成的 `.xlsx` 文件 |
+| 票据汇总 PDF | 根据原始票据、关联行程单和其他材料合成的打印文件；页面内容来自原件，不是 OCR 重排文字 |
+| 行程单关联 | 某一笔费用保存对应材料的文件 ID，由员工选择；与钉钉“关联出差审批”是两个独立关系 |
 | `processCode` | 一类钉钉审批模板的标识，例如“差旅费报销申请”模板的标识 |
 | `processInstanceId` | 某一张已经发起的具体审批单的唯一标识 |
 | Schema | 钉钉审批模板的字段说明，包括字段 ID、类型和选项 |
@@ -45,9 +49,9 @@
 flowchart LR
     U[员工] -->|钉钉工作台打开| H[智能差旅报销 H5]
     H -->|同源 HTTPS API| S[FastAPI 服务器]
-    S --> DB[(SQLite<br/>草稿、快照、任务、检查点)]
-    S --> FS[(持久暂存卷<br/>原始文件、生成 Excel)]
-    S --> OCR[本地 OCR 与 Excel 生成]
+    S --> DB[(SQLite<br/>填写内容、快照、任务、检查点)]
+    S --> FS[(持久暂存卷<br/>原始文件、汇总 PDF、Excel)]
+    S --> OCR[本地 OCR、PDF 合并与 Excel 生成]
     S -->|组织身份、Workflow、Storage API| D[钉钉开放平台]
     D -->|创建审批实例、保存表单和文件引用| OA[钉钉原生 OA]
     OA -->|实例详情、状态、表单和附件| D
@@ -57,8 +61,8 @@ flowchart LR
 
 这里有两份不同位置的文件：
 
-- 服务器持久暂存卷保存员工上传的原件和待提交的 Excel，用于重启恢复；
-- 钉钉审批附件空间保存完成 commit 的远端文件，OA 表单通过 `spaceId/fileId` 引用它们。
+- 服务器持久暂存卷保存员工上传的原件和生成的 PDF、Excel，用于预览和重启恢复；
+- 钉钉审批附件空间保存完成 commit 的汇总 PDF、Excel，OA 表单通过 `spaceId/fileId` 引用这两份文件。
 
 钉钉公开接口没有给这类审批空间一个可以可靠对外展示的“个人盘”或“公司盘”名称。产品页面只称它为“审批附件空间”，也不要求员工进入钉盘操作。
 
@@ -78,10 +82,10 @@ sequenceDiagram
     D-->>S: 返回已验证身份
     S-->>H: 建立 HttpOnly Session，必要时选择部门
 
-    H->>S: 读取 OA 选项和本人的草稿
+    H->>S: 读取 OA 选项，恢复最近报销或自动准备空表
     S->>D: 读取已确认模板的 Schema
     D-->>S: 返回模板字段与选项
-    S-->>H: 返回所属公司、预算代码和模板信息
+    S-->>H: 返回所属公司、预算代码和已保存内容
 
     H->>S: 查询本人已通过的出差审批
     S->>D: 按允许的出差 processCode 查询实例 ID
@@ -100,21 +104,22 @@ sequenceDiagram
     end
     S-->>H: 返回可修改费用明细
 
-    U->>H: 修改明细并选择出差审批
-    H->>S: 保存草稿和关联审批
+    U->>H: 修改明细、关联行程单并选择出差审批
+    H->>S: 自动保存当前输入和关联审批
     S->>D: 重新证明审批属于本人且仍已通过
     D-->>S: 返回最新实例详情
     S-->>H: 返回新 revision
 
     U->>H: 点击“确认并提交到钉钉 OA”
+    H->>S: 等待并完成最新输入的自动保存
     H->>S: 标记 REVIEW_READY
     H->>S: POST draftId + expectedRevision + Idempotency-Key
-    S->>S: 原子锁定草稿并保存不可变快照
+    S->>S: 校验材料和金额确认，锁定不可变快照
     S-->>H: 202 + submissionId + 当前状态
 
-    S->>S: 后台校验快照并生成最终 Excel
+    S->>S: 后台校验快照，生成票据汇总 PDF 和最终 Excel
     S->>D: 取得审批附件空间
-    loop 原始附件在前，Excel 在最后
+    loop 仅两份文件：票据汇总 PDF 在前，Excel 在后
         S->>D: 申请短时上传信息
         S->>D: 使用签名 URL PUT 文件字节
         S->>D: commit 文件
@@ -141,13 +146,14 @@ sequenceDiagram
 H5 负责员工看得见的交互：
 
 - 钉钉免登和多部门选择；
-- 创建、保存、恢复和切换报销草稿；
-- 展示从模板读取的所属公司、预算代码；
+- 自动准备和恢复本次报销，自动保存未完成的输入并显示保存状态；
+- 展示从模板读取的所属公司、预算代码，用预算代码标签填 Excel 项目；
 - 选择本地原始文件；
 - 把票据/发票标为 `EXPENSE_SOURCE`，把行程单等只需附上的材料标为 `ATTACHMENT_ONLY`；
-- 展示 OCR 候选结果，允许修改或手工增加费用行；
+- 在单一费用列表展示 OCR 候选、来源票据、关联行程单及一组编辑/重新识别/删除操作；允许手工增加费用行；
+- 为网约车选择对应行程单；展示国外票据原币信息并要求确认人民币报销金额；
 - 查询并选择本人已通过的出差审批；
-- 下载“当前已保存草稿”的 Excel 预览；
+- 通过鉴权接口预览已上传文件，下载当前内容的 Excel 预览；
 - 在正式提交前给出不可撤销提示；
 - 展示后台进度、最终 OA 编号和打开入口。
 
@@ -163,7 +169,8 @@ H5 不取得企业 access token，不保存 `Client Secret`，不调用钉钉服
 - 查询、复核并冻结关联出差审批；
 - 安全接收并持久保存原始文件；
 - 后端重新计算补助、总额、票据数和人民币大写；
-- 根据锁定快照生成最终 Excel；
+- 校验费用与行程单文件关系、必填字段和人民币金额确认；
+- 根据锁定快照生成最终 Excel 和票据汇总 PDF；
 - 申请上传信息、PUT、commit、创建 OA 和回读 OA；
 - 保存幂等记录、状态、租约和每一个危险远端操作前的检查点；
 - 自动重试安全操作，处理确定的孤儿文件，对不确定结果停止自动写操作；
@@ -198,15 +205,19 @@ H5 不取得企业 access token，不保存 `Client Secret`，不调用钉钉服
 | `description` | 明细说明 | `TextField` 或 `TextareaField` | 费用行、补助和合计的服务器格式化结果 |
 | `reimbursementAmount` | 报销金额 | `MoneyField` 或 `NumberField` | 服务器计算总额 |
 | `relatedApprovals` | 关联审批单 | `RelateField` | 已复核的出差 `processInstanceId` 数组 |
-| `attachments` | 附件 | `DDAttachment` | 原始附件和最终 Excel 的远端文件元数据 |
+| `attachments` | 附件 | `DDAttachment` | 票据汇总 PDF、最终 Excel 的远端文件元数据 |
 
 前端显示的所属公司和预算代码来自已确认 Schema，不能写死测试企业的选项或控件 ID。
+
+`budgetCodeValue` 保存精确选项值，服务器从当前绑定 Schema 取得对应完整标签，作为 Excel 的项目文字。表单内的预算代码和 Excel 项目始终来自同一次选择，页面无需另设项目输入或项目管理入口。完整标签可达 2048 字符，Excel 项目栏按内容扩展；文件名中的项目部分单独限长。
 
 ### 6.3 模板变更保护
 
 `oa_template_profiles` 保存配置版本、完整 Schema、字段映射、确认指纹、允许的出差模板和确认人。草稿创建时绑定当时的 `processCode + configVersion + schemaFingerprint`。
 
 正式提交前后台还会重新读取报销模板和所用出差模板。指纹变化时，系统在上传任何钉钉文件之前终止这次提交，要求管理员重新检查映射，避免把金额或附件写进错误字段。已绑定旧配置的可编辑草稿不会静默改成新模板。
+
+管理员已确认新模板后，若本次填写内容尚未锁定、也没有正在跟踪的提交，但绑定的 `processCode/configVersion/schemaFingerprint` 与当前配置不同，页面提供“按新表单重新填写”。员工明确确认后准备一笔绑定新配置的空白报销；原记录和已上传材料保留，员工重新填写及上传，避免把未经适配的数据直接带入新表单。
 
 管理员接口见 [OA 模板目录 API](../backend/app/api/oa_templates.py)，字段契约见 [模板适配服务](../backend/app/services/oa_template_profiles.py)。
 
@@ -262,13 +273,19 @@ AND 开始、结束日期能从已映射控件准确读取
 
 这里不能使用审批编号 `businessId`，也不能使用模板的 `processCode`。
 
-## 8. 草稿、原始文件、OCR 和 Excel
+## 8. 自动保存、票据明细和生成文件
 
-### 8.1 草稿
+### 8.1 自动保存和恢复
 
-报销草稿持久保存在 SQLite，按企业、员工和所选部门隔离。每次修改都必须带 `expectedRevision`。版本不一致时返回冲突，前端重新读取服务器状态，不能盲目重放写请求。
+填写内容持久保存在 SQLite，按企业、员工和所选部门隔离。页面进入时自动准备空白报销或恢复最近记录；已提交的记录恢复进度或成功结果，避免刷新产生新审批。员工编辑后约 600 毫秒触发自动保存，上传、文件修改和表单写入串行使用最新 `expectedRevision`，避免同一页面相互覆盖。
 
-草稿状态：
+公司和预算尚未选择、费用缺少日期/金额、补助日期时间尚未填完时也允许保存。`editingState` 保存未完成的输入文字；计算只使用完整费用行，Excel 预览和正式提交则要求所需字段完整。保存失败时页面保留当前输入并显示原因，不能把仍在本页的修改显示成已持久保存。提交会等待最新内容保存完成后再锁定。
+
+每次修改都必须带 `expectedRevision`。不同页面写入导致版本冲突时重新读取服务器状态，不盲目重放写请求。`draftId` 只是后台定位本次填写内容的标识；页面提供“正在保存 / 已保存 / 保存失败”和成功后的“再报销一笔”。
+
+提交明确终止为 `FAILED_FINAL` 时，可点击“重新填写”开始一笔空白报销，失败记录和审计历史继续保留。处理中或结果不确定的提交继续跟踪原任务，不能通过这个入口重建审批。
+
+内部状态：
 
 ```text
 DRAFT --检查完整性--> REVIEW_READY --正式提交原子锁定--> LOCKED
@@ -280,34 +297,52 @@ DRAFT / REVIEW_READY --超过 expiresAt--> EXPIRED
 
 `REVIEW_READY` 只是“内容已检查，可以提交”，仍不是钉钉 OA。任何修改会增加 revision 并回到 `DRAFT`。创建提交记录时，草稿、提交快照和原始附件清单在一个数据库事务中写入，草稿同时变成 `LOCKED`。
 
-### 8.2 文件角色和保存位置
+### 8.2 文件角色、预览和保存位置
 
 - `EXPENSE_SOURCE`：发票、车票等需要 OCR 的票据；
-- `ATTACHMENT_ONLY`：行程单等只需随 OA 一起提交的材料，不执行 OCR。
+- `ATTACHMENT_ONLY`：行程单等证明材料，可关联到费用行，最终进入汇总 PDF；当前由员工明确选择对应关系。
 
-当前持久文件允许 `jpg/jpeg/png/pdf`，单文件默认上限 20 MiB。前端允许一次选择多份，但逐份调用上传接口；服务器先做扩展名、magic bytes、图片或 PDF 内容检查，再把文件放入受控持久暂存卷。存储路径只使用服务器生成的 UUID，不使用原文件名作为路径。
+当前持久文件允许 `jpg/jpeg/png/pdf`，单文件默认上限 20 MiB。`EXPENSE_SOURCE` 的 PDF 保持独立单页票据；`ATTACHMENT_ONLY` 的 PDF 最多 30 页，可包含多段行程。前端允许一次选择多份，但逐份调用上传接口；服务器先做扩展名、magic bytes、图片或 PDF 内容检查，再把文件放入受控持久暂存卷。存储路径只使用服务器生成的 UUID，不使用原文件名作为路径。
 
-数据库保存大小和 SHA-256。后续 OCR、生成快照和远端上传每次都按这两个值重新核对文件，避免磁盘内容被替换。持久页面恢复后只显示文件名和状态，不伪造已经失效的浏览器本地预览。
+数据库保存大小和 SHA-256。后续预览、OCR、生成快照和汇总材料每次都按这两个值重新核对文件，避免磁盘内容被替换。刷新后的预览通过 `GET /api/reimbursements/drafts/{draftId}/files/{fileId}/content` 重新取得内容；接口校验企业、员工、部门、文件状态和有效期，响应禁止缓存。前端使用 Blob 展示图片/PDF，关闭预览时释放对象 URL。
 
 ### 8.3 OCR 和费用明细
 
 `EXPENSE_SOURCE` 上传后可调用持久 OCR 接口。服务器保存的是页面需要的结构化候选结果和状态：`NOT_REQUESTED/RUNNING/COMPLETE/FAILED`。每条由 OCR 产生的费用行都通过 `sourceFileId` 保存来源文件 ID，不用金额、日期或说明文字反推关系。重新识别更新同一条候选，不重复增加明细；员工已经手工修改的费用行不会被迟到的 OCR 响应覆盖。
 
-对于每一份已完成或识别失败的 `EXPENSE_SOURCE`，草稿必须明确二选一：关联到一条费用明细，或记录为员工明确不计入明细。从费用明细中移除 OCR 行时保留原始附件并记录不计入；员工可以显式重新加入。`ATTACHMENT_ONLY` 不参与这项费用去向检查。
+费用列表集中呈现票据、费用字段、关联行程单和操作；上传中、识别失败或尚未计入费用的材料也在同一区域展示。每份已完成或识别失败的 `EXPENSE_SOURCE` 在正式提交前必须明确二选一：关联到一条费用明细，或由员工明确选择仅作为材料保留。删除费用行和删除文件保持明确语义；附件删除会同步清理对应来源或行程单引用，缺少必要行程单的费用重新进入待补齐状态。
 
-草稿输入使用 `ocrDispositionVersion` 区分这套规则，当前版本为 `1`。历史草稿缺少该字段时按版本 `0` 读取，不会被默默当成新版本。版本 `0` 只在一条历史费用行与一份 OCR 候选的 `category/date/displayDate/description/amount/receiptCount` 六个字段全部相同，且费用行与候选两侧都是唯一一对一匹配时，才自动补上 `sourceFileId`。任一字段被编辑、不匹配或缺失，以及一对多/多对一歧义，都保持为“未决定”，既不自动增加费用行，也不自动忽略。
+输入使用 `ocrDispositionVersion=1`，每个活动的终态 `EXPENSE_SOURCE` 在费用行 `sourceFileId` 或 `dismissedOcrFileIds` 中恰好出现一处。自动保存允许尚未决定的材料，完整性检查和正式提交会阻止静默漏报；网络丢失 OCR 回包后可按文件 ID 恢复候选，不重复增加金额。
 
-页面对每一份“未决定”的终态 `EXPENSE_SOURCE` 明确显示“添加到费用明细”和“忽略此票据”。选择忽略只把文件 ID 写入 `dismissedOcrFileIds`，原始文件仍作为 OA 附件；所有票据都明确决定前，前端禁止保存、进入复核和正式提交。后端对版本 `0` 的直接保存或复核请求也执行同一个唯一精确匹配；只要仍有未决定票据，就返回 `REIMBURSEMENT_DRAFT_NOT_READY`，防止绕过页面造成静默漏报。全部决定后才持久为版本 `1`。
+历史缺少去向版本的记录只在费用行与候选的六个计算字段完全一致、且双方唯一匹配时补充来源 ID；歧义保留给员工确认。该兼容处理不改变已锁定提交快照。
 
-版本 `1` 中，`COMPLETE/FAILED` 的活动 `EXPENSE_SOURCE` 必须恰好出现在“费用行的来源文件 ID”或 `dismissedOcrFileIds` 其中一处，不能两处都有，也不能两处都没有。新版本中如果 OCR 成功回包在网络中丢失，刷新后可按持久的文件 ID 恢复唯一候选，不会生成第二条费用行。
+### 8.4 网约车费用与行程单
 
-删除原始文件或把它改为 `ATTACHMENT_ONLY` 时，版本 `1` 使用持久的 `sourceFileId` 原子清理对应费用行和不计入记录；版本 `0` 先对这一份目标文件执行相同的唯一精确匹配，再与文件变更一起原子移除匹配行。如果还有其他无法判定的历史候选，草稿仍保留版本 `0`，不会因删除一份文件而自动增加、忽略或重新关联其他票据。
+- 费用行通过 `itineraryFileIds` 保存员工选择的行程单，可选择一份或多份活动的 `ATTACHMENT_ONLY` 文件。
+- `requiresItinerary=true` 或 `transportType=ride_hailing` 的费用必须关联至少一份行程单；前端提示缺失位置，后端复核和正式提交再次检查。
+- 后端结合来源票据的实际 OCR 类型和标记判断要求，前端把开关改成 `false` 不能绕过。纸质出租车小票、火车票、住宿票据按对应类型处理。
+- 同一份多行程 PDF 可由多笔费用分别明确选择；系统检查文件归属与关联存在，不宣称已自动识别每个订单并证明金额一一对应。
+- 关联文件必须属于同一笔报销，且仍为活动证明材料；删除或改变角色后关联失效，补齐后才能提交。
 
-OCR 只辅助填写。正式金额、补助、总额、票据数和人民币大写始终由服务器从保存后的费用数据重新计算。
+### 8.5 出租车与国外票据识别
 
-### 8.4 Excel 预览与最终 Excel
+数字 PDF 优先读取原生文本，必要时使用本地 PaddleOCR。纸质出租车小票通过专门解析器提取乘车日期和车费，区分单价、里程与实付金额；国外票据结合币种、Total 等字段尽力读取原币总额和日期，住宿材料可归为住宿费。识别和字段规则在本地完成，员工始终可以修正。
 
-“预览 Excel”只针对当前已保存 revision，生成后下载给员工检查，不会进入提交清单。正式提交时后台从不可变快照重新生成一份最终 Excel，并校验 Excel 模板 SHA-256。最终 Excel 进入持久暂存区，再由服务器直接上传到钉钉；员工无需手工处理它。
+国外票据的 `originalCurrency/originalAmount` 与人民币报销 `amount` 分开保存。OCR 不把外币数值直接写进人民币金额；员工填写人民币报销金额并确认 `cnyAmountConfirmed=true` 后才能提交。只出现 `$`、混合币种或日期顺序不明确时，保留相应警告和空值，不能猜成某个币种或日期。即使币种暂时未知，只要来源类型为 `foreign_receipt`、包含外币确认警告或 `requiresCnyConfirmation=true`，后端仍要求人民币金额确认。
+
+OCR 只辅助填写，无法保证所有国家、语言和拍摄质量下准确。扩展使用现有本地识别模型和轻量字段规则；实际速度包含上传、图片大小、进程启动与识别时间，应在目标服务器用业务样本测量。正式金额、补助、总额、票据数和人民币大写由服务器从员工确认后的费用数据重新计算。
+
+### 8.6 Excel 预览与最终 Excel
+
+“预览 Excel”先保存最新输入，再按该 revision 生成文件供员工下载检查；正式提交时后台从不可变快照重新生成最终 Excel，并校验模板 SHA-256。项目栏取所选预算代码完整标签，金额为确认后的人民币数值。最终文件进入持久暂存区，由服务器直接上传钉钉。
+
+### 8.7 票据汇总 PDF
+
+服务器按快照顺序合并：每笔费用的来源发票，紧接该笔选择的行程单，最后加入其余材料。同一个文件 ID 被多次引用时只放入一次；不同上传文件即使字节相同也分别保留。
+
+原始 PDF 按页面复制内容，保留页面尺寸、旋转、文字和图像；照片按 EXIF 方向纠正后等比放到 A4 页面，透明背景转白，保留完整图片边界。汇总内容直接来自原件而非 OCR 重排，便于保留印章、二维码和版面。合并结果用于阅读打印，不承诺保留原 PDF 的数字签名效力。
+
+汇总文件固定名为 `票据汇总.pdf`，最多 500 页并受服务端单对象容量限制。生成失败或超限时明确报错；生成成功后与 Excel 一同持久化，重试复用已有生成文件。两份文件均从 OA 回读确认前保留原始材料。
 
 ## 9. 正式提交的服务器流程
 
@@ -320,14 +355,17 @@ OCR 只辅助填写。正式金额、补助、总额、票据数和人民币大�
 - 企业、员工 `userId/unionId`、姓名和部门；
 - 报销模板配置版本、Schema、指纹和 10 个字段映射；
 - 员工确认的输入、服务器计算结果和 OA 字段值；
+- 预算代码对应的完整项目标签、费用与行程单关联、原币信息和人民币金额确认；
 - 已复核出差审批及其日期、模板和查询窗口；
 - 原始附件顺序、角色、存储键、大小、类型和 SHA-256；
-- Excel 模板 SHA-256、最终文件名；
-- `snapshotVersion=1` 和整个规范 JSON 的 SHA-256。
+- Excel 模板 SHA-256、生成文件名及 PDF 材料顺序；
+- `snapshotVersion=2` 和整个规范 JSON 的 SHA-256。
 
 后台只使用这份快照，不再读取前端当前表单作为权威数据。数据库触发器禁止在提交创建后修改快照。
 
-### 9.2 上传原始文件和 Excel
+已存在的版本 `1` 快照仍按其原有冻结请求恢复；升级不会重写历史快照、改变已提交 OA 或把恢复任务转成一张新审批。
+
+### 9.2 上传汇总 PDF 和 Excel
 
 每个文件执行相同的三段流程：
 
@@ -335,14 +373,14 @@ OCR 只辅助填写。正式金额、补助、总额、票据数和人民币大�
 2. 对钉钉返回的短时 HTTPS 签名地址执行 `PUT`；
 3. 调用 commit，取得正式的 `spaceId/fileId/fileName/fileSize/fileType`。
 
-附件清单严格保持“所有原始文件在前，生成的 Excel 在最后”。钉钉可能因重名自动改名，因此 OA 中使用 commit 返回的最终文件名。
+新提交的附件清单严格为两项：`GENERATED_PDF` 在前，`GENERATED_EXCEL` 在后；上传之前先生成并保存两份文件。原件保留在服务器作为汇总来源。钉钉可能因重名自动改名，因此 OA 中使用 commit 返回的最终文件名。
 
 写入 `DDAttachment` 的值是整个数组的 JSON 字符串，例如：
 
 ```json
 {
   "name": "附件",
-  "value": "[{\"spaceId\":\"...\",\"fileId\":\"...\",\"fileName\":\"发票.pdf\",\"fileSize\":12345,\"fileType\":\"pdf\"},{\"spaceId\":\"...\",\"fileId\":\"...\",\"fileName\":\"差旅费报销单-员工-项目.xlsx\",\"fileSize\":12000,\"fileType\":\"xlsx\"}]",
+  "value": "[{\"spaceId\":\"...\",\"fileId\":\"...\",\"fileName\":\"票据汇总.pdf\",\"fileSize\":12345,\"fileType\":\"pdf\"},{\"spaceId\":\"...\",\"fileId\":\"...\",\"fileName\":\"差旅费报销单-员工-预算代码.xlsx\",\"fileSize\":12000,\"fileType\":\"xlsx\"}]",
   "id": "从已确认 Schema 取得的控件ID",
   "componentType": "DDAttachment"
 }
@@ -449,23 +487,26 @@ Workflow 适配代码见 [workflow.py](../backend/app/integrations/dingtalk/work
 | `GET /api/oa/reimbursements/options` | 返回员工可选的公司、预算和出差模板信息 |
 | `GET /api/oa/travel-approvals?from=&to=&q=` | 查询当前员工本人已通过的出差审批 |
 
-### 11.3 草稿和持久文件
+### 11.3 自动保存和持久文件
+
+`drafts` 为服务端 API 名称，下列创建、恢复、保存和复核由页面自动调用。
 
 | 方法与路径 | 用途 |
 |---|---|
-| `POST /api/reimbursements/drafts` | 创建草稿；请求的 `expectedRevision` 必须为 `0` |
-| `GET /api/reimbursements/drafts` | 分页列出当前员工、当前部门的草稿 |
-| `GET /api/reimbursements/drafts/{draftId}` | 读取草稿详情、计算结果和已关联审批 |
-| `PUT /api/reimbursements/drafts/{draftId}` | 按 `expectedRevision` 保存输入 |
+| `POST /api/reimbursements/drafts` | 自动准备空白报销；请求的 `expectedRevision` 必须为 `0` |
+| `GET /api/reimbursements/drafts` | 查找当前员工、当前部门最近的报销内容用于恢复 |
+| `GET /api/reimbursements/drafts/{draftId}` | 恢复填写内容、计算结果和已关联审批 |
+| `PUT /api/reimbursements/drafts/{draftId}` | 按 `expectedRevision` 自动保存完整或未完成的输入 |
 | `DELETE /api/reimbursements/drafts/{draftId}?expectedRevision=` | 删除未锁定草稿及其本地文件 |
 | `PUT /api/reimbursements/drafts/{draftId}/related-approvals` | 远端复核并原子替换关联审批 |
 | `POST /api/reimbursements/drafts/{draftId}/review` | 检查完整性并标记 `REVIEW_READY` |
 | `GET /api/reimbursements/drafts/{draftId}/files` | 读取持久附件清单 |
+| `GET /api/reimbursements/drafts/{draftId}/files/{fileId}/content` | 鉴权后返回图片/PDF 原件用于预览；校验归属、有效期和文件哈希 |
 | `POST /api/reimbursements/drafts/{draftId}/files?expectedRevision=&role=` | 上传一份持久原始文件 |
 | `PATCH /api/reimbursements/drafts/{draftId}/files/{fileId}` | 按 revision 修改文件名或角色 |
 | `DELETE /api/reimbursements/drafts/{draftId}/files/{fileId}?expectedRevision=` | 删除一份未锁定草稿文件 |
 | `POST /api/reimbursements/drafts/{draftId}/files/{fileId}/ocr` | 对一份 `EXPENSE_SOURCE` 文件识别或重试 |
-| `POST /api/reimbursements/drafts/{draftId}/excel-preview` | 从当前保存的 revision 生成预览下载 |
+| `POST /api/reimbursements/drafts/{draftId}/excel-preview` | 页面保存最新输入后，从对应 revision 生成预览下载 |
 
 ### 11.4 正式提交和恢复
 
@@ -550,7 +591,7 @@ stateDiagram-v2
     MANUAL_REVIEW --> [*]
 ```
 
-员工看到的 12 个状态是：
+后台保留的 12 个状态如下，员工页面展示对应中文进度：
 
 `QUEUED`、`VALIDATING`、`GENERATING_EXCEL`、`UPLOADING`、`OA_CREATING`、`VERIFYING`、`FAILED_RETRYABLE`、`RECONCILING`、`ORPHAN_CLEANUP`、`SUBMITTED`、`FAILED_FINAL`、`MANUAL_REVIEW`。
 
@@ -601,12 +642,13 @@ SQLite CAS、唯一约束和触发器共同保证：
 - 提交快照、幂等键哈希和 OA 创建请求在危险边界后不可修改；
 - `SUBMITTED` 是不可逆终态；
 - `SUBMITTED` 必须正好有一份生成 Excel，且全部附件都是 `LINKED`；
+- 版本 `2` 的 `SUBMITTED` 还必须恰好有两条上传记录：顺序 `0` 的 `GENERATED_PDF` 和顺序 `1` 的 `GENERATED_EXCEL`，二者均为 `LINKED`；
 - 已提交任务不能增加、删除或改变附件清单；
 - 已进入远端清理的任务不能再写入 OA 实例；
 - 已关联 OA 的文件不能进入孤儿清理；
 - 本地文件只有在已关联、已清理或确定安全丢弃时才能记为删除。
 
-实现见 [提交状态服务](../backend/app/services/reimbursement_submissions.py)、[OA 编排和 worker](../backend/app/services/oa_reimbursement.py) 与 [0011 迁移](../backend/migrations/versions/20260904_0011_submission_snapshots.py)。
+实现见 [提交状态服务](../backend/app/services/reimbursement_submissions.py)、[OA 编排和 worker](../backend/app/services/oa_reimbursement.py)、[0011 快照迁移](../backend/migrations/versions/20260904_0011_submission_snapshots.py) 与 [0012 汇总附件迁移](../backend/migrations/versions/20260906_0012_receipt_bundle.py)。0012 保留已有快照；一旦存在版本 2 提交或生成 PDF 的审计记录，降级会拒绝执行，应按已验证备份恢复流程处理。
 
 ## 13. 文件保留和清理规则
 
@@ -614,7 +656,7 @@ SQLite CAS、唯一约束和触发器共同保证：
 
 | 最终情况 | 本地处理 |
 |---|---|
-| `SUBMITTED`，全部附件已在 OA 回读并标为 `LINKED` | 后台删除原始文件和生成 Excel；原草稿文件记为 `PURGED`，上传本地状态记为 `DELETED` |
+| 版本 2 为 `SUBMITTED`，汇总 PDF 和 Excel 均已从 OA 回读并标为 `LINKED` | 后台删除原件、汇总 PDF 和 Excel 的本地副本；来源文件记为 `PURGED`，两份上传文件本地状态记为 `DELETED` |
 | OA 明确未创建，已 commit 文件已经远端回收为 `CLEANED` | 删除对应本地副本 |
 | `FAILED_FINAL`，从未开始创建 OA，且文件从未开始 commit、没有远端 ID | 保留到该草稿原有 `expiresAt`；到期后删除，上传记为 `DISCARDED`，原草稿文件记为 `PURGED` |
 | `MANUAL_REVIEW` | 永不自动删除，等待管理员核对 |
@@ -623,6 +665,8 @@ SQLite CAS、唯一约束和触发器共同保证：
 `FAILED_FINAL` 的到期删除还要求草稿仍是锁定状态、`processInstanceId` 为空、`oaCreateStartedAt` 为空、`commitStartedAt` 为空、`spaceId/fileId` 为空，且上传状态只能是 `PENDING/PUTTING/PUT_DONE`。任一条件不满足都不会进入自动删除。
 
 本地删除由持久扫描任务执行。删除磁盘对象成功后才用状态版本 CAS 更新数据库；如果进程中断，下次启动继续扫描，重复执行是安全的。
+
+版本 2 的原件只有本地来源文件记录，不能伪装成已经远端上传或关联。成功后的原件清理独立核对提交状态、快照来源和两份生成文件的 `LINKED` 状态；上传其中一份或仅取得 OA 实例 ID 都不足以删除原件。
 
 ### 13.2 钉钉远端文件
 
@@ -649,7 +693,7 @@ SQLite CAS、唯一约束和触发器共同保证：
 |---|---|
 | 身份 | `corp_id`、`owner_user_id`、`department_id`、`department_name` |
 | 模板绑定 | `template_process_code`、`template_config_version`、`schema_fingerprint` |
-| 草稿数据 | `input_json`、`related_instance_ids_json`；`input_json` 含 `ocrDispositionVersion`、费用行 `sourceFileId` 和 `dismissedOcrFileIds` |
+| 自动保存内容 | `input_json`、`related_instance_ids_json`；含 `editingState`、预算值、费用行、OCR 去向版本、来源/行程单文件 ID、原币信息和人民币金额确认 |
 | 并发和生命周期 | `status`、`revision`、`expires_at`、`locked_at` |
 | 审计 | `created_at`、`updated_at` |
 
@@ -678,7 +722,7 @@ SQLite CAS、唯一约束和触发器共同保证：
 
 ### 14.6 `reimbursement_uploads`
 
-每个原始附件和生成 Excel 都是一行。主要保存提交/草稿、来源草稿文件、角色、顺序、本地存储状态、预留大小、文件名/类型/大小/SHA-256、远端上传状态和版本、`space_id/file_id`、PUT/commit/清理开始时间、关联/清理/本地删除时间和错误码。
+版本 2 每次提交有两行，分别是 `GENERATED_PDF` 和 `GENERATED_EXCEL`。保存提交/报销关联、角色、顺序、本地存储状态、预留大小、文件名/类型/大小/SHA-256、远端上传状态和版本、`space_id/file_id`、PUT/commit/清理开始时间、关联/清理/本地删除时间和错误码。原件由来源文件表和不可变快照保存，不新增远端上传记录。
 
 ## 15. 权限和应用配置
 
@@ -745,7 +789,7 @@ SQLite CAS、唯一约束和触发器共同保证：
 | `DINGTALK_OA_WORKER_RETRY_MAX_SECONDS` | `300` | 自动重试最大间隔 |
 | `DINGTALK_OA_WORKER_RECONCILIATION_SECONDS` | `900` | OA 创建结果未知时的自动核对窗口，至少 30 秒 |
 | `DINGTALK_APPROVAL_DETAIL_URL_TEMPLATE` | 空 | 可选；仅填写已验证且含一个 `{processInstanceId}` 的绝对 URL |
-| `REIMBURSEMENT_STAGING_DIR` | Compose 固定 `/app/staging` | 原始附件和生成 Excel 的持久私有目录，不能放进 `TEMP_DIR` |
+| `REIMBURSEMENT_STAGING_DIR` | Compose 固定 `/app/staging` | 原始附件、汇总 PDF 和 Excel 的持久私有目录，不能放进 `TEMP_DIR` |
 | `REIMBURSEMENT_STAGING_MAX_BYTES` | `4 GiB` | 持久暂存总预留上限 |
 | `REIMBURSEMENT_DRAFT_TTL_DAYS` | `30` | 普通草稿及安全 `FAILED_FINAL` 本地文件保留期限 |
 
@@ -755,10 +799,10 @@ SQLite CAS、唯一约束和触发器共同保证：
 
 - 正式部署为同源 HTTPS：Nginx 提供 H5 和 `/api` 反向代理；
 - FastAPI、SQLite 和数据库轮询 worker 运行在同一个后端服务中；任务不是进程内队列，进程重启后从 SQLite 检查点恢复；
-- SQLite 数据放在 `sqlite_data` 持久卷，原始文件和生成 Excel 放在独立 `reimbursement_staging` 持久卷；
+- SQLite 数据放在 `sqlite_data` 持久卷，原始文件、汇总 PDF 和 Excel 放在独立 `reimbursement_staging` 持久卷；
 - `/tmp/expense` 是受限 tmpfs，只保存上传解析和 OCR 工作副本，不承载可恢复草稿；
 - 当前 SQLite 部署按单个后端副本运行。不能把 SQLite 文件放到多个容器随意共享并横向扩容；若未来改成多副本，应先迁移到支持该并发模型的数据库并重新验证租约；
-- 启动前执行 Alembic 到 `20260904_0011`；readiness 会检查当前 revision 和关键字段；
+- 启动前执行 Alembic 到 `20260906_0012`；readiness 会检查当前 revision 和关键字段；后端代码升级后重启服务使新代码生效；
 - 代码和所有现成部署示例均保持 `DINGTALK_OA_WORKER_ENABLED=false`，启动服务不会自动消费已排队的正式提交；
 - worker 关闭时，员工点击正式提交仍会锁定草稿并创建持久任务；以后开启 worker 会消费这些已排队任务，因此开启前必须查清所有非终态 submission，不得遗留未确认的历史任务；
 - 只有在 Alembic 迁移、模板 Schema/映射、权限、应用归属、非终态任务清单和 `/api/ready` 预检全部通过，且已准备执行一次明确的真实验收时，才显式设为 `true`；进入生产正式接单也必须经过同样的发布确认；
@@ -770,7 +814,7 @@ SQLite CAS、唯一约束和触发器共同保证：
 - `GET /api/health`：只说明 FastAPI 进程存活；
 - `GET /api/ready`：检查数据库、迁移、Excel 模板、临时目录、持久暂存空间、OCR 和钉钉基础配置；
 - `/api/ready` 不发起真实 Workflow/Storage 调用，也不代替权限、模板目录和远端创建能力预检；
-- 模板目录是否已经确认由管理员目录接口和员工 options 接口检查。模板未配置或发生漂移时，员工不能创建新草稿或正式提交。
+- 模板目录是否已经确认由管理员目录接口和员工 options 接口检查。模板未配置或发生漂移时，页面提示配置问题，无法准备新报销或正式提交。
 
 ## 18. 监控和人工处理
 
@@ -814,13 +858,16 @@ SQLite CAS、唯一约束和触发器共同保证：
 |---|---|---|
 | 模板 inspect、字段映射、配置版本、Schema 漂移拦截 | 已实现 | `oa_template_profiles`、模板目录 API 和测试 |
 | 当前员工已通过出差审批查询、保存时复核、提交时再复核 | 已实现 | `travel_approvals.py`、草稿服务和测试 |
-| SQLite 持久草稿、revision CAS、持久原始文件、OCR 状态/去向、Excel 预览 | 已实现 | 草稿/文件 API、暂存、版本兼容与配额测试 |
+| 自动保存未完成内容、revision CAS、持久原件、鉴权预览 | 已实现 | 报销/文件 API、暂存、输入及配额测试 |
+| 预算代码标签直接填 Excel 项目 | 已实现 | 输入规范化、Excel 与页面测试 |
+| 网约车关联行程单、缺材料拦截、共享行程文件 | 已实现 | 输入/文件/快照测试与单列表编辑交互 |
+| 纸质出租车、国外票据本地解析和人民币确认 | 已实现 | 专门票据解析器、OCR 与输入契约测试 |
 | 不可变提交快照、一个草稿一条任务、UUID 幂等 | 已实现 | 提交服务、0011 迁移和测试 |
-| 原始附件在前、生成 Excel 在最后的完整 OA 请求 | 已实现 | payload 合同测试 |
+| 汇总 PDF 在前、Excel 在后的两附件 OA 请求 | 已实现 | 汇总生成器、payload、0012 约束与 worker 测试 |
 | 上传前检查点、PUT/commit 恢复、创建结果核对、严格回读 | 已实现 | worker/state 测试 |
 | 提交后本地副本清理；安全 `FAILED_FINAL` 到期清理；不确定状态保留 | 已实现 | 提交状态和维护测试 |
 | 202 提交、按 ID 轮询、按草稿跨设备只读恢复 | 已实现 | 后端 API 与前端 store 测试 |
-| H5 草稿、持久附件、关联审批、提交确认和状态展示 | 已实现 | 前端组件/store 测试和完整前端门禁 |
+| H5 单费用列表、自动保存、文件预览、关联审批和提交状态 | 已实现 | 前端组件/store 测试 |
 
 核心实现文件：
 
@@ -838,18 +885,21 @@ SQLite CAS、唯一约束和触发器共同保证：
 | 模型/迁移 | 升级、降级、重新升级；唯一约束、外键、检查约束和不可逆触发器 |
 | 模板 | 10 个字段类型、精确选项、出差模板映射、配置版本冲突和 Schema 漂移 |
 | 出差审批 | 当前员工隔离、已完成且同意、120 天窗口、分页上限、保存和提交再复核 |
-| 草稿/文件 | 重启恢复、revision 冲突、上传/删除中断、配额、路径安全、OCR 回包丢失恢复、版本 0 唯一六字段精确关联、编辑/缺字段/歧义保持未决定、显式加入/忽略、后端保存与复核拦截、删除/改角色原子一致性、静默漏报与重复金额防护 |
-| 快照/payload | 规范 JSON、SHA-256、防篡改、10 字段、关联数组、原件顺序和 Excel 最后 |
+| 自动保存/文件 | 未完成字段保存恢复、revision 冲突、上传/删除中断、配额、预览鉴权/过期/哈希、OCR 回包丢失、来源去向、删除/改角色引用一致性 |
+| 行程单/外币 | 网约车缺行程单拦截、同记录活动材料、共享行程文件、纸质出租车类型、外币原值与人民币分离、未知币种仍需确认、绕过前端标记拦截 |
+| OCR | 出租车单价与车费区分、外币千分位/小数/日期歧义、国外总额、中文电子票据回归及真实模型样本 |
+| 快照/payload | 规范 JSON、SHA-256、防篡改、10 字段、关联数组、预算完整标签、版本 1 恢复、版本 2 两附件 |
+| PDF | 原始 PDF 页面/旋转保留、图片 EXIF/A4/完整边界、多页材料、按费用关联顺序、同 ID 一次且不同上传均保留、大小/页数限制和失败清理 |
 | worker | 续租、指数退避、PUT 重试、明确 commit 拒绝、commit 不确定、OA 不确定核对 |
 | 回读 | 员工、部门、每个字段和结构化控件精确匹配，错误时进入人工核对 |
 | 清理 | `LINKED` 本地删除、孤儿远端回收、安全 `FAILED_FINAL` 到期删除、危险状态不删除 |
-| 前端 | 一次 POST、稳定 UUID、刷新轮询、跨设备按草稿恢复、迟到响应隔离、错误展示 |
+| 前端 | 单费用列表、唯一操作、文件预览、自动保存排队/失败/恢复、预算来源、真实 totals 请求契约、行程单与外币提示、一次提交、刷新轮询和迟到响应隔离 |
 
-本地集成测试 `test_submit_worker_readback_and_cleanup_are_one_durable_local_flow` 使用真实 SQLite、状态机、Excel 生成和本地模拟的钉钉边界，覆盖：两份原件、生成 Excel、一次创建、严格回读、全部 `LINKED`、本地清理，以及同键/新键重复提交仍只创建一次。它证明本系统各层能闭环，但不替代测试企业的真实 API 验收。
+本地集成测试 `test_submit_worker_readback_and_cleanup_are_one_durable_local_flow` 使用真实 SQLite、状态机、PDF/Excel 生成和本地模拟的钉钉边界，覆盖：原件汇总、仅两次远端文件上传、一次创建、严格回读、两文件 `LINKED`、本地清理，以及同键/新键重复提交仍只创建一次。它证明本系统各层能闭环，但不替代测试企业的真实 API 验收。
 
-### 19.3 已完成的真实能力验证
+### 19.3 真实能力验证和本轮验收记录
 
-测试企业已经完成一张真实 OA 的综合验收，并验证：
+测试企业已于 2026-09-05 完成以下基础 API 能力验证：
 
 - 取得 access token；
 - 读取报销模板 Schema、字段 ID 和选项；
@@ -857,12 +907,25 @@ SQLite CAS、唯一约束和触发器共同保证：
 - 一次创建报销 OA；
 - 把出差审批写成真正的 `RelateField`；
 - 取得审批附件空间；
-- 服务器依次上传测试发票、测试行程单和自动生成的 Excel，完成 PUT、commit 并取得文件 ID；
-- 从新 OA 回读相同的关联实例 ID、三个附件及其顺序；
+- 服务器完成文件 PUT、commit 并取得文件 ID；
+- 从 OA 回读相同的关联实例 ID、附件内容及其顺序；
 - `RelateField.value` 返回标题、`extValue.list[].procInstId` 返回真实实例 ID；
-- 严格回读通过后，本地状态为 `SUBMITTED`，三个远端文件均为 `LINKED`，三个本地副本均为 `DELETED`。
+- 严格回读后进入 `SUBMITTED`，远端文件标为 `LINKED` 并安全清理本地副本。
 
-本次测试记录：2026-09-05，审批业务编号 `202609051454000287675`，实例 ID `uOoIPafnRJ-_Jn7LePsV4w09051788591268`。这证明测试企业模板和服务器完整链路可用；切换真实公司 `processCode` 后，仍要按真实 Schema 重新映射并做一次生产前验收。
+该次审批业务编号为 `202609051454000287675`，实例 ID 为 `uOoIPafnRJ-_Jn7LePsV4w09051788591268`。
+
+2026-09-06 本轮通过浏览器实际提交测试企业 OA，页面返回成功编号 `202609061656000291225`，刷新后仍显示同一编号。独立只读核对结果：
+
+- 仅一条提交记录 `86c6d2f5-9d14-4d66-8191-6581bd017478`，状态 `SUBMITTED`；实例 ID 为 `m3wgpdZ5TZGUZzoi1EvT0A09051788684989`。
+- 原生 OA 全字段严格回读匹配，关联出差审批实例正确。
+- 远端附件恰好两项，顺序为 `票据汇总.pdf`（109542 字节）和报销单 Excel（8326 字节），两份上传记录均为 `LINKED`。
+- 两份来源文件均为 `PURGED`，两份生成文件的本地状态为 `DELETED`，对应物理路径均已不存在。
+- 用锁定快照及经过 SHA-256 核对的原始测试材料本地重建汇总 PDF，得到 109542 字节，SHA-256 与实际上传清单中的文件哈希完全一致；三页顺序为发票、行程单第 1 页、行程单第 2 页。
+- 同快照重建 Excel 的项目 `G2` 为 `10000 管理部门`，总额 `G55` 为 `1.23`，票据张数 `I55` 为 `1`。重建工作簿包含时间元数据差异，文件哈希与实际上传文件不同；该检查证明快照字段生成正确，不等同于打开实际远端 Excel。
+- 用户于 2026-09-06 对本次 OA 的票据汇总 PDF 和报销单 Excel 人工确认：“可以正常预览或下载”。实际钉钉客户端附件访问已通过用户确认。
+- 自动化直接下载远端文件的只读检查仍受当前应用下载信息权限限制；用户的客户端确认不代表该 API 已开通，也不代表已通过远端下载字节的自动化校验。
+
+本轮浏览器使用隔离的本地测试服务，测试专用 Session 绑定通过真实钉钉用户 API 取得的身份及 `unionId`；尚未在本轮重新走钉钉客户端 JSAPI 免登入口。材料预览接口已成功返回原件；内置自动化浏览器的 PDF 显示和备用 Blob 导航限制属于测试工具边界，本次钉钉 OA 附件已由用户另行确认可正常预览或下载。该确认不扩展为所有设备、全部打印版式或免登入口均已复验。切换真实公司 `processCode` 后，仍要按真实 Schema 重新映射并完成生产前验收。
 
 ### 19.4 代码门禁
 
@@ -881,7 +944,9 @@ make nginx-policy-check
 make ocr-models-check
 ```
 
-`make compose-config` 必须在已注入生产必需配置的环境执行。另外执行 Alembic `upgrade -> downgrade -> upgrade` 回归。若当前机器缺少 OCR 模型，不能把对应检查跳过后宣称完整门禁通过，应在具备模型的验收环境补跑。
+`make compose-config` 必须在已注入生产必需配置的环境执行。另在隔离数据库执行 Alembic `upgrade -> downgrade -> upgrade` 回归，并验证含版本 2 提交的数据库会安全拒绝降级；不得拿正在使用的数据库做破坏性迁移测试。若当前机器缺少 OCR 模型，不能把对应检查跳过后宣称完整门禁通过，应在具备模型的验收环境补跑。
+
+2026-09-06 本轮后端全套测试为 856 通过（11 条既有 warning），前端测试为 194 通过；Ruff、编译检查和差异空白检查通过；`nginx-policy-check`、`ocr-models-check`、开发 Compose 检查通过。生产 Compose 使用隔离的占位配置执行静态展开检查通过，这不代替生产凭据、目标服务器和真实客户端验收。本轮使用独立测试数据库；正在使用的数据库及其既有排队记录未被修改或消费。
 
 ## 20. 上线前和正式验收
 
@@ -894,8 +959,9 @@ make ocr-models-check
 - [ ] 管理员在生产模板上完成 inspect、10 字段映射和 Schema 指纹确认；
 - [ ] 每个出差模板的日期字段、出差类别选项和关联控件允许范围已经确认；
 - [ ] 钉钉模板的审批人、条件分支和抄送已经由业务负责人检查；
-- [ ] Excel 正式模板、项目、补助规则和费用类别已经通过业务验收；
-- [ ] SQLite 已迁移到 `20260904_0011`，SQLite 与 staging 持久卷均可备份恢复；
+- [ ] Excel 正式模板、预算代码完整标签、补助规则和费用类别已经通过业务验收；
+- [ ] 网约车行程单要求、人工关联方式和境外费用人民币确认方式已向使用员工说明；
+- [ ] SQLite 已迁移到 `20260906_0012`，SQLite 与 staging 持久卷均可备份恢复；
 - [ ] 部署文件仍保持 `DINGTALK_OA_WORKER_ENABLED=false`，未在预检前消费正式任务；
 - [ ] 已列出所有非终态 submission，没有任何未经确认便会在 worker 开启后被处理的历史任务；
 - [ ] `/api/ready` 正常，OCR 模型、Excel 模板和持久暂存均通过检查；
@@ -912,21 +978,21 @@ make ocr-models-check
 - 报销模板和出差模板；
 - 至少一张属于该员工、状态为已完成且同意的出差审批；
 - 至少两份脱敏原始文件，覆盖票据/发票和只附加材料；
-- 所属公司、预算代码、项目、日期、金额和补助；
+- 所属公司、预算代码、日期、金额和补助；
 - 本次会真正启动测试模板的审批流，审批人已知情。
 
 验收步骤：
 
 1. 从钉钉工作台进入 H5 并免登；
-2. 新建草稿，确认公司/预算选项来自当前模板；
-3. 上传多份原件，完成 OCR 修改，并保存至少一份 `ATTACHMENT_ONLY`；
-4. 查询并选择本人已通过的出差审批，保存后刷新页面确认仍能恢复；
-5. 预览 Excel，核对姓名、部门、项目、费用行、补助、合计和文件名；
-6. 点击一次正式提交，不在处理中再次创建新草稿或换键提交；
+2. 页面自动恢复或准备报销，确认公司/预算选项来自当前模板，项目栏无需另填；
+3. 上传多份原件，核对单列表中的 OCR、预览和编辑；网约车选择行程单，并验证缺行程单会阻止提交；
+4. 填写一部分内容并等待“已保存”，刷新确认恢复；选择本人已通过的出差审批并核对恢复；
+5. 预览 Excel，核对姓名、部门、预算代码项目、费用行、补助、合计和文件名；境外样本另在本地验证原币与人民币确认；
+6. 点击一次正式提交，等待最新内容保存和确认，不在处理中另建报销；
 7. 观察状态经过校验、生成、上传、创建和回读，最终成为 `SUBMITTED`；
 8. 打开钉钉 OA，人工确认 10 个表单字段；
 9. 确认关联审批可打开正确出差实例；
-10. 确认附件顺序为全部原件在前、最终 Excel 在最后，并逐个预览/下载；
+10. 确认附件恰好为票据汇总 PDF、最终 Excel，并逐个预览/下载；检查汇总页数、发票与关联材料顺序、图像完整性和实际打印可读性；
 11. 使用同一键、不同键、刷新页面和另一浏览器只做读取恢复，确认都返回同一 `submissionId/processInstanceId`，钉钉只有一张 OA；
 12. 确认服务器本地副本随后被安全清理，OA 中远端附件仍可正常访问；
 13. 记录审批业务编号、实例 ID、模板指纹、测试时间和检查结果，不记录 Secret 或票据敏感正文。

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from typing import Annotated
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Query, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -33,6 +34,7 @@ from app.services.reimbursement_files import (
     list_draft_files,
     map_reimbursement_storage_error,
     persist_draft_upload,
+    read_draft_file_content,
     recognize_draft_file,
     serialize_draft_file,
     update_draft_file,
@@ -125,7 +127,7 @@ async def upload_file(
     if draft.revision != expected_revision:
         raise ApiError(
             "REIMBURSEMENT_DRAFT_REVISION_CONFLICT",
-            "草稿已在其他页面更新，请刷新后重试",
+            "报销内容已在其他页面更新，请刷新后重试",
             409,
         )
     session_id_hash = current.record.session_id_hash
@@ -176,6 +178,39 @@ async def upload_file(
             "revision": result.revision,
             "file": serialize_draft_file(result.file),
         }
+    )
+
+
+@router.get("/reimbursements/drafts/{draft_id}/files/{file_id}/content")
+def preview_file(
+    draft_id: str,
+    file_id: str,
+    request: Request,
+    database: Annotated[Session, Depends(get_db)],
+    current: Annotated[CurrentSession, Depends(get_current_session)],
+) -> Response:
+    try:
+        file, content = read_draft_file_content(
+            database,
+            actor=draft_actor(current),
+            draft_id=draft_id,
+            file_id=file_id,
+            staging=request.app.state.reimbursement_staging,
+        )
+    except ReimbursementStagingError as exc:
+        raise map_reimbursement_storage_error(exc) from exc
+    return Response(
+        content=content,
+        media_type=file.media_type,
+        headers={
+            "Content-Disposition": (
+                f"inline; filename=receipt.{file.extension.lstrip('.')}; "
+                f"filename*=UTF-8''{quote(file.original_name, safe='')}"
+            ),
+            "Cache-Control": "no-store, private",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "sandbox",
+        },
     )
 
 

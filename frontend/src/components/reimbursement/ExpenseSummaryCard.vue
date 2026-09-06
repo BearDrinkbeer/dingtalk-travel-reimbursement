@@ -7,17 +7,19 @@ import { useReimbursementDraftStore } from '@/stores/reimbursementDraft'
 
 const props = withDefaults(defineProps<{
   previewDisabledReason?: string
+  beforePreview?: () => Promise<void>
 }>(), {
   previewDisabledReason: '',
+  beforePreview: undefined,
 })
 
 const expense = useExpenseStore()
 const drafts = useReimbursementDraftStore()
 
 const disabledReason = computed(() => {
-  if (!drafts.currentDraft) return '请先创建或打开报销草稿'
+  if (!drafts.currentDraft) return '正在准备报销表单'
   if (props.previewDisabledReason) return props.previewDisabledReason
-  if (drafts.pendingMutations > 0) return '请等待草稿保存完成'
+  if (drafts.pendingMutations > 0 && !props.beforePreview) return '请等待内容保存完成'
   return ''
 })
 
@@ -27,8 +29,9 @@ async function downloadExcel(): Promise<void> {
     return
   }
   try {
+    await props.beforePreview?.()
     await drafts.downloadExcelPreview()
-    ElMessage.success('已生成当前已保存草稿的 Excel 预览')
+    ElMessage.success('已生成报销单 Excel 预览')
   } catch (error) {
     ElMessage.error(
       drafts.mutationError
@@ -55,6 +58,12 @@ async function downloadExcel(): Promise<void> {
     <p class="uppercase-amount">
       人民币大写：{{ expense.totals?.uppercaseAmount ?? '待服务端计算' }}
     </p>
+    <el-alert
+      v-if="expense.calculationError"
+      :title="expense.calculationError"
+      type="error"
+      :closable="false"
+    />
     <div class="excel-download-action">
       <el-button
         :loading="drafts.downloadingPreview"
@@ -73,7 +82,7 @@ async function downloadExcel(): Promise<void> {
         v-else
         class="field-help excel-preview-help"
       >
-        这里只预览已保存的内容；正式提交时服务器会重新生成最终 Excel，并直接加入钉钉 OA 附件。
+        预览前会自动保存当前内容；正式提交时生成最终报销单和票据汇总 PDF。
       </p>
     </div>
   </el-card>

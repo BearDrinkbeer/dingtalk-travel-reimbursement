@@ -2,10 +2,13 @@
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 
+import { getReimbursementFileContent } from '@/api/reimbursements'
+import { apiErrorMessage } from '@/api/errors'
 import { useAuthStore } from '@/stores/auth'
 import { useExpenseStore } from '@/stores/expense'
 import { useReimbursementDraftStore } from '@/stores/reimbursementDraft'
 import type { ExpenseCategoryId, ExpenseItem } from '@/types/expenses'
+import { isForeignExpense } from '@/types/expenses'
 import type { ReceiptFileState, ReceiptFileStatus } from '@/types/receipts'
 import type {
   ReimbursementDraftFile,
@@ -36,6 +39,8 @@ const receiptPreviewVisible = ref(false)
 const receiptPreviewUrl = ref('')
 const receiptPreviewName = ref('')
 const receiptPreviewKind = ref<'image' | 'pdf'>('image')
+const previewLoading = ref(false)
+let previewController: AbortController | null = null
 const editorVisible = ref(false)
 const editorRevision = ref(0)
 const editor = reactive({
@@ -45,6 +50,11 @@ const editor = reactive({
   description: '',
   amount: '',
   receiptCount: 1,
+  requiresItinerary: false,
+  itineraryFileIds: [] as string[],
+  originalCurrency: '',
+  originalAmount: '',
+  cnyAmountConfirmed: false,
 })
 
 const receiptStatusLabels: Record<ReceiptFileStatus, string> = {
@@ -68,10 +78,13 @@ const warningLabels: Record<string, string> = {
   QR_AMOUNT_MISMATCH: '二维码金额与票面金额不一致',
   QR_ISSUE_DATE_USED: '日期来自二维码开票日期，请核对发生日期',
   INVOICE_DATE_USED_AS_OCCURRENCE: '未识别到发生日期，当前使用开票日期',
+  FOREIGN_CURRENCY_REQUIRES_CONFIRMATION: '请确认人民币报销金额',
+  FOREIGN_CURRENCY_REQUIRES_CNY_AMOUNT: '请确认原票币种和人民币报销金额',
+  MISSING_ITINERARY: '请补充对应行程单',
 }
 const durableRoleLabels: Record<ReimbursementDraftFileRole, string> = {
   EXPENSE_SOURCE: '票据/发票',
-  ATTACHMENT_ONLY: '其他附件',
+  ATTACHMENT_ONLY: '行程单/证明材料',
 }
 
 const categoryNames = computed<Record<string, string>>(() =>
@@ -81,6 +94,21 @@ const unlinkedReceiptFiles = computed(() =>
   expense.receiptFiles.filter((receipt) => !receipt.ocrItemId),
 )
 const durableFiles = computed(() => drafts.files.filter((file) => file.status !== 'PURGED'))
+const unlinkedDurableFiles = computed(() => durableFiles.value.filter((file) =>
+  !expense.items.some((item) => item.sourceFileId === file.id || item.itineraryFileIds?.includes(file.id)),
+))
+const itineraryOptions = computed(() => durableFiles.value.filter((file) =>
+  file.status === 'ACTIVE' && file.role === 'ATTACHMENT_ONLY',
+))
+const foreignEditor = computed(() => Boolean(editor.originalCurrency && editor.originalCurrency.toUpperCase() !== 'CNY')
+  || expense.items.find((item) => item.id === editor.id)?.requiresCnyConfirmation
+  || editorSource.value?.ocrResult?.type === 'foreign_receipt'
+  || editorSource.value?.ocrResult?.warnings.includes('FOREIGN_CURRENCY_REQUIRES_CNY_AMOUNT'))
+const editorSource = computed(() => durableFiles.value.find((file) =>
+  file.id === expense.items.find((item) => item.id === editor.id)?.sourceFileId,
+))
+const sourceRequiresItinerary = computed(() => editorSource.value?.ocrResult?.requiresItinerary
+  || editorSource.value?.ocrResult?.transportType === 'ride_hailing')
 const unresolvedDurableOcrFiles = computed(() => durableFiles.value.filter(
   (file) => isUnresolvedDurableOcrFile(file),
 ))
@@ -88,11 +116,11 @@ const durableBusy = computed(() => durableOperating.value || drafts.busy)
 const durableMutationDisabledReason = computed(() => {
   if (props.readonly) return '当前操作进行中，费用明细和附件暂不可修改'
   const current = drafts.currentDraft
-  if (!current) return '请先创建或打开一份报销草稿'
+  if (!current) return '正在准备报销表单'
   if (current.status === 'DRAFT' || current.status === 'REVIEW_READY') return ''
-  if (current.status === 'LOCKED') return '当前草稿已锁定，不能再修改附件'
-  if (current.status === 'EXPIRED') return '当前草稿已过期，不能再修改附件'
-  return '当前草稿不能再修改附件'
+  if (current.status === 'LOCKED') return '当前报销已提交，不能再修改附件'
+  if (current.status === 'EXPIRED') return '当前报销已过期，不能再修改附件'
+  return '当前报销不能再修改附件'
 })
 const durableActionDisabledReason = computed(() => durableMutationDisabledReason.value
   || (durableBusy.value ? '请等待当前文件操作完成' : ''))
@@ -108,7 +136,7 @@ const receiptUploadDisabledReason = computed(() => {
   if (props.durable) {
     if (durableActionDisabledReason.value) return durableActionDisabledReason.value
     if (durableFiles.value.length >= expense.receiptUploadLimits.maxFiles) {
-      return `当前草稿已达到 ${expense.receiptUploadLimits.maxFiles} 个附件上限`
+      return `本次报销已达到 ${expense.receiptUploadLimits.maxFiles} 个附件上限`
     }
     return ''
   }
@@ -143,6 +171,7 @@ onBeforeUnmount(() => {
   durableOperationGeneration += 1
   activeDurableOperation = null
   releaseReceiptPreview()
+  previewController?.abort()
 })
 
 watch(
@@ -216,6 +245,11 @@ function openNewItem(): void {
     description: '',
     amount: '',
     receiptCount: 1,
+    requiresItinerary: false,
+    itineraryFileIds: [],
+    originalCurrency: '',
+    originalAmount: '',
+    cnyAmountConfirmed: false,
   })
   editorRevision.value += 1
   editorVisible.value = true
@@ -230,6 +264,11 @@ function openEditItem(item: ExpenseItem): void {
     description: item.description,
     amount: item.amount,
     receiptCount: item.receiptCount,
+    requiresItinerary: item.requiresItinerary || item.transportType === 'ride_hailing' || false,
+    itineraryFileIds: [...(item.itineraryFileIds ?? [])],
+    originalCurrency: item.originalCurrency ?? '',
+    originalAmount: item.originalAmount ?? '',
+    cnyAmountConfirmed: item.cnyAmountConfirmed ?? false,
   })
   editorRevision.value += 1
   editorVisible.value = true
@@ -269,6 +308,14 @@ function durableFileByItemId(itemId: string): ReimbursementDraftFile | undefined
   return sourceFileId
     ? durableFiles.value.find((file) => file.id === sourceFileId)
     : undefined
+}
+
+function itineraryFiles(item: ExpenseItem): ReimbursementDraftFile[] {
+  return durableFiles.value.filter((file) => item.itineraryFileIds?.includes(file.id))
+}
+
+function needsItinerary(item: ExpenseItem): boolean {
+  return Boolean(item.requiresItinerary || item.transportType === 'ride_hailing')
 }
 
 function durableFileError(file: ReimbursementDraftFile | undefined): string {
@@ -327,6 +374,8 @@ function chooseAttachmentFiles(): void {
 }
 
 function releaseReceiptPreview(): void {
+  previewController?.abort()
+  previewController = null
   if (receiptPreviewUrl.value) URL.revokeObjectURL(receiptPreviewUrl.value)
   receiptPreviewUrl.value = ''
 }
@@ -347,7 +396,29 @@ function openReceiptPreview(receipt: ReceiptFileState): void {
   }
 }
 
-function previewItemReceipt(itemId: string): void {
+async function previewDurableFile(file: ReimbursementDraftFile | undefined): Promise<void> {
+  const draft = drafts.currentDraft
+  if (!draft || !file || file.status !== 'ACTIVE') return
+  releaseReceiptPreview()
+  const controller = new AbortController()
+  previewController = controller
+  previewLoading.value = true
+  try {
+    const blob = await getReimbursementFileContent(draft.id, file.id, { signal: controller.signal })
+    if (controller.signal.aborted || drafts.currentDraft?.id !== draft.id || durableUnmounted) return
+    receiptPreviewName.value = file.name
+    receiptPreviewKind.value = file.mediaType === 'application/pdf' ? 'pdf' : 'image'
+    receiptPreviewUrl.value = URL.createObjectURL(blob)
+    receiptPreviewVisible.value = true
+  } catch (error) {
+    if (!controller.signal.aborted) ElMessage.error(apiErrorMessage(error, '材料预览失败，请重试'))
+  } finally {
+    if (previewController === controller) previewLoading.value = false
+  }
+}
+
+async function previewItemReceipt(itemId: string): Promise<void> {
+  if (props.durable) { await previewDurableFile(durableFileByItemId(itemId)); return }
   const receipt = expense.receiptByItemId(itemId)
   if (receipt) openReceiptPreview(receipt)
 }
@@ -374,19 +445,9 @@ function durableTripYear(): number | undefined {
 
 function expenseItemSnapshot(item: ExpenseItem | undefined): string | null {
   if (!item) return null
-  return JSON.stringify({
-    id: item.id,
-    sourceFileId: item.sourceFileId ?? null,
-    category: item.category,
-    date: item.date ?? null,
-    displayDate: item.displayDate,
-    description: item.description,
-    amount: item.amount,
-    receiptCount: item.receiptCount,
-    source: item.source,
-    confidence: item.confidence ?? null,
-    warnings: [...(item.warnings ?? [])],
-  })
+  // Protect every employee-editable field, including proof links and foreign
+  // currency confirmation, from a recognition response that arrives later.
+  return JSON.stringify(item)
 }
 
 function readableOperationError(error: unknown, fallback: string): string {
@@ -507,7 +568,7 @@ async function removeDurableFile(file: ReimbursementDraftFile): Promise<void> {
     ) return
     expense.removeDraftFileAssociation(file.id)
     delete durableErrors[file.id]
-    ElMessage.success('已从报销草稿移除该文件')
+    ElMessage.success('已从本次报销移除该文件')
     void expense.refreshCalculations()
   } catch (error) {
     if (!acceptsDurableOperation(scope)) return
@@ -575,34 +636,6 @@ async function ignoreDurableRecognition(file: ReimbursementDraftFile): Promise<v
   }
 }
 
-async function dismissDurableExpenseItem(item: ExpenseItem): Promise<void> {
-  if (props.readonly || durableActionDisabledReason.value || !item.sourceFileId) return
-  const scope = beginDurableOperation()
-  if (!scope) return
-  durableOperating.value = true
-  try {
-    try {
-      await ElMessageBox.confirm(
-        '该费用明细来自已识别票据。移除明细后附件仍保留，且刷新后不会自动恢复，是否继续？',
-        '移除费用明细',
-        {
-          confirmButtonText: '移除明细',
-          cancelButtonText: '取消',
-          type: 'warning',
-        },
-      )
-    } catch {
-      return
-    }
-    if (!acceptsDurableOperation(scope)) return
-    expense.removeItem(item.id)
-    ElMessage.success('费用明细已移除，原附件仍保留')
-    void expense.refreshCalculations()
-  } finally {
-    finishDurableOperation(scope)
-  }
-}
-
 async function removeReceipt(localId: string): Promise<void> {
   if (props.readonly) return
   const receipt = expense.receiptFiles.find((entry) => entry.localId === localId)
@@ -630,6 +663,9 @@ async function removeReceipt(localId: string): Promise<void> {
 function saveItem(): void {
   if (props.readonly) return
   try {
+    if (editor.originalCurrency.trim() && !/^[A-Z]{3}$/.test(editor.originalCurrency.trim().toUpperCase())) {
+      throw new Error('请填写票面原币币种，例如 VND、USD 或 EUR')
+    }
     expense.upsertManualItem({
       id: editor.id || undefined,
       category: editor.category,
@@ -638,6 +674,14 @@ function saveItem(): void {
       description: editor.description,
       amount: editor.amount,
       receiptCount: editor.receiptCount,
+      requiresItinerary: editor.requiresItinerary || Boolean(sourceRequiresItinerary.value),
+      transportType: editor.requiresItinerary ? 'ride_hailing'
+        : editorSource.value?.ocrResult?.transportType ?? 'other',
+      itineraryFileIds: [...editor.itineraryFileIds],
+      originalCurrency: editor.originalCurrency.trim().toUpperCase() || undefined,
+      originalAmount: editor.originalAmount.trim() || undefined,
+      cnyAmountConfirmed: foreignEditor.value && editor.cnyAmountConfirmed,
+      requiresCnyConfirmation: Boolean(foreignEditor.value),
       warnings: [],
     })
     editorVisible.value = false
@@ -651,8 +695,9 @@ async function removeItem(id: string): Promise<void> {
   if (props.readonly) return
   if (props.durable) {
     const item = expense.items.find((entry) => entry.id === id)
-    if (item?.sourceFileId) {
-      await dismissDurableExpenseItem(item)
+    const file = durableFileByItemId(id)
+    if (item?.sourceFileId && file) {
+      await removeDurableFile(file)
     } else {
       expense.removeItem(id)
       void expense.refreshCalculations()
@@ -719,7 +764,7 @@ async function retryItemRecognition(id: string): Promise<void> {
             :title="receiptUploadDisabledReason"
             @click="chooseAttachmentFiles"
           >
-            添加其他附件
+            添加行程单 / 证明材料
           </el-button>
         </div>
         <input
@@ -766,7 +811,7 @@ async function retryItemRecognition(id: string): Promise<void> {
     <el-alert
       :title="props.durable ? '票据自动识别，其他材料作为附件保存' : '一个文件只能放一张票据'"
       :description="props.durable
-        ? '票据/发票上传后会逐个识别并生成费用明细；行程单等材料请使用“添加其他附件”，只保存文件、不做 OCR。文件已保存到当前报销草稿。'
+        ? '发票上传后自动填入下方明细；行程单请使用“添加行程单 / 证明材料”，并在对应费用的编辑窗口中选择。提交时按费用顺序汇总为一个 PDF。'
         : '支持一次选择多个 JPG、JPEG、PNG 和单页 PDF。OCR 结果会直接成为可编辑的费用条目；不支持多页汇总 PDF、行程单或文件合并。临时文件由后台自动清理。'"
       type="info"
       :closable="false"
@@ -792,27 +837,35 @@ async function retryItemRecognition(id: string): Promise<void> {
     <el-alert
       v-if="props.durable && unresolvedDurableOcrFiles.length > 0"
       :title="`${unresolvedDurableOcrFiles.length} 张票据的 OCR 结果待确认`"
-      description="请逐张选择“添加到费用明细”或“忽略此票据”；全部确认前不能保存或提交。"
+      description="请逐张选择“添加到费用明细”或“仅作为材料保留”，处理完成后即可提交。"
       type="warning"
       :closable="false"
       show-icon
       class="receipt-alert"
     />
     <div
-      v-if="props.durable && durableFiles.length"
+      v-if="props.durable && unlinkedDurableFiles.length"
       class="receipt-list"
       aria-live="polite"
-      aria-label="报销草稿附件"
+      aria-label="待处理票据和未关联材料"
     >
       <article
-        v-for="file in durableFiles"
+        v-for="file in unlinkedDurableFiles"
         :key="file.id"
         class="receipt-row"
         :aria-label="`${file.name}：${durableStatusLabel(file)}`"
       >
         <div class="receipt-main">
           <div class="receipt-name-line">
-            <strong>{{ file.name }}</strong>
+            <button
+              type="button"
+              class="receipt-file-preview-link"
+              :disabled="file.status !== 'ACTIVE' || previewLoading"
+              :aria-label="`预览材料 ${file.name}`"
+              @click="previewDurableFile(file)"
+            >
+              {{ file.name }} · 预览
+            </button>
             <el-tag size="small">
               {{ durableRoleLabels[file.role] }}
             </el-tag>
@@ -824,7 +877,8 @@ async function retryItemRecognition(id: string): Promise<void> {
             </el-tag>
           </div>
           <span class="receipt-meta">
-            {{ formatFileSize(file.sizeBytes) }} · 已保存到草稿，无本地预览
+            {{ formatFileSize(file.sizeBytes) }}
+            <template v-if="file.role === 'ATTACHMENT_ONLY'"> · 尚未关联费用，可在对应费用的编辑窗口中选择</template>
           </span>
           <p
             v-if="durableOcrSummary(file)"
@@ -859,7 +913,7 @@ async function retryItemRecognition(id: string): Promise<void> {
             :title="durableActionDisabledReason"
             @click="ignoreDurableRecognition(file)"
           >
-            忽略此票据
+            仅作为材料保留
           </el-button>
           <el-button
             v-if="canRetryDurableRecognition(file)"
@@ -1013,12 +1067,30 @@ async function retryItemRecognition(id: string): Promise<void> {
             >
               {{ expense.receiptByItemId(scope.row.id)?.name }} · 预览
             </button>
-            <span
+            <button
               v-if="props.durable && durableFileByItemId(scope.row.id)?.name"
-              class="receipt-meta"
+              type="button"
+              class="receipt-file-preview-link receipt-meta"
+              :disabled="previewLoading"
+              :aria-label="`预览票据 ${durableFileByItemId(scope.row.id)?.name}`"
+              @click="previewItemReceipt(scope.row.id)"
             >
-              {{ durableFileByItemId(scope.row.id)?.name }} · 已保存，无本地预览
-            </span>
+              {{ durableFileByItemId(scope.row.id)?.name }} · 预览
+            </button>
+            <button
+              v-for="file in itineraryFiles(scope.row)"
+              :key="file.id"
+              type="button"
+              class="receipt-file-preview-link receipt-meta"
+              :disabled="previewLoading"
+              @click="previewDurableFile(file)"
+            >
+              行程单：{{ file.name }} · 预览
+            </button>
+            <span
+              v-if="needsItinerary(scope.row) && itineraryFiles(scope.row).length === 0"
+              class="field-error"
+            >缺少行程单，请编辑补齐</span>
             <span
               v-if="scope.row.warnings?.length"
               class="ocr-warning"
@@ -1060,6 +1132,16 @@ async function retryItemRecognition(id: string): Promise<void> {
       >
         <template #default="scope">
           {{ scope.row.amount ? `¥${scope.row.amount}` : '待补充' }}
+          <div
+            v-if="isForeignExpense(scope.row)"
+            class="receipt-meta"
+          >
+            原币 {{ scope.row.originalAmount || '待补充' }} {{ scope.row.originalCurrency || '币种待确认' }}
+            <span
+              v-if="!scope.row.cnyAmountConfirmed"
+              class="field-error"
+            >请确认人民币金额</span>
+          </div>
         </template>
       </el-table-column>
       <el-table-column
@@ -1148,7 +1230,44 @@ async function retryItemRecognition(id: string): Promise<void> {
           v-if="props.durable && durableFileByItemId(item.id)?.name"
           class="receipt-meta"
         >
-          {{ durableFileByItemId(item.id)?.name }} · 已保存，无本地预览
+          <button
+            type="button"
+            class="receipt-file-preview-link"
+            :disabled="previewLoading"
+            @click="previewItemReceipt(item.id)"
+          >
+            {{ durableFileByItemId(item.id)?.name }} · 预览
+          </button>
+        </p>
+        <p
+          v-for="file in itineraryFiles(item)"
+          :key="file.id"
+          class="receipt-meta"
+        >
+          <button
+            type="button"
+            class="receipt-file-preview-link"
+            :disabled="previewLoading"
+            @click="previewDurableFile(file)"
+          >
+            行程单：{{ file.name }} · 预览
+          </button>
+        </p>
+        <p
+          v-if="needsItinerary(item) && itineraryFiles(item).length === 0"
+          class="field-error"
+        >
+          缺少行程单，请编辑补齐
+        </p>
+        <p
+          v-if="isForeignExpense(item)"
+          class="receipt-meta"
+        >
+          原币 {{ item.originalAmount || '待补充' }} {{ item.originalCurrency || '币种待确认' }}
+          <span
+            v-if="!item.cnyAmountConfirmed"
+            class="field-error"
+          >请确认人民币金额</span>
         </p>
         <p
           v-if="props.durable && durableFileError(durableFileByItemId(item.id))"
@@ -1223,7 +1342,7 @@ async function retryItemRecognition(id: string): Promise<void> {
       />
     </div>
     <p class="field-help receipt-preview-help">
-      <span>预览直接读取本次选择的原文件，不会额外上传或长期保存。</span>
+      <span>预览本次报销的原始材料，请核对金额、日期和票面内容。</span>
       <a
         v-if="receiptPreviewKind === 'pdf'"
         :href="receiptPreviewUrl"
@@ -1278,12 +1397,13 @@ async function retryItemRecognition(id: string): Promise<void> {
         />
       </el-form-item>
       <div class="trip-grid">
-        <el-form-item label="金额（元）">
+        <el-form-item :label="foreignEditor ? '人民币报销金额（元）' : '金额（元）'">
           <el-input
             v-model="editor.amount"
             inputmode="decimal"
             placeholder="0.00"
             maxlength="15"
+            @input="editor.cnyAmountConfirmed = false"
           />
         </el-form-item>
         <el-form-item label="票据张数">
@@ -1298,6 +1418,63 @@ async function retryItemRecognition(id: string): Promise<void> {
           />
         </el-form-item>
       </div>
+      <div class="trip-grid">
+        <el-form-item label="原票币种（不确定时可留空）">
+          <el-input
+            v-model="editor.originalCurrency"
+            placeholder="例如 VND、USD、EUR"
+            maxlength="3"
+            @input="editor.cnyAmountConfirmed = false"
+          />
+        </el-form-item>
+        <el-form-item
+          v-if="foreignEditor"
+          label="原币金额"
+        >
+          <el-input
+            v-model="editor.originalAmount"
+            placeholder="例如 97600000"
+            inputmode="decimal"
+            @input="editor.cnyAmountConfirmed = false"
+          />
+        </el-form-item>
+      </div>
+      <el-form-item v-if="foreignEditor">
+        <el-checkbox v-model="editor.cnyAmountConfirmed">
+          已核对原币金额，并确认上述人民币报销金额
+        </el-checkbox>
+        <p class="field-help">
+          人民币金额请按实际报销金额填写，系统不会把原币金额直接当作人民币。
+        </p>
+      </el-form-item>
+      <template v-if="props.durable">
+        <el-form-item>
+          <el-checkbox
+            v-model="editor.requiresItinerary"
+            :disabled="Boolean(sourceRequiresItinerary)"
+          >
+            网约车费用（必须有对应行程单）
+          </el-checkbox>
+        </el-form-item>
+        <el-form-item label="对应行程单 / 证明材料">
+          <el-select
+            v-model="editor.itineraryFileIds"
+            multiple
+            class="full-width"
+            placeholder="选择已经上传的对应材料"
+          >
+            <el-option
+              v-for="file in itineraryOptions"
+              :key="file.id"
+              :label="file.name"
+              :value="file.id"
+            />
+          </el-select>
+          <p class="field-help">
+            先上传行程单，再确认对应关系。一份行程单包含多次行程时，可关联多条费用；汇总 PDF 中只保留一份。
+          </p>
+        </el-form-item>
+      </template>
     </el-form>
     <template #footer>
       <el-button @click="editorVisible = false">

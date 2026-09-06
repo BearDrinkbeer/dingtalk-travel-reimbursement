@@ -39,6 +39,10 @@ export interface OcrReceiptCandidate {
   date: string | null
   description: string | null
   amount: string | null
+  transportType?: 'ride_hailing' | 'taxi' | 'rail' | 'hotel' | 'other'
+  requiresItinerary?: boolean
+  originalCurrency?: string | null
+  originalAmount?: string | null
   receiptCount: 1
   source: 'ocr'
   confidence: string

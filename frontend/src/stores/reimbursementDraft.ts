@@ -93,6 +93,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
   const revisionConflict = ref(false)
 
   let lifecycleEpoch = 0
+  let mutationQueue: Promise<unknown> | null = null
   let currentIntentVersion = 0
   let draftCollectionVersion = 0
   let listRequestVersion = 0
@@ -405,7 +406,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
       draftCollectionVersion += 1
     } catch (error) {
       if (accepts(context) && requestVersion === listRequestVersion && !isCancellation(error)) {
-        listError.value = apiErrorMessage(error, '报销草稿列表加载失败，请重试')
+        listError.value = apiErrorMessage(error, '报销报销内容列表加载失败，请重试')
       }
     } finally {
       releaseRequest(context)
@@ -429,7 +430,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
         return { draft, files: fileList.items }
       }
     }
-    throw new Error('草稿读取期间持续发生变化，请稍后重试')
+    throw new Error('报销内容读取期间持续发生变化，请稍后重试')
   }
 
   async function loadDraft(draftId: string): Promise<void> {
@@ -470,7 +471,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
       ) {
         tombstoneDraft(draftId)
       } else if (canHandleFailure) {
-        loadError.value = apiErrorMessage(error, '报销草稿加载失败，请重试')
+        loadError.value = apiErrorMessage(error, '报销报销内容加载失败，请重试')
       }
     } finally {
       releaseRequest(context)
@@ -505,7 +506,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
         && intentVersion === currentIntentVersion
         && !isCancellation(error)
       ) {
-        mutationError.value = apiErrorMessage(error, '报销草稿创建失败，请重试')
+        mutationError.value = apiErrorMessage(error, '报销报销内容创建失败，请重试')
       }
       throw error
     } finally {
@@ -518,7 +519,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
   }
 
   function requireCurrentDraft(): ReimbursementDraft {
-    if (currentDraft.value === null) throw new Error('请先创建或打开报销草稿')
+    if (currentDraft.value === null) throw new Error('报销内容尚未加载，请稍后重试')
     return currentDraft.value
   }
 
@@ -589,7 +590,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
     }
   }
 
-  async function mutateCurrent<T extends RevisionedResult>(
+  async function performMutation<T extends RevisionedResult>(
     request: (
       draftId: string,
       expectedRevision: number,
@@ -638,13 +639,13 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
         if (conflict) {
           revisionConflict.value = true
           mutationError.value = refreshed
-            ? '草稿已在其他页面更新，已加载最新内容；请检查后重新操作'
-            : '草稿已在其他页面更新，最新内容加载失败；请手动重新加载'
+            ? '报销内容已在其他页面更新，已加载最新内容；请检查后重新操作'
+            : '报销内容已在其他页面更新，最新内容加载失败；请手动重新加载'
         } else {
           const message = apiErrorMessage(error, fallbackMessage)
           mutationError.value = options.reloadAfterFailure
             ? refreshed
-              ? `${message}；已同步草稿最新状态`
+              ? `${message}；已同步报销内容最新状态`
               : `${message}；最新状态同步失败，请手动重新加载`
             : message
         }
@@ -657,6 +658,28 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
         pendingMutations.value -= 1
       }
     }
+  }
+
+  function mutateCurrent<T extends RevisionedResult>(
+    request: (draftId: string, expectedRevision: number, signal: AbortSignal) => Promise<T>,
+    apply: (result: T, draftId: string, context: RequestContext) => void,
+    fallbackMessage: string,
+    options: MutationOptions = {},
+  ): Promise<T> {
+    const draftId = requireCurrentDraft().id
+    const epoch = lifecycleEpoch
+    const run = () => {
+      if (epoch !== lifecycleEpoch || currentDraft.value?.id !== draftId) {
+        throw new Error('当前报销已切换，请重新操作')
+      }
+      return performMutation(request, apply, fallbackMessage, options)
+    }
+    const operation = mutationQueue ? mutationQueue.then(run) : run()
+    const settled = operation.catch(() => undefined).finally(() => {
+      if (mutationQueue === settled) mutationQueue = null
+    })
+    mutationQueue = settled
+    return operation
   }
 
   function applyDraftMutation(
@@ -685,7 +708,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
         { signal },
       ),
       applyDraftMutation,
-      '报销草稿保存失败，请重试',
+      '报销报销内容保存失败，请重试',
     )
   }
 
@@ -708,7 +731,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
         { signal: context.controller.signal },
       )
       if (result.deletedDraftId !== draftId) {
-        throw new Error('草稿删除响应无效，请刷新后确认草稿状态')
+        throw new Error('报销内容删除响应无效，请刷新后确认报销内容状态')
       }
       if (!accepts(context)) return result
       tombstoneDraft(draftId, collectionVersion === draftCollectionVersion)
@@ -727,12 +750,12 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
         if (conflict) {
           revisionConflict.value = true
           mutationError.value = refreshed
-            ? '草稿已在其他页面更新，已加载最新内容；请检查后重新删除'
-            : '草稿已在其他页面更新，未删除草稿；请刷新后重试'
+            ? '报销内容已在其他页面更新，已加载最新内容；请检查后重新删除'
+            : '报销内容已在其他页面更新，未删除报销内容；请刷新后重试'
         } else {
-          const message = apiErrorMessage(error, '报销草稿删除失败，请重试')
+          const message = apiErrorMessage(error, '报销报销内容删除失败，请重试')
           mutationError.value = refreshed
-            ? `${message}；已同步草稿最新状态`
+            ? `${message}；已同步报销内容最新状态`
             : `${message}；最新状态同步失败，请手动重新加载`
         }
       }
@@ -774,7 +797,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
         { signal },
       ),
       applyDraftMutation,
-      '草稿检查失败，请核对内容后重试',
+      '报销内容检查失败，请核对内容后重试',
     )
   }
 
@@ -913,8 +936,8 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
         ) {
           revisionConflict.value = true
           mutationError.value = refreshed
-            ? '草稿已在其他页面更新，已加载最新内容；请检查后重新操作'
-            : '草稿已在其他页面更新，最新内容加载失败；请手动重新加载'
+            ? '报销内容已在其他页面更新，已加载最新内容；请检查后重新操作'
+            : '报销内容已在其他页面更新，最新内容加载失败；请手动重新加载'
         }
       } else if (
         accepts(context)
@@ -940,6 +963,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
 
   function reset(): void {
     lifecycleEpoch += 1
+    mutationQueue = null
     currentIntentVersion += 1
     draftCollectionVersion += 1
     listRequestVersion += 1

@@ -287,7 +287,7 @@ def test_alembic_0003_preserves_legacy_rate_for_old_automatic_types(
                 row[1]
                 for row in connection.execute("PRAGMA table_info(oa_template_profiles)").fetchall()
             }
-        assert revision == ("20260904_0011",)
+        assert revision == ("20260906_0012",)
         assert keyword_count == (18,)
         assert keyword_columns == {
             "id",
@@ -380,7 +380,7 @@ def test_alembic_0008_adds_nullable_union_id_without_fabricating_legacy_identity
                 ("legacy-session",),
             ).fetchone()
 
-        assert revision == ("20260904_0011",)
+        assert revision == ("20260906_0012",)
         assert "dingtalk_union_id" in session_columns
         assert union_id == (None,)
     finally:

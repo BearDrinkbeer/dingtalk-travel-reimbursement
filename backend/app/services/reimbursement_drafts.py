@@ -11,7 +11,6 @@ from app.core.errors import ApiError
 from app.domain.expenses import calculate_expense_totals
 from app.domain.subsidy import calculate_subsidy
 from app.integrations.dingtalk.workflow import DingTalkWorkflowClient, FormOption
-from app.models.project import Project
 from app.models.reimbursement import (
     ReimbursementDraft,
     ReimbursementDraftFile,
@@ -22,9 +21,11 @@ from app.models.reimbursement import (
     ReimbursementOcrStatus,
     utc_now,
 )
-from app.schemas.excel import ManualProjectInput, SelectedProjectInput
+from app.schemas.excel import ExcelExpenseItemInput
+from app.schemas.expenses import TripInput
 from app.schemas.reimbursements import (
     CURRENT_OCR_DISPOSITION_VERSION,
+    BudgetProjectInput,
     ReimbursementDraftExpenseItemInput,
     ReimbursementDraftInput,
     RelatedApprovalSelectionInput,
@@ -171,12 +172,12 @@ def bump_owned_draft_revision(
     if current.revision != expected_revision:
         raise ApiError(
             "REIMBURSEMENT_DRAFT_REVISION_CONFLICT",
-            "草稿已在其他页面更新，请刷新后重试",
+            "报销内容已在其他页面更新，请刷新后重试",
             409,
         )
     raise ApiError(
         "REIMBURSEMENT_DRAFT_REVISION_CONFLICT",
-        "草稿状态已变化，请刷新后重试",
+        "报销状态已变化，请刷新后重试",
         409,
     )
 
@@ -191,7 +192,9 @@ def create_reimbursement_draft(
     now: datetime | None = None,
 ) -> dict[str, object]:
     created_at = now or utc_now()
-    if _draft_file_reference_ids(draft_input):
+    if _draft_file_reference_ids(draft_input) or any(
+        item.itinerary_file_ids for item in draft_input.items
+    ):
         raise _invalid_file_reference_error()
     draft_input = draft_input.model_copy(
         update={"ocr_disposition_version": CURRENT_OCR_DISPOSITION_VERSION}
@@ -203,6 +206,7 @@ def create_reimbursement_draft(
         draft_input=draft_input,
         max_items=max_items,
         validate_project=True,
+        allow_partial=True,
     )
     binding = CatalogBinding.from_catalog(catalog)
     draft = ReimbursementDraft(
@@ -299,18 +303,20 @@ def update_reimbursement_draft(
         draft_id=draft.id,
         draft_input=draft_input,
     )
+    draft_input = apply_ocr_evidence(database, draft_id=draft.id, draft_input=draft_input)
     calculation = validate_and_calculate_input(
         database,
         catalog=catalog,
         draft_input=draft_input,
         max_items=max_items,
         validate_project=True,
+        allow_partial=True,
     )
     validate_draft_file_references(
         database,
         draft_id=draft.id,
         draft_input=draft_input,
-        require_terminal_disposition=True,
+        require_terminal_disposition=False,
     )
     try:
         new_revision = bump_owned_draft_revision(
@@ -368,6 +374,7 @@ def mark_reimbursement_draft_review_ready(
         draft_id=draft.id,
         draft_input=draft_input,
     )
+    draft_input = apply_ocr_evidence(database, draft_id=draft.id, draft_input=draft_input)
     calculation = validate_and_calculate_input(
         database,
         catalog=catalog,
@@ -490,6 +497,7 @@ def validate_and_calculate_input(
     draft_input: ReimbursementDraftInput,
     max_items: int,
     validate_project: bool,
+    allow_partial: bool = False,
 ) -> DraftCalculation:
     if len(draft_input.items) > max_items:
         raise ApiError(
@@ -497,11 +505,64 @@ def validate_and_calculate_input(
             f"当前部署每张报销单最多处理 {max_items} 条费用明细",
             422,
         )
-    _require_exact_option(catalog, "company", draft_input.company_value)
-    _require_exact_option(catalog, "budgetCode", draft_input.budget_code_value)
-    if validate_project:
-        _validate_project(database, draft_input)
-    return _calculate_input(database, draft_input)
+    if draft_input.company_value or not allow_partial:
+        _require_exact_option(catalog, "company", draft_input.company_value)
+    budget = None
+    if draft_input.budget_code_value or not allow_partial:
+        budget = _require_exact_option(catalog, "budgetCode", draft_input.budget_code_value)
+    # The obsolete project argument stays accepted for stored callers, but the
+    # currently selected OA option is always authoritative for new saved input.
+    draft_input = draft_input.model_copy(
+        update={
+            "project": BudgetProjectInput(mode="manual", text=budget.label) if budget else None,
+        }
+    )
+    if not allow_partial:
+        require_complete_draft_input(draft_input)
+    return _calculate_input(database, draft_input, allow_partial=allow_partial)
+
+
+def complete_expense_items(draft_input: ReimbursementDraftInput) -> list[ExcelExpenseItemInput]:
+    """Only validated workbook fields may reach arithmetic or generation."""
+    return [
+        ExcelExpenseItemInput.model_validate(
+            item.model_dump(
+                mode="json",
+                by_alias=True,
+                include=set(ExcelExpenseItemInput.model_fields),
+            )
+        )
+        for item in draft_input.items
+    ]
+
+
+def require_complete_draft_input(draft_input: ReimbursementDraftInput) -> None:
+    try:
+        complete_expense_items(draft_input)
+    except ValueError:
+        raise _not_ready_error("请补齐费用的日期、说明和人民币报销金额") from None
+    if any(
+        (
+            item.requires_cny_confirmation
+            or (item.original_currency and item.original_currency != "CNY")
+        )
+        and not item.cny_amount_confirmed
+        for item in draft_input.items
+    ):
+        raise _not_ready_error("请填写并确认海外票据对应的人民币报销金额")
+    state = draft_input.editing_state
+    if state is not None:
+        if not state.include_subsidy and draft_input.trip is not None:
+            raise _not_ready_error("出差补助选择已变化，请重新确认")
+        if state.include_subsidy:
+            raw = state.trip.model_dump(mode="json", by_alias=True)
+            if not raw.get("confirmedEffectiveDays"):
+                raw.pop("confirmedEffectiveDays", None)
+            try:
+                if TripInput.model_validate(raw) != draft_input.trip:
+                    raise ValueError("editing trip differs")
+            except ValueError:
+                raise _not_ready_error("请补齐并确认出差补助的日期和时间") from None
 
 
 def validate_draft_file_references(
@@ -510,6 +571,7 @@ def validate_draft_file_references(
     draft_id: str,
     draft_input: ReimbursementDraftInput,
     require_terminal_disposition: bool = False,
+    require_submission_proofs: bool = False,
 ) -> None:
     """Validate receipt provenance without revealing another draft's files."""
 
@@ -523,11 +585,21 @@ def validate_draft_file_references(
     files_by_id = {item.id: item for item in files}
     if any(
         file_id not in files_by_id
-        or files_by_id[file_id].processing_role
-        != ReimbursementDraftFileRole.EXPENSE_SOURCE.value
+        or files_by_id[file_id].processing_role != ReimbursementDraftFileRole.EXPENSE_SOURCE.value
         for file_id in reference_ids
     ):
         raise _invalid_file_reference_error()
+
+    for item in draft_input.items:
+        if any(
+            file_id not in files_by_id
+            or files_by_id[file_id].processing_role
+            != ReimbursementDraftFileRole.ATTACHMENT_ONLY.value
+            for file_id in item.itinerary_file_ids
+        ):
+            raise _invalid_file_reference_error()
+    if require_submission_proofs:
+        validate_submission_evidence(draft_input, files_by_id)
 
     if not require_terminal_disposition:
         return
@@ -545,6 +617,80 @@ def validate_draft_file_references(
         raise _not_ready_error("请确认每张已识别票据的费用明细，或明确忽略识别结果")
 
 
+def validate_submission_evidence(
+    draft_input: ReimbursementDraftInput,
+    files_by_id: dict[str, ReimbursementDraftFile],
+) -> None:
+    for item in draft_input.items:
+        evidence = file_ocr_evidence(files_by_id.get(item.source_file_id or ""))
+        requires_itinerary = (
+            item.requires_itinerary
+            or item.transport_type == "ride_hailing"
+            or evidence.get("requiresItinerary") is True
+            or evidence.get("transportType") == "ride_hailing"
+        )
+        if requires_itinerary and not item.itinerary_file_ids:
+            raise _not_ready_error("网约车费用缺少对应行程单，请上传并关联后提交")
+        currency = evidence.get("originalCurrency") or item.original_currency
+        if (
+            item.requires_cny_confirmation
+            or _evidence_requires_cny_confirmation(evidence)
+            or (currency and currency != "CNY")
+        ) and not item.cny_amount_confirmed:
+            raise _not_ready_error("请填写并确认海外票据对应的人民币报销金额")
+
+
+def _evidence_requires_cny_confirmation(evidence: dict[str, object]) -> bool:
+    warnings = evidence.get("warnings")
+    return evidence.get("type") == "foreign_receipt" or (
+        isinstance(warnings, list) and "FOREIGN_CURRENCY_REQUIRES_CNY_AMOUNT" in warnings
+    )
+
+
+def file_ocr_evidence(file: ReimbursementDraftFile | None) -> dict[str, object]:
+    if file is None:
+        return {}
+    try:
+        value = json.loads(file.ocr_result_json or "null")
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def apply_ocr_evidence(
+    database: Session,
+    *,
+    draft_id: str,
+    draft_input: ReimbursementDraftInput,
+) -> ReimbursementDraftInput:
+    files = database.scalars(
+        select(ReimbursementDraftFile).where(
+            ReimbursementDraftFile.draft_id == draft_id,
+            ReimbursementDraftFile.file_status == ReimbursementDraftFileStatus.ACTIVE.value,
+        )
+    ).all()
+    by_id = {file.id: file for file in files}
+    items = []
+    for item in draft_input.items:
+        evidence = file_ocr_evidence(by_id.get(item.source_file_id or ""))
+        values = item.model_dump(mode="json", by_alias=True)
+        if (
+            evidence.get("requiresItinerary") is True
+            or evidence.get("transportType") == "ride_hailing"
+        ):
+            values.update(requiresItinerary=True, transportType="ride_hailing")
+        currency = evidence.get("originalCurrency")
+        if _evidence_requires_cny_confirmation(evidence):
+            values["requiresCnyConfirmation"] = True
+        if isinstance(currency, str) and currency != "CNY":
+            values["requiresCnyConfirmation"] = True
+            values["originalCurrency"] = currency
+            if evidence.get("originalAmount") is not None:
+                values["originalAmount"] = evidence["originalAmount"]
+        items.append(ReimbursementDraftExpenseItemInput.model_validate(values))
+    return draft_input.model_copy(update={"items": items})
+
+
 def detach_draft_file_from_input(
     database: Session,
     *,
@@ -560,14 +706,21 @@ def detach_draft_file_from_input(
         draft_input=draft_input,
     )
     remaining_items = [
-        item for item in draft_input.items if item.source_file_id != file_id
+        item.model_copy(
+            update={
+                "itinerary_file_ids": [
+                    value for value in item.itinerary_file_ids if value != file_id
+                ]
+            }
+        )
+        for item in draft_input.items
+        if item.source_file_id != file_id
     ]
     remaining_dismissed = [
         value for value in draft_input.dismissed_ocr_file_ids if value != file_id
     ]
-    if (
-        len(remaining_items) == len(draft_input.items)
-        and len(remaining_dismissed) == len(draft_input.dismissed_ocr_file_ids)
+    if remaining_items == draft_input.items and len(remaining_dismissed) == len(
+        draft_input.dismissed_ocr_file_ids
     ):
         return _calculate_input(database, draft_input)
     updated_input = draft_input.model_copy(
@@ -582,20 +735,35 @@ def detach_draft_file_from_input(
 def _calculate_input(
     database: Session,
     draft_input: ReimbursementDraftInput,
+    *,
+    allow_partial: bool = True,
 ) -> DraftCalculation:
     subsidy = None
     if draft_input.trip is not None:
         settings = get_expense_settings(database)
         trip_type = draft_input.trip.subsidy_trip_type()
-        subsidy = calculate_subsidy(
-            trip_type=trip_type,
-            period=draft_input.trip.as_period(),
-            configured_daily_rate=settings.daily_rate_for(trip_type),
-            policy_confirmed=draft_input.trip.policy_confirmed,
-            confirmed_effective_days=draft_input.trip.confirmed_effective_days,
-            no_subsidy_exception=draft_input.trip.no_subsidy_exception,
-        )
-    totals = calculate_expense_totals(draft_input.items, subsidy).as_api_dict()
+        try:
+            subsidy = calculate_subsidy(
+                trip_type=trip_type,
+                period=draft_input.trip.as_period(),
+                configured_daily_rate=settings.daily_rate_for(trip_type),
+                policy_confirmed=draft_input.trip.policy_confirmed,
+                confirmed_effective_days=draft_input.trip.confirmed_effective_days,
+                no_subsidy_exception=draft_input.trip.no_subsidy_exception,
+            )
+        except (ApiError, ValueError):
+            if not allow_partial:
+                raise
+    complete = []
+    for item in draft_input.items:
+        try:
+            complete.extend(
+                complete_expense_items(draft_input.model_copy(update={"items": [item]}))
+            )
+        except ValueError:
+            if not allow_partial:
+                raise
+    totals = calculate_expense_totals(complete, subsidy).as_api_dict()
     totals["subsidy"] = subsidy.as_api_dict() if subsidy is not None else None
     input_data = _canonical_input_data(draft_input)
     return DraftCalculation(
@@ -721,11 +889,17 @@ def _store_related_approvals(
 
 
 def _canonical_input_data(draft_input: ReimbursementDraftInput) -> dict[str, object]:
-    project = draft_input.project.model_dump(mode="json", by_alias=True)
+    project = (
+        draft_input.project.model_dump(mode="json", by_alias=True) if draft_input.project else None
+    )
     items = [
-        item.model_dump(mode="json", by_alias=True, exclude_none=True)
-        for item in draft_input.items
+        item.model_dump(mode="json", by_alias=True, exclude_none=True) for item in draft_input.items
     ]
+    for item, value in zip(draft_input.items, items, strict=True):
+        if item.date is None:
+            value["date"] = None
+        if item.amount is None:
+            value["amount"] = None
     trip: dict[str, object] | None = None
     if draft_input.trip is not None:
         trip = draft_input.trip.model_dump(
@@ -736,7 +910,7 @@ def _canonical_input_data(draft_input: ReimbursementDraftInput) -> dict[str, obj
         )
         trip["startTime"] = draft_input.trip.start_time.strftime("%H:%M")
         trip["endTime"] = draft_input.trip.end_time.strftime("%H:%M")
-    return {
+    result = {
         "ocrDispositionVersion": draft_input.ocr_disposition_version,
         "companyValue": draft_input.company_value,
         "budgetCodeValue": draft_input.budget_code_value,
@@ -745,6 +919,9 @@ def _canonical_input_data(draft_input: ReimbursementDraftInput) -> dict[str, obj
         "items": items,
         "dismissedOcrFileIds": list(draft_input.dismissed_ocr_file_ids),
     }
+    if draft_input.editing_state is not None:
+        result["editingState"] = draft_input.editing_state.model_dump(mode="json", by_alias=True)
+    return result
 
 
 def _normalize_legacy_ocr_dispositions(
@@ -788,17 +965,14 @@ def _bind_unique_legacy_ocr_matches(
         return draft_input
 
     linked_ids = {
-        item.source_file_id
-        for item in draft_input.items
-        if item.source_file_id is not None
+        item.source_file_id for item in draft_input.items if item.source_file_id is not None
     }
     decided_ids = linked_ids | set(draft_input.dismissed_ocr_file_ids)
     terminal_files = database.scalars(
         select(ReimbursementDraftFile)
         .where(
             ReimbursementDraftFile.draft_id == draft_id,
-            ReimbursementDraftFile.file_status
-            == ReimbursementDraftFileStatus.ACTIVE.value,
+            ReimbursementDraftFile.file_status == ReimbursementDraftFileStatus.ACTIVE.value,
             ReimbursementDraftFile.processing_role
             == ReimbursementDraftFileRole.EXPENSE_SOURCE.value,
             ReimbursementDraftFile.ocr_status.in_(
@@ -873,11 +1047,7 @@ def _legacy_file_match_key(file: ReimbursementDraftFile) -> tuple[object, ...] |
 
 def _draft_file_reference_ids(draft_input: ReimbursementDraftInput) -> set[str]:
     return {
-        *(
-            item.source_file_id
-            for item in draft_input.items
-            if item.source_file_id is not None
-        ),
+        *(item.source_file_id for item in draft_input.items if item.source_file_id is not None),
         *draft_input.dismissed_ocr_file_ids,
     }
 
@@ -888,19 +1058,9 @@ def _stored_input(draft: ReimbursementDraft) -> ReimbursementDraftInput:
     except ValueError:
         raise ApiError(
             "REIMBURSEMENT_DRAFT_CORRUPTED",
-            "草稿数据损坏，请联系管理员",
+            "报销数据损坏，请联系管理员",
             500,
         ) from None
-
-
-def _validate_project(database: Session, draft_input: ReimbursementDraftInput) -> None:
-    if isinstance(draft_input.project, ManualProjectInput):
-        return
-    if not isinstance(draft_input.project, SelectedProjectInput):
-        raise ValueError("unsupported project input")
-    project = database.get(Project, draft_input.project.id)
-    if project is None or not project.enabled:
-        raise ApiError("PROJECT_NOT_FOUND", "项目不存在或已停用", 404)
 
 
 def _require_exact_option(
@@ -990,8 +1150,7 @@ def _validate_related_snapshot(
         return
 
     if any(
-        item.travel_end_date < reimbursement_start
-        or item.travel_start_date > reimbursement_end
+        item.travel_end_date < reimbursement_start or item.travel_start_date > reimbursement_end
         for item in related
     ):
         raise ApiError(
@@ -1033,6 +1192,7 @@ def _validate_file_snapshot(
         draft_id=draft_id,
         draft_input=draft_input,
         require_terminal_disposition=True,
+        require_submission_proofs=True,
     )
 
 
@@ -1040,16 +1200,16 @@ def _require_department(draft: ReimbursementDraft, actor: DraftActor) -> None:
     if draft.department_id != actor.department_id or draft.department_name != actor.department_name:
         raise ApiError(
             "REIMBURSEMENT_DRAFT_DEPARTMENT_MISMATCH",
-            "草稿所属部门与当前选择不同，请切换部门后重试",
+            "本次报销所属部门与当前选择不同，请切换部门后重试",
             409,
         )
 
 
 def _require_mutable(draft: ReimbursementDraft, *, now: datetime) -> None:
     if draft.expires_at <= now or draft.status == ReimbursementDraftStatus.EXPIRED.value:
-        raise ApiError("REIMBURSEMENT_DRAFT_EXPIRED", "草稿已过期，请重新创建", 409)
+        raise ApiError("REIMBURSEMENT_DRAFT_EXPIRED", "报销资料已过期，请重新填写", 409)
     if draft.status not in _MUTABLE_STATUSES or draft.locked_at is not None:
-        raise ApiError("REIMBURSEMENT_DRAFT_LOCKED", "草稿已锁定，不能继续修改", 409)
+        raise ApiError("REIMBURSEMENT_DRAFT_LOCKED", "报销已进入提交处理，不能继续修改", 409)
 
 
 def _draft_summary(draft: ReimbursementDraft, *, now: datetime) -> dict[str, object]:
@@ -1126,13 +1286,13 @@ def _timestamp(value: datetime | None) -> str | None:
 
 
 def _not_found_error() -> ApiError:
-    return ApiError("REIMBURSEMENT_DRAFT_NOT_FOUND", "草稿不存在", 404)
+    return ApiError("REIMBURSEMENT_DRAFT_NOT_FOUND", "报销记录不存在", 404)
 
 
 def _revision_conflict_error() -> ApiError:
     return ApiError(
         "REIMBURSEMENT_DRAFT_REVISION_CONFLICT",
-        "草稿已在其他页面更新，请刷新后重试",
+        "报销内容已在其他页面更新，请刷新后重试",
         409,
     )
 
@@ -1140,7 +1300,7 @@ def _revision_conflict_error() -> ApiError:
 def _template_changed_error() -> ApiError:
     return ApiError(
         "REIMBURSEMENT_DRAFT_TEMPLATE_CHANGED",
-        "OA 审批模板已更新，请重新创建草稿",
+        "OA 审批模板已更新，请重新发起报销",
         409,
     )
 
@@ -1160,6 +1320,6 @@ def _invalid_file_reference_error() -> ApiError:
 def _corrupted_error() -> ApiError:
     return ApiError(
         "REIMBURSEMENT_DRAFT_CORRUPTED",
-        "草稿数据损坏，请联系管理员",
+        "报销数据损坏，请联系管理员",
         500,
     )

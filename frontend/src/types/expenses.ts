@@ -37,6 +37,13 @@ export interface ExpenseItem {
   id: string
   /** Stable provenance for a line created from a persisted reimbursement draft file. */
   sourceFileId?: string
+  itineraryFileIds?: string[]
+  requiresItinerary?: boolean
+  transportType?: 'ride_hailing' | 'taxi' | 'rail' | 'hotel' | 'other'
+  originalCurrency?: string
+  originalAmount?: string
+  cnyAmountConfirmed?: boolean
+  requiresCnyConfirmation?: boolean
   category: ExpenseCategoryId
   date?: string
   displayDate: string
@@ -46,6 +53,12 @@ export interface ExpenseItem {
   source: 'ocr' | 'manual' | 'system'
   confidence?: string
   warnings?: string[]
+}
+
+export function isForeignExpense(item: Pick<ExpenseItem, 'originalCurrency' | 'warnings' | 'requiresCnyConfirmation'>): boolean {
+  return Boolean(item.requiresCnyConfirmation)
+    || Boolean(item.originalCurrency && item.originalCurrency.toUpperCase() !== 'CNY')
+    || Boolean(item.warnings?.includes('FOREIGN_CURRENCY_REQUIRES_CNY_AMOUNT'))
 }
 
 export interface SubsidyResult {

@@ -168,6 +168,8 @@ async def validate_new_file(
     extension: str,
     settings: Settings,
     process_runner: KillableProcessRunner,
+    *,
+    supporting_pdf: bool = False,
 ) -> None:
     """Perform expensive image/PDF validation away from the event loop."""
 
@@ -178,6 +180,7 @@ async def validate_new_file(
                 str(path),
                 settings.pdf_limits,
                 settings.file_worker_limits,
+                *((30,) if supporting_pdf else ()),
                 timeout_seconds=settings.pdf_preflight_timeout_seconds,
             )
         else:
