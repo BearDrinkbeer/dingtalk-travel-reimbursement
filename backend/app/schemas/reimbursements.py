@@ -13,6 +13,7 @@ from app.schemas.primitives import DecimalString, StrictCalendarDate
 
 MAX_RELATED_APPROVALS = 20
 CURRENT_OCR_DISPOSITION_VERSION = 1
+RailType = Literal["high_speed", "emu", "regular", "unknown"]
 
 
 class BudgetProjectInput(ManualProjectInput):
@@ -55,6 +56,13 @@ class ReimbursementDraftExpenseItemInput(BaseModel):
     itinerary_file_ids: list[str] = Field(
         default_factory=list, alias="itineraryFileIds", max_length=100
     )
+    itinerary_auto_match_disabled: bool = Field(
+        default=False, alias="itineraryAutoMatchDisabled", strict=True
+    )
+    payment_proof_file_ids: list[str] = Field(
+        default_factory=list, alias="paymentProofFileIds", max_length=100
+    )
+    rail_type: RailType = Field(default="unknown", alias="railType")
     requires_itinerary: bool = Field(default=False, alias="requiresItinerary", strict=True)
     transport_type: Literal["ride_hailing", "taxi", "rail", "hotel", "other"] | None = Field(
         default=None, alias="transportType"
@@ -96,12 +104,12 @@ class ReimbursementDraftExpenseItemInput(BaseModel):
             raise ValueError("subsidy is calculated by the server")
         return value
 
-    @field_validator("itinerary_file_ids")
+    @field_validator("itinerary_file_ids", "payment_proof_file_ids")
     @classmethod
     def normalize_itinerary_ids(cls, values: list[str]) -> list[str]:
         result = [value.strip() for value in values]
         if any(not value or len(value) > 36 for value in result) or len(result) != len(set(result)):
-            raise ValueError("itineraryFileIds must contain unique valid file ids")
+            raise ValueError("proof file ids must contain unique valid file ids")
         return result
 
     source_file_id: str | None = Field(

@@ -216,7 +216,7 @@ describe('persistent reimbursement API', () => {
     expect(call[1]).toBeInstanceOf(FormData)
     expect((call[1] as FormData).getAll('files[]')).toEqual([file])
     expect(call[2]).toMatchObject({
-      params: { expectedRevision: 1, role: 'ATTACHMENT_ONLY' },
+      params: { expectedRevision: 1, role: 'ATTACHMENT_ONLY', attachmentKind: 'other' },
       timeout: 120_000,
     })
     expect(call[2]).not.toHaveProperty('headers.Content-Type')

@@ -12,6 +12,7 @@ import { useHealthStore } from '@/stores/health'
 import { useReimbursementDraftStore } from '@/stores/reimbursementDraft'
 import { useReimbursementSubmissionStore } from '@/stores/reimbursementSubmission'
 import { isForeignExpense } from '@/types/expenses'
+import { isActiveProof, requiresPaymentProof } from '@/utils/expenseProofs'
 import type {
   ReimbursementDraft,
   ReimbursementDraftInput,
@@ -269,11 +270,14 @@ function validateSubmission(): string {
   if (!drafts.files.some((file) => file.status === 'ACTIVE')) return '请上传报销材料'
   for (const item of expense.items) {
     if ((item.requiresItinerary || item.transportType === 'ride_hailing') && !item.itineraryFileIds?.some((id) =>
-      drafts.files.some((file) => file.id === id && file.status === 'ACTIVE' && file.role === 'ATTACHMENT_ONLY'),
+      drafts.files.some((file) => file.id === id && isActiveProof(file, 'itinerary')),
     )) return `“${item.description || '网约车费用'}”缺少对应行程单，请点击编辑补齐`
     if (isForeignExpense(item) && !item.cnyAmountConfirmed) {
       return `请确认“${item.description || '国外票据'}”的人民币报销金额`
     }
+    if (requiresPaymentProof(item) && !item.paymentProofFileIds?.some((id) =>
+      drafts.files.some((file) => file.id === id && isActiveProof(file, 'payment_proof')),
+    )) return `“${item.description || '本行费用'}”超过 500 元，请补充付款凭证`
   }
   return ''
 }

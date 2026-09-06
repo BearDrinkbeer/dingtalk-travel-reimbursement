@@ -20,6 +20,7 @@ from app.ocr.extractors import (
     PASSENGER_OCCURRENCE_DATE_PREFIX,
     PASSENGER_ROUTE_PREFIX,
     extract_passenger_fields_from_layout,
+    extract_passenger_transport_from_layout,
 )
 from app.ocr.pdf_inspection import PdfLimits, inspect_single_page_pdf
 from app.ocr.qr import decode_invoice_qr, invoice_qr_to_payload
@@ -50,6 +51,10 @@ def _append_passenger_fields(
         lines.append((f"{PASSENGER_OCCURRENCE_DATE_PREFIX}{occurrence_date.isoformat()}", 1.0))
     if route:
         lines.append((f"{PASSENGER_ROUTE_PREFIX}{route}", 1.0))
+    if all(header in plain_text for header in _PASSENGER_ROUTE_HEADERS):
+        transport = extract_passenger_transport_from_layout(layout_text)
+        if transport:
+            lines.insert(0, (f"交通工具类型：{transport}", 1.0))
 
 
 def apply_worker_limits(raw_limits: dict[str, int]) -> None:

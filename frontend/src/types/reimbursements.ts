@@ -6,7 +6,7 @@ import type {
   ExcelProjectInput,
   TripInput,
 } from '@/types/expenses'
-import type { OcrReceiptCandidate } from '@/types/receipts'
+import { isItineraryOcrResult, type ItineraryOcrResult, type OcrReceiptCandidate } from '@/types/receipts'
 import type { OaFormOption } from '@/types/oa'
 
 export type ReimbursementDraftStatus =
@@ -20,6 +20,9 @@ export interface ReimbursementDraftExpenseItemInput extends Omit<ExcelExpenseIte
   amount: string | null
   sourceFileId?: string
   itineraryFileIds?: string[]
+  itineraryAutoMatchDisabled?: boolean
+  paymentProofFileIds?: string[]
+  railType?: ExpenseItem['railType']
   requiresItinerary?: boolean
   transportType?: ExpenseItem['transportType']
   originalCurrency?: string
@@ -154,6 +157,8 @@ export type ReimbursementDraftFileRole =
   | 'EXPENSE_SOURCE'
   | 'ATTACHMENT_ONLY'
 
+export type ReimbursementAttachmentKind = 'itinerary' | 'payment_proof' | 'other'
+
 export type ReimbursementDraftFileStatus =
   | 'RESERVED'
   | 'WRITING'
@@ -172,12 +177,18 @@ export interface ReimbursementDraftFile {
   id: string
   name: string
   role: ReimbursementDraftFileRole
+  attachmentKind: ReimbursementAttachmentKind
   sortOrder: number
   status: ReimbursementDraftFileStatus
   mediaType: string
   sizeBytes: number
   ocrStatus: ReimbursementDraftFileOcrStatus
-  ocrResult: OcrReceiptCandidate | null
+  ocrResult: OcrReceiptCandidate | ItineraryOcrResult | null
+}
+
+export function receiptOcrResult(file: ReimbursementDraftFile | undefined): OcrReceiptCandidate | null {
+  const result = file?.ocrResult
+  return result && !isItineraryOcrResult(result) ? result : null
 }
 
 export interface ReimbursementDraftFileList {
@@ -205,6 +216,7 @@ export interface ReimbursementDraftDeletion {
 export interface ReimbursementDraftFileUpdate {
   expectedRevision: number
   role?: ReimbursementDraftFileRole
+  attachmentKind?: ReimbursementAttachmentKind
   name?: string
 }
 

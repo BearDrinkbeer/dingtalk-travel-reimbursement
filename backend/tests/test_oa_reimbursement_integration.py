@@ -466,7 +466,7 @@ def _draft_input(*, source_file_id: str | None = None) -> ReimbursementDraftInpu
                     "displayDate": "9月1日",
                     "description": "机场到酒店",
                     "amount": "44.89",
-                    "receiptCount": 2,
+                    "receiptCount": 1 if source_file_id else 2,
                     **({"sourceFileId": source_file_id} if source_file_id else {}),
                 },
                 {

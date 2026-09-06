@@ -181,6 +181,7 @@ class ReimbursementQuotaCoordinator:
         media_type: str,
         reserved_bytes: int,
         expires_at: datetime,
+        attachment_kind: str = "other",
     ) -> QuotaReservation:
         _require_positive_size(reserved_bytes)
         _require_sort_order(sort_order)
@@ -228,6 +229,7 @@ class ReimbursementQuotaCoordinator:
                         draft_id=draft.id,
                         sort_order=sort_order,
                         processing_role=processing_role.value,
+                        attachment_kind=attachment_kind,
                         file_status=ReimbursementDraftFileStatus.RESERVED.value,
                         storage_key=staging_reservation.storage_key,
                         part_storage_key=staging_reservation.part_storage_key,

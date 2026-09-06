@@ -53,6 +53,42 @@ class ParsedExpense:
     transport_type: Literal["ride_hailing", "taxi", "rail", "hotel", "other"] | None = None
     original_currency: str | None = None
     original_amount: Decimal | None = None
+    invoice_numbers: tuple[str, ...] = field(default_factory=tuple)
+    order_numbers: tuple[str, ...] = field(default_factory=tuple)
+    rail_type: Literal["high_speed", "emu", "regular", "unknown"] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ItinerarySummary:
+    currency: str | None = None
+    amount: Decimal | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    invoice_numbers: tuple[str, ...] = ()
+    order_numbers: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ItineraryTrip:
+    page: int
+    row: int
+    date: date | None = None
+    amount: Decimal | None = None
+    origin: str | None = None
+    destination: str | None = None
+    invoice_numbers: tuple[str, ...] = ()
+    order_numbers: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedItinerary:
+    source: Literal["pdf_text", "paddle", "mixed", "unknown"]
+    page_count: int
+    processed_page_count: int
+    complete: bool
+    summary: ItinerarySummary = field(default_factory=ItinerarySummary)
+    trips: tuple[ItineraryTrip, ...] = ()
+    warnings: tuple[str, ...] = ()
 
 
 class LocalOcrEngine(Protocol):

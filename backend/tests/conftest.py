@@ -69,7 +69,7 @@ def client_factory(settings_factory):
             )
             connection.execute(text("DELETE FROM alembic_version"))
             connection.execute(
-                text("INSERT INTO alembic_version (version_num) VALUES ('20260906_0012')")
+                text("INSERT INTO alembic_version (version_num) VALUES ('20260906_0013')")
             )
         client = TestClient(application)
         client.__enter__()

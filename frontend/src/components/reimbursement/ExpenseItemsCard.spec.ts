@@ -9,6 +9,8 @@ import {
   getReimbursementFileContent,
   listReimbursementDraftFiles,
   recognizeReimbursementDraftFile,
+  updateReimbursementDraft,
+  updateReimbursementDraftFile,
   uploadReimbursementDraftFile,
 } from '@/api/reimbursements'
 import { logout as logoutRequest } from '@/api/auth'
@@ -20,6 +22,8 @@ import {
 import { useExpenseStore } from '@/stores/expense'
 import { useAuthStore } from '@/stores/auth'
 import { useReimbursementDraftStore } from '@/stores/reimbursementDraft'
+import type { OcrReceiptCandidate, ItineraryOcrResult } from '@/types/receipts'
+import { receiptOcrResult } from '@/types/reimbursements'
 import type {
   ReimbursementDraft,
   ReimbursementDraftFile,
@@ -46,6 +50,8 @@ vi.mock('@/api/reimbursements', async (importOriginal) => {
     getReimbursementFileContent: vi.fn(),
     listReimbursementDraftFiles: vi.fn(),
     recognizeReimbursementDraftFile: vi.fn(),
+    updateReimbursementDraft: vi.fn(),
+    updateReimbursementDraftFile: vi.fn(),
     uploadReimbursementDraftFile: vi.fn(),
   }
 })
@@ -109,6 +115,7 @@ function serverFile(
     id,
     name,
     role,
+    attachmentKind: 'other',
     sortOrder: Number(id.replace(/\D/g, '')) || 0,
     status: 'ACTIVE',
     mediaType: name.endsWith('.pdf') ? 'application/pdf' : 'image/jpeg',
@@ -123,8 +130,8 @@ function recognizedFile(
   id: string,
   name: string,
   amount = '454.00',
-): ReimbursementDraftFile {
-  return serverFile(id, name, 'EXPENSE_SOURCE', {
+): ReimbursementDraftFile & { ocrResult: OcrReceiptCandidate } {
+  return { ...serverFile(id, name, 'EXPENSE_SOURCE'),
     ocrStatus: 'COMPLETE',
     ocrResult: {
       fileId: id,
@@ -141,13 +148,29 @@ function recognizedFile(
       status: 'recognized',
       error: null,
     },
-  })
+  }
 }
 
 function selectFiles(wrapper: ReturnType<typeof mount>, testId: string, files: File[]) {
   const input = wrapper.get<HTMLInputElement>(`[data-testid="${testId}"]`)
   Object.defineProperty(input.element, 'files', { configurable: true, value: files })
   return input.trigger('change')
+}
+
+function recognizedItinerary(id = 'proof-1'): ReimbursementDraftFile {
+  const ocrResult: ItineraryOcrResult = {
+    fileId: id, version: 1, kind: 'itinerary', status: 'recognized', source: 'pdf_text',
+    pageCount: 1, processedPageCount: 1, complete: true, warnings: [], error: null,
+    summary: { currency: 'CNY', amount: '60.00', startDate: '2026-09-01', endDate: '2026-09-01', invoiceNumbers: ['INV-001'], orderNumbers: [] },
+    trips: [{ page: 1, row: 1, date: '2026-09-01', amount: '60.00', origin: '合肥机场', destination: '滨湖酒店', invoiceNumbers: [], orderNumbers: [] }],
+  }
+  return serverFile(id, '行程.pdf', 'ATTACHMENT_ONLY', { attachmentKind: 'itinerary', ocrStatus: 'COMPLETE', ocrResult })
+}
+
+function taxiInvoice(): ReimbursementDraftFile & { ocrResult: OcrReceiptCandidate } {
+  const file = recognizedFile('invoice-1', '打车发票.pdf', '60.00')
+  Object.assign(file.ocrResult, { categoryId: 'local_transport', type: 'ride_hailing', transportType: 'ride_hailing', invoiceNumbers: ['INV-001'], requiresItinerary: true })
+  return file
 }
 
 describe('ExpenseItemsCard durable files', () => {
@@ -170,7 +193,268 @@ describe('ExpenseItemsCard durable files', () => {
     vi.unstubAllGlobals()
   })
 
-  it('uploads receipt files sequentially with OCR and uploads other attachments without OCR', async () => {
+  it.each(['invoice_first', 'itinerary_first'])('matches itinerary OCR without creating an expense in %s order and persists through hydration', async (order) => {
+    const expense = useExpenseStore()
+    expense.categories = [{ id: 'local_transport', name: '市内交通', order: 1, manualSelectable: true }]
+    const drafts = useReimbursementDraftStore()
+    drafts.currentDraft = draft()
+    const invoice = taxiInvoice()
+    const proof = recognizedItinerary()
+    if (order === 'invoice_first') { drafts.files = [invoice]; expense.upsertDraftOcrItem(invoice) }
+    else drafts.files = [proof]
+    const fileToUpload = order === 'invoice_first' ? proof : invoice
+    vi.mocked(uploadReimbursementDraftFile).mockResolvedValue({ draftId: 'draft-1', revision: 2, file: { ...fileToUpload, ocrResult: null, ocrStatus: 'NOT_REQUESTED' } })
+    vi.mocked(recognizeReimbursementDraftFile).mockResolvedValue({ draftId: 'draft-1', revision: 3, file: fileToUpload })
+    const wrapper = mount(ExpenseItemsCard, { props: { durable: true }, global: { plugins: [pinia, ElementPlus] } })
+    await selectFiles(wrapper, order === 'invoice_first' ? 'durable-itinerary-input' : 'durable-expense-input', [new File(['pdf'], fileToUpload.name, { type: 'application/pdf' })])
+    await flushPromises()
+    expect(uploadReimbursementDraftFile).toHaveBeenCalledWith('draft-1', 1, expect.any(File), expect.objectContaining({ attachmentKind: fileToUpload.attachmentKind, role: fileToUpload.role }))
+    expect(recognizeReimbursementDraftFile).toHaveBeenCalledOnce()
+    expect(expense.items).toHaveLength(1)
+    expect(expense.items[0]).toMatchObject({ sourceFileId: 'invoice-1', itineraryFileIds: ['proof-1'], receiptCount: 1 })
+    const persisted = expense.buildDraftExpenseItems()
+    expense.hydrateFromDraft({ ...draft(4), input: { ...draft().input, items: persisted } }, drafts.files)
+    expect(expense.items[0]?.itineraryFileIds).toEqual(['proof-1'])
+    expect(expense.buildDraftExpenseItems()).toEqual(persisted)
+    wrapper.unmount()
+  })
+
+  it('uploads payment proofs without OCR or receipt-count changes', async () => {
+    const expense = useExpenseStore()
+    expense.categories = [{ id: 'local_transport', name: '市内交通', order: 1, manualSelectable: true }]
+    useReimbursementDraftStore().currentDraft = draft()
+    const file = serverFile('payment-1', '转账.pdf', 'ATTACHMENT_ONLY', { attachmentKind: 'payment_proof' })
+    vi.mocked(uploadReimbursementDraftFile).mockResolvedValue({ draftId: 'draft-1', revision: 2, file })
+    const wrapper = mount(ExpenseItemsCard, { props: { durable: true }, global: { plugins: [pinia, ElementPlus] } })
+    await selectFiles(wrapper, 'durable-payment-proof-input', [new File(['pdf'], file.name, { type: 'application/pdf' })])
+    await flushPromises()
+    expect(recognizeReimbursementDraftFile).not.toHaveBeenCalled()
+    expect(expense.items).toEqual([])
+    expect(expense.buildDraftExpenseItems()).toEqual([])
+    expect(wrapper.text()).toContain('付款凭证')
+    wrapper.unmount()
+  })
+
+  it('lets the employee confirm an unclassified OCR city-transport invoice as taxi and match its itinerary on save', async () => {
+    const expense = useExpenseStore()
+    expense.categories = [{ id: 'local_transport', name: '市内交通', order: 1, manualSelectable: true }]
+    const drafts = useReimbursementDraftStore()
+    drafts.currentDraft = draft()
+    const invoice = taxiInvoice()
+    Object.assign(invoice.ocrResult, { transportType: 'other', requiresItinerary: false })
+    drafts.files = [invoice, recognizedItinerary()]
+    expense.upsertDraftOcrItem(invoice)
+    const wrapper = mount(ExpenseItemsCard, { props: { durable: true }, global: { plugins: [pinia, ElementPlus] } })
+    await flushPromises()
+    expect(expense.items[0]?.itineraryFileIds).toEqual([])
+    await wrapper.findAll('button').find((button) => button.text() === '编辑')!.trigger('click')
+    const transportField = wrapper.findAllComponents({ name: 'ElFormItem' }).find((field) => field.props('label') === '市内交通类型')
+    expect(transportField).toBeDefined()
+    transportField!.findComponent({ name: 'ElSelect' }).vm.$emit('update:modelValue', 'taxi')
+    await flushPromises()
+    expect(wrapper.findAllComponents({ name: 'ElFormItem' }).some((field) => field.props('label') === '对应行程单')).toBe(true)
+    await wrapper.findAll('button').find((button) => button.text() === '保存')!.trigger('click')
+    await flushPromises()
+    expect(expense.buildDraftExpenseItems()[0]).toMatchObject({ transportType: 'taxi', requiresItinerary: false, itineraryFileIds: ['proof-1'], itineraryAutoMatchDisabled: false })
+    wrapper.unmount()
+  })
+
+  it('keeps insufficient evidence manual and retries matching after the employee corrects amount, date and route', async () => {
+    const expense = useExpenseStore()
+    expense.categories = [{ id: 'local_transport', name: '市内交通', order: 1, manualSelectable: true }]
+    const drafts = useReimbursementDraftStore()
+    drafts.currentDraft = draft()
+    const invoice = taxiInvoice()
+    Object.assign(invoice.ocrResult, { transportType: 'other', requiresItinerary: false, invoiceNumbers: [], amount: '70.00', date: '2026-09-02', description: '交通费用' })
+    drafts.files = [invoice, recognizedItinerary()]
+    expense.upsertDraftOcrItem(invoice)
+    const wrapper = mount(ExpenseItemsCard, { props: { durable: true }, global: { plugins: [pinia, ElementPlus] } })
+    await wrapper.findAll('button').find((button) => button.text() === '编辑')!.trigger('click')
+    const formItem = (label: string) => wrapper.findAllComponents({ name: 'ElFormItem' }).find((field) => field.props('label') === label)!
+    formItem('市内交通类型').findComponent({ name: 'ElSelect' }).vm.$emit('update:modelValue', 'taxi')
+    await flushPromises()
+    expect(formItem('对应行程单').findAllComponents({ name: 'ElOption' }).map((option) => option.props('value'))).toEqual(['proof-1'])
+    await wrapper.findAll('button').find((button) => button.text() === '保存')!.trigger('click')
+    await flushPromises()
+    expect(expense.items[0]?.itineraryFileIds).toEqual([])
+    await wrapper.findAll('button').find((button) => button.text() === '编辑')!.trigger('click')
+    formItem('发生日期').findComponent({ name: 'ElDatePicker' }).vm.$emit('update:modelValue', '2026-09-01')
+    formItem('金额（元）').findComponent({ name: 'ElInput' }).vm.$emit('update:modelValue', '60.00')
+    formItem('说明').findComponent({ name: 'ElInput' }).vm.$emit('update:modelValue', '合肥机场至滨湖酒店')
+    await flushPromises()
+    await wrapper.findAll('button').find((button) => button.text() === '保存')!.trigger('click')
+    await flushPromises()
+    expect(expense.buildDraftExpenseItems()[0]?.itineraryFileIds).toEqual(['proof-1'])
+    wrapper.unmount()
+  })
+
+  it('does not let an OCR-confirmed ride-hailing invoice cancel its required itinerary', async () => {
+    const expense = useExpenseStore()
+    expense.categories = [{ id: 'local_transport', name: '市内交通', order: 1, manualSelectable: true }]
+    const drafts = useReimbursementDraftStore()
+    drafts.currentDraft = draft()
+    const invoice = taxiInvoice()
+    drafts.files = [invoice]
+    expense.upsertDraftOcrItem(invoice)
+    const wrapper = mount(ExpenseItemsCard, { props: { durable: true }, global: { plugins: [pinia, ElementPlus] } })
+    await wrapper.findAll('button').find((button) => button.text() === '编辑')!.trigger('click')
+    expect(wrapper.findAllComponents({ name: 'ElFormItem' }).some((field) => field.props('label') === '市内交通类型')).toBe(false)
+    expect(wrapper.text()).toContain('网约车费用必须有对应行程单')
+    await wrapper.findAll('button').find((button) => button.text() === '保存')!.trigger('click')
+    await flushPromises()
+    expect(expense.buildDraftExpenseItems()[0]).toMatchObject({ transportType: 'ride_hailing', requiresItinerary: true })
+    wrapper.unmount()
+  })
+
+  it('keeps a manually cleared itinerary after autosave and refresh until explicit automatic matching is requested', async () => {
+    const expense = useExpenseStore()
+    expense.categories = [{ id: 'local_transport', name: '市内交通', order: 1, manualSelectable: true }]
+    const drafts = useReimbursementDraftStore()
+    drafts.currentDraft = draft()
+    const invoice = taxiInvoice()
+    drafts.files = [invoice, recognizedItinerary()]
+    expense.upsertDraftOcrItem(invoice)
+    const wrapper = mount(ExpenseItemsCard, { props: { durable: true }, global: { plugins: [pinia, ElementPlus] } })
+    await flushPromises()
+    expect(expense.items[0]?.itineraryFileIds).toEqual(['proof-1'])
+    await wrapper.findAll('button').find((button) => button.text() === '编辑')!.trigger('click')
+    const itinerary = wrapper.findAllComponents({ name: 'ElFormItem' }).find((field) => field.props('label') === '对应行程单')!
+    itinerary.findComponent({ name: 'ElSelect' }).vm.$emit('update:modelValue', [])
+    await flushPromises()
+    await wrapper.findAll('button').find((button) => button.text() === '保存')!.trigger('click')
+    const input = { ...draft().input, items: expense.buildDraftExpenseItems() }
+    expect(input.items[0]?.itineraryFileIds).toEqual([])
+    expect(input.items[0]).toMatchObject({ itineraryAutoMatchDisabled: true })
+    const pending = deferred<ReimbursementDraft>()
+    vi.mocked(updateReimbursementDraft).mockReturnValue(pending.promise)
+    const saving = drafts.saveDraft(input)
+    await vi.waitFor(() => expect(updateReimbursementDraft).toHaveBeenCalledOnce())
+    pending.resolve({ ...draft(2), input })
+    await saving
+    await flushPromises()
+    expect(expense.buildDraftExpenseItems()[0]?.itineraryFileIds).toEqual([])
+    wrapper.unmount()
+    expense.hydrateFromDraft({ ...draft(2), input }, drafts.files)
+    const restored = mount(ExpenseItemsCard, { props: { durable: true }, global: { plugins: [pinia, ElementPlus] } })
+    await flushPromises()
+    expect(expense.buildDraftExpenseItems()[0]).toMatchObject({ itineraryFileIds: [], itineraryAutoMatchDisabled: true })
+    await restored.findAll('button').find((button) => button.text() === '编辑')!.trigger('click')
+    await restored.findAll('button').find((button) => button.text() === '重新自动匹配')!.trigger('click')
+    await flushPromises()
+    expect(expense.buildDraftExpenseItems()[0]).toMatchObject({ itineraryFileIds: ['proof-1'], itineraryAutoMatchDisabled: false })
+    restored.unmount()
+  })
+
+  it.each(['other', 'local_transport'])('allows unknown rail evidence but explains known non-rail evidence when category is corrected from %s', async (categoryId) => {
+    const expense = useExpenseStore()
+    expense.categories = [{ id: 'rail_fare', name: '火车票', order: 1, manualSelectable: true }]
+    const drafts = useReimbursementDraftStore()
+    drafts.currentDraft = draft()
+    const source = recognizedFile('file-1', '待确认.pdf', '600.00')
+    Object.assign(source.ocrResult, { categoryId, status: categoryId === 'other' ? 'failed' : 'recognized', railType: null })
+    drafts.files = [source]
+    expense.upsertDraftOcrItem(source)
+    expense.items[0]!.category = 'rail_fare'
+    const wrapper = mount(ExpenseItemsCard, { props: { durable: true }, global: { plugins: [pinia, ElementPlus] } })
+    await wrapper.findAll('button').find((button) => button.text() === '编辑')!.trigger('click')
+    const railField = wrapper.findAllComponents({ name: 'ElFormItem' }).find((field) => field.props('label') === '铁路票种')
+    expect(Boolean(railField)).toBe(categoryId === 'other')
+    if (railField) {
+      railField.findComponent({ name: 'ElSelect' }).vm.$emit('update:modelValue', 'high_speed')
+      await flushPromises()
+      expect(wrapper.findAllComponents({ name: 'ElFormItem' }).some((field) => field.props('label') === '付款凭证')).toBe(false)
+      await wrapper.findAll('button').find((button) => button.text() === '保存')!.trigger('click')
+      expect(expense.items[0]?.railType).toBe('high_speed')
+    } else {
+      expect(wrapper.text()).toContain('修改类别不会获得高铁付款凭证豁免')
+      expect(wrapper.findAllComponents({ name: 'ElFormItem' }).some((field) => field.props('label') === '付款凭证')).toBe(true)
+    }
+    wrapper.unmount()
+  })
+
+  it('discards a late purpose-change response after switching drafts without OCR or relinking', async () => {
+    const pending = deferred<Awaited<ReturnType<typeof updateReimbursementDraftFile>>>()
+    const expense = useExpenseStore()
+    expense.categories = [{ id: 'local_transport', name: '市内交通', order: 1, manualSelectable: true }]
+    const drafts = useReimbursementDraftStore()
+    drafts.currentDraft = draft()
+    drafts.files = [serverFile('proof-1', '原材料.pdf', 'ATTACHMENT_ONLY')]
+    vi.mocked(updateReimbursementDraftFile).mockReturnValue(pending.promise)
+    const wrapper = mount(ExpenseItemsCard, { props: { durable: true }, global: { plugins: [pinia, ElementPlus] } })
+    await wrapper.findAll('button').find((button) => button.text() === '用途')!.trigger('click')
+    await flushPromises()
+    const dialog = wrapper.findAllComponents({ name: 'ElDialog' }).find((entry) => entry.props('title') === '修改材料用途')!
+    dialog.findComponent({ name: 'ElSelect' }).vm.$emit('update:modelValue', 'itinerary')
+    await flushPromises()
+    await wrapper.findAll('button').find((button) => button.text() === '保存用途')!.trigger('click')
+    await vi.waitFor(() => expect(updateReimbursementDraftFile).toHaveBeenCalledOnce())
+    drafts.currentDraft = draft(1, 'draft-2')
+    drafts.files = []
+    expense.reset()
+    pending.resolve({ draftId: 'draft-1', revision: 2, file: recognizedItinerary() })
+    await flushPromises()
+    expect(recognizeReimbursementDraftFile).not.toHaveBeenCalled()
+    expect(drafts.files).toEqual([])
+    expect(expense.items).toEqual([])
+    expect(dialog.props('modelValue')).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('changes an existing material purpose, clears incompatible proof links and recognizes without reupload', async () => {
+    const expense = useExpenseStore()
+    expense.categories = [{ id: 'local_transport', name: '市内交通', order: 1, manualSelectable: true }]
+    const drafts = useReimbursementDraftStore()
+    drafts.currentDraft = draft()
+    const source = taxiInvoice()
+    const proof = recognizedItinerary()
+    drafts.files = [source, { ...proof, attachmentKind: 'payment_proof', ocrResult: null }]
+    expense.upsertDraftOcrItem(source)
+    expense.items[0]!.paymentProofFileIds = [proof.id]
+    vi.mocked(updateReimbursementDraftFile).mockResolvedValue({ draftId: 'draft-1', revision: 2, file: { ...proof, ocrResult: null } })
+    vi.mocked(recognizeReimbursementDraftFile).mockResolvedValue({ draftId: 'draft-1', revision: 3, file: proof })
+    const wrapper = mount(ExpenseItemsCard, { props: { durable: true }, global: { plugins: [pinia, ElementPlus] } })
+    await wrapper.findAll('button').find((button) => button.text() === '用途')!.trigger('click')
+    await flushPromises()
+    const selector = wrapper.findAllComponents({ name: 'ElDialog' }).find((entry) => entry.props('title') === '修改材料用途')!.findComponent({ name: 'ElSelect' })
+    selector.vm.$emit('update:modelValue', 'itinerary')
+    await flushPromises()
+    await wrapper.findAll('button').find((button) => button.text() === '保存用途')!.trigger('click')
+    await flushPromises()
+    expect(updateReimbursementDraftFile).toHaveBeenCalledWith('draft-1', proof.id, { attachmentKind: 'itinerary', expectedRevision: 1 }, expect.any(Object))
+    expect(recognizeReimbursementDraftFile).toHaveBeenCalledOnce()
+    expect(uploadReimbursementDraftFile).not.toHaveBeenCalled()
+    expect(expense.items[0]).toMatchObject({ itineraryFileIds: [proof.id], paymentProofFileIds: [] })
+    expect(expense.items).toHaveLength(1)
+    wrapper.unmount()
+  })
+
+  it.each([
+    { amount: '500.00', category: 'rail_fare', railType: 'unknown', expected: false },
+    { amount: '500.01', category: 'rail_fare', railType: 'unknown', expected: true },
+    { amount: '600.00', category: 'rail_fare', railType: 'high_speed', expected: false },
+    { amount: '600.00', category: 'rail_fare', railType: 'emu', expected: true },
+    { amount: '600.00', category: 'local_transport', railType: null, expected: true },
+  ] as const)('shows payment candidates for the confirmed row amount and supported rail evidence %j', async ({ amount, category, railType, expected }) => {
+    const expense = useExpenseStore()
+    expense.categories = [{ id: category, name: '费用类别', order: 1, manualSelectable: true }]
+    const drafts = useReimbursementDraftStore()
+    drafts.currentDraft = draft()
+    const source = recognizedFile('file-1', '费用.pdf', amount)
+    Object.assign(source.ocrResult, { categoryId: category, railType })
+    drafts.files = [source, recognizedItinerary(), serverFile('payment-1', '付款.pdf', 'ATTACHMENT_ONLY', { attachmentKind: 'payment_proof' }), serverFile('other-1', '其他.pdf', 'ATTACHMENT_ONLY')]
+    expense.upsertDraftOcrItem(source)
+    const wrapper = mount(ExpenseItemsCard, { props: { durable: true }, global: { plugins: [pinia, ElementPlus] } })
+    await wrapper.findAll('button').find((button) => button.text() === '编辑')!.trigger('click')
+    const paymentField = wrapper.findAllComponents({ name: 'ElFormItem' }).find((field) => field.props('label') === '付款凭证')
+    expect(Boolean(paymentField)).toBe(expected)
+    if (paymentField) expect(paymentField.findAllComponents({ name: 'ElOption' }).map((option) => option.props('value'))).toEqual(['payment-1'])
+    const railField = wrapper.findAllComponents({ name: 'ElFormItem' }).find((field) => field.props('label') === '铁路票种')
+    expect(Boolean(railField)).toBe(category === 'rail_fare')
+    if (railField) expect(railField.findComponent({ name: 'ElSelect' }).props('disabled')).toBe(railType !== 'unknown')
+    wrapper.unmount()
+  })
+
+  it('uploads the whole selection before sequential OCR and uploads other attachments without OCR', async () => {
     const expense = useExpenseStore()
     expense.categories = [
       { id: 'rail_fare', name: '火车票', order: 1, manualSelectable: true },
@@ -220,23 +504,171 @@ describe('ExpenseItemsCard durable files', () => {
       call[1], call[2].name, call[3]?.role,
     ])).toEqual([
       [1, '发票一.pdf', 'EXPENSE_SOURCE'],
-      [3, '发票二.jpg', 'EXPENSE_SOURCE'],
+      [2, '发票二.jpg', 'EXPENSE_SOURCE'],
       [5, '行程单.pdf', 'ATTACHMENT_ONLY'],
     ])
     expect(vi.mocked(recognizeReimbursementDraftFile).mock.calls.map((call) => [
       call[1], call[2].expectedRevision,
     ])).toEqual([
-      ['file-1', 2],
-      ['file-3', 4],
+      ['file-1', 3],
+      ['file-2', 4],
     ])
-    expect(expense.items.map((item) => item.id)).toEqual(['ocr-file-1', 'ocr-file-3'])
+    expect(expense.items.map((item) => item.id)).toEqual(['ocr-file-1', 'ocr-file-2'])
     expect(drafts.currentDraft?.revision).toBe(6)
     expect(wrapper.text()).toContain('行程单.pdf')
-    expect(wrapper.text()).toContain('行程单/证明材料')
+    expect(wrapper.text()).toContain('其他材料')
     expect(wrapper.text()).toContain('发票一.pdf 的行程')
     expect(wrapper.find('[aria-label="预览票据 发票一.pdf"]').exists()).toBe(true)
     expect(wrapper.findAll('.receipt-row').some((row) => row.text().includes('发票一.pdf'))).toBe(false)
 
+    wrapper.unmount()
+  })
+
+  it.each([
+    ['hotel', 'hotel', false], ['rail_fare', 'rail', false],
+    ['local_transport', 'other', false], ['local_transport', 'taxi', true],
+    ['local_transport', 'ride_hailing', true],
+  ] as const)('shows itinerary editing only for taxi expenses (%s/%s)', async (category, transportType, visible) => {
+    const expense = useExpenseStore()
+    expense.categories = [{ id: category, name: category, order: 1, manualSelectable: true }]
+    expense.items = [{
+      id: 'manual', category, transportType, date: '2026-09-01', displayDate: '2026-09-01',
+      description: '本次费用', amount: '10.00', receiptCount: 1, source: 'manual',
+    }]
+    useReimbursementDraftStore().currentDraft = draft()
+    const wrapper = mount(ExpenseItemsCard, { props: { durable: true }, global: { plugins: [pinia, ElementPlus] } })
+    await wrapper.findAll('button').find((button) => button.text() === '编辑')!.trigger('click')
+    await flushPromises()
+    expect(wrapper.findAllComponents({ name: 'ElFormItem' }).some((item) =>
+      String(item.props('label')).includes('对应行程单'),
+    )).toBe(visible)
+    wrapper.unmount()
+  })
+
+  it('keeps a source invoice fixed at one receipt and permits manual aggregate receipt counts', async () => {
+    const expense = useExpenseStore()
+    expense.categories = [{ id: 'rail_fare', name: '火车票', order: 1, manualSelectable: true }]
+    const drafts = useReimbursementDraftStore()
+    drafts.currentDraft = draft()
+    const source = recognizedFile('file-1', '单张发票.pdf')
+    drafts.files = [source]
+    expense.upsertDraftOcrItem(source)
+    const wrapper = mount(ExpenseItemsCard, { props: { durable: true }, global: { plugins: [pinia, ElementPlus] } })
+    await wrapper.findAll('button').find((button) => button.text() === '编辑')!.trigger('click')
+    await flushPromises()
+    expect(wrapper.findAllComponents({ name: 'ElInputNumber' })).toHaveLength(0)
+    await wrapper.findAllComponents({ name: 'ElButton' }).find((button) => button.text() === '取消')!.trigger('click')
+    await wrapper.findAll('button').find((button) => button.text() === '手动添加')!.trigger('click')
+    await flushPromises()
+    expect(wrapper.findAllComponents({ name: 'ElInputNumber' })).toHaveLength(1)
+    expect(wrapper.findAllComponents({ name: 'ElFormItem' }).find((item) => item.props('label') === '票据张数')!.text())
+      .toContain('手工汇总多张票据时填写；行程单和证明材料不计入')
+    wrapper.unmount()
+  })
+
+  it('keeps every selected placeholder stable and publishes OCR rows together at batch completion', async () => {
+    const expense = useExpenseStore()
+    expense.categories = [{ id: 'rail_fare', name: '火车票', order: 1, manualSelectable: true }]
+    const calculate = vi.spyOn(expense, 'refreshCalculations').mockResolvedValue()
+    const drafts = useReimbursementDraftStore()
+    drafts.currentDraft = draft()
+    const upload = deferred<Awaited<ReturnType<typeof uploadReimbursementDraftFile>>>()
+    const recognition = deferred<Awaited<ReturnType<typeof recognizeReimbursementDraftFile>>>()
+    vi.mocked(uploadReimbursementDraftFile).mockReturnValueOnce(upload.promise)
+      .mockImplementation(async (draftId, revision, file) => ({
+        draftId, revision: revision + 1, file: serverFile('file-2', file.name, 'EXPENSE_SOURCE'),
+      }))
+    vi.mocked(recognizeReimbursementDraftFile)
+      .mockResolvedValueOnce({ draftId: 'draft-1', revision: 4, file: recognizedFile('file-1', '第一张.pdf') })
+      .mockReturnValueOnce(recognition.promise)
+    const wrapper = mount(ExpenseItemsCard, { props: { durable: true }, global: { plugins: [pinia, ElementPlus] } })
+    await selectFiles(wrapper, 'durable-expense-input', [
+      new File(['a'], '第一张.pdf', { type: 'application/pdf' }),
+      new File(['b'], '第二张.pdf', { type: 'application/pdf' }),
+    ])
+    expect(wrapper.findAll('[data-testid="batch-file"]')).toHaveLength(2)
+    const placeholders = wrapper.findAll('[data-testid="batch-file"]').map((row) => row.element)
+    expect(recognizeReimbursementDraftFile).not.toHaveBeenCalled()
+    upload.resolve({ draftId: 'draft-1', revision: 2, file: serverFile('file-1', '第一张.pdf', 'EXPENSE_SOURCE') })
+    await flushPromises()
+    expect(uploadReimbursementDraftFile).toHaveBeenCalledTimes(2)
+    expect(recognizeReimbursementDraftFile).toHaveBeenCalledTimes(2)
+    expect(wrapper.findAll('[data-testid="batch-file"]').map((row) => row.element)).toEqual(placeholders)
+    expect(expense.items).toHaveLength(0)
+    expect(calculate).not.toHaveBeenCalled()
+    recognition.resolve({ draftId: 'draft-1', revision: 5, file: recognizedFile('file-2', '第二张.pdf') })
+    await flushPromises()
+    expect(expense.items).toHaveLength(2)
+    expect(wrapper.get('[data-testid="batch-progress"]').text()).toContain('本批 2 个文件已处理完成')
+    expect(wrapper.findAll('[data-testid="batch-file"]')).toHaveLength(0)
+    expect(wrapper.get('[data-testid="batch-progress"]').text()).not.toContain('第一张.pdf')
+    expect(calculate).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('continues the batch after individual upload and OCR failures without replaying either request', async () => {
+    const expense = useExpenseStore()
+    expense.categories = [{ id: 'rail_fare', name: '火车票', order: 1, manualSelectable: true }]
+    const drafts = useReimbursementDraftStore()
+    drafts.currentDraft = draft()
+    let revision = 1
+    const retained: ReimbursementDraftFile[] = []
+    vi.mocked(getReimbursementDraft).mockImplementation(async () => draft(revision))
+    vi.mocked(listReimbursementDraftFiles).mockImplementation(async () => ({ draftId: 'draft-1', revision, items: [...retained] }))
+    vi.mocked(uploadReimbursementDraftFile).mockImplementation(async (draftId, expected, file) => {
+      expect(expected).toBe(revision)
+      if (file.name === '上传失败.pdf') throw new Error('单张上传失败')
+      const uploaded = serverFile(`file-${revision}`, file.name, 'EXPENSE_SOURCE')
+      retained.push(uploaded)
+      return { draftId, revision: ++revision, file: uploaded }
+    })
+    vi.mocked(recognizeReimbursementDraftFile).mockImplementation(async (draftId, fileId, input) => {
+      expect(input.expectedRevision).toBe(revision)
+      const uploaded = retained.find((file) => file.id === fileId)!
+      if (uploaded.name === '识别失败.pdf') throw new Error('单张识别失败')
+      return { draftId, revision: ++revision, file: recognizedFile(fileId, uploaded.name) }
+    })
+    const wrapper = mount(ExpenseItemsCard, { props: { durable: true }, global: { plugins: [pinia, ElementPlus] } })
+    await selectFiles(wrapper, 'durable-expense-input', ['上传失败.pdf', '识别失败.pdf', '成功一.pdf', '成功二.pdf'].map((name) =>
+      new File(['pdf'], name, { type: 'application/pdf' }),
+    ))
+    await flushPromises()
+    expect(uploadReimbursementDraftFile).toHaveBeenCalledTimes(4)
+    expect(recognizeReimbursementDraftFile).toHaveBeenCalledTimes(3)
+    expect(expense.items.map((item) => item.description)).toEqual(['成功一.pdf 的行程', '成功二.pdf 的行程'])
+    expect(wrapper.get('[data-testid="batch-progress"]').text()).toContain('单张上传失败')
+    expect(wrapper.get('[data-testid="batch-progress"]').text()).toContain('单张识别失败')
+    expect(drafts.processingFiles).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('does not start a batch when the file picker is cancelled', async () => {
+    useReimbursementDraftStore().currentDraft = draft()
+    const wrapper = mount(ExpenseItemsCard, { props: { durable: true }, global: { plugins: [pinia, ElementPlus] } })
+    await selectFiles(wrapper, 'durable-expense-input', [])
+    expect(uploadReimbursementDraftFile).not.toHaveBeenCalled()
+    expect(wrapper.find('[data-testid="batch-progress"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('lets a manual city-transport row explicitly choose taxi or ride-hailing and preserves the requirement', async () => {
+    const expense = useExpenseStore()
+    expense.categories = [{ id: 'local_transport', name: '市内交通', order: 1, manualSelectable: true }]
+    expense.upsertManualItem({ category: 'local_transport', date: '2026-09-01', displayDate: '2026-09-01', description: '市内交通', amount: '20.00', receiptCount: 3 })
+    useReimbursementDraftStore().currentDraft = draft()
+    const wrapper = mount(ExpenseItemsCard, { props: { durable: true }, global: { plugins: [pinia, ElementPlus] } })
+    for (const transportType of ['taxi', 'ride_hailing'] as const) {
+      await wrapper.findAll('button').find((button) => button.text() === '编辑')!.trigger('click')
+      await flushPromises()
+      const selector = wrapper.findAllComponents({ name: 'ElFormItem' }).find((item) => item.props('label') === '市内交通类型')!
+        .findComponent({ name: 'ElSelect' })
+      selector.vm.$emit('update:modelValue', transportType)
+      await flushPromises()
+      expect(wrapper.findAllComponents({ name: 'ElFormItem' }).some((item) => String(item.props('label')).includes('对应行程单'))).toBe(true)
+      expect(wrapper.findAllComponents({ name: 'ElFormItem' }).find((item) => item.props('label') === '票据张数')!.text()).toContain('付款凭证按本行金额判断')
+      await wrapper.findAllComponents({ name: 'ElButton' }).find((button) => button.text() === '保存')!.trigger('click')
+      expect(expense.items[0]).toMatchObject({ transportType, requiresItinerary: transportType === 'ride_hailing', receiptCount: 3 })
+    }
     wrapper.unmount()
   })
 
@@ -346,7 +778,7 @@ describe('ExpenseItemsCard durable files', () => {
       })
 
       const uploadButtons = wrapper.findAll('button').filter((button) =>
-        ['选择票据/发票', '添加行程单 / 证明材料'].includes(button.text().trim()),
+        ['选择票据/发票', '添加行程单'].includes(button.text().trim()),
       )
       expect(uploadButtons).toHaveLength(2)
       for (const button of uploadButtons) {
@@ -408,7 +840,9 @@ describe('ExpenseItemsCard durable files', () => {
     const mutationLabels = new Set([
       '手动添加',
       '选择票据/发票',
-      '添加行程单 / 证明材料',
+      '添加行程单',
+      '添加付款凭证',
+      '添加其他材料',
       '重新识别',
       '删除文件',
       '编辑',
@@ -531,7 +965,7 @@ describe('ExpenseItemsCard durable files', () => {
     await operation
     await flushPromises()
 
-    expect(uploadReimbursementDraftFile).toHaveBeenCalledOnce()
+    expect(uploadReimbursementDraftFile).toHaveBeenCalledTimes(2)
     expect(recognizeReimbursementDraftFile).toHaveBeenCalledOnce()
     expect(expense.items).toEqual([
       expect.objectContaining({ description: '新草稿已有明细', amount: '1.00' }),
@@ -678,7 +1112,7 @@ describe('ExpenseItemsCard durable files', () => {
     const drafts = useReimbursementDraftStore()
     drafts.currentDraft = draft(8)
     const source = recognizedFile('file-1', '发票.pdf', '10.00')
-    const itinerary = serverFile('file-2', '行程单.pdf', 'ATTACHMENT_ONLY')
+    const itinerary = serverFile('file-2', '行程单.pdf', 'ATTACHMENT_ONLY', { attachmentKind: 'itinerary' })
     drafts.files = [source, itinerary]
     expense.upsertDraftOcrItem(source)
     expense.items[0]!.itineraryFileIds = ['file-2']
@@ -716,7 +1150,10 @@ describe('ExpenseItemsCard durable files', () => {
     drafts.currentDraft = draft(8)
     const first = recognizedFile('file-1', '发票一.pdf')
     const second = recognizedFile('file-2', '发票二.pdf')
-    const itinerary = serverFile('file-3', '多次行程.pdf', 'ATTACHMENT_ONLY')
+    for (const source of [first, second]) {
+      source.ocrResult = { ...source.ocrResult!, transportType: 'ride_hailing', requiresItinerary: true }
+    }
+    const itinerary = serverFile('file-3', '多次行程.pdf', 'ATTACHMENT_ONLY', { attachmentKind: 'itinerary' })
     drafts.files = [first, second, itinerary]
     expense.upsertDraftOcrItem(first)
     expense.upsertDraftOcrItem(second)
@@ -733,6 +1170,8 @@ describe('ExpenseItemsCard durable files', () => {
     await flushPromises()
     await wrapper.findAll('button').find((button) => button.text().trim() === '保存')!.trigger('click')
     expect(expense.items.map((item) => item.itineraryFileIds)).toEqual([['file-3'], ['file-3']])
+    expect(expense.items[1]?.itineraryAutoMatchDisabled).toBe(true)
+    expect(wrapper.findAll('button').some((button) => button.text() === '重新自动匹配')).toBe(false)
     expect(wrapper.text()).toContain('汇总 PDF 中只保留一份')
     wrapper.unmount()
   })
@@ -913,10 +1352,10 @@ describe('ExpenseItemsCard durable files', () => {
         date: '2026-09-02',
         description: '用户在重试期间人工修改',
         amount: '99.00',
-        receiptCount: 2,
+        receiptCount: 1,
       }),
     ])
-    expect(drafts.files[0]?.ocrResult?.amount).toBe('20.00')
+    expect(receiptOcrResult(drafts.files[0])?.amount).toBe('20.00')
     expect(warning).toHaveBeenCalledWith(expect.stringContaining('未自动新增或覆盖'))
 
     wrapper.unmount()
@@ -930,6 +1369,9 @@ describe('ExpenseItemsCard durable files', () => {
     { originalAmount: '97600000.00' },
     { cnyAmountConfirmed: true },
     { requiresCnyConfirmation: true },
+    { paymentProofFileIds: ['payment-1'] },
+    { railType: 'high_speed' as const },
+    { itineraryAutoMatchDisabled: true },
   ])('preserves metadata-only edits during an OCR retry (%j)', async (changedFields) => {
     const pending = deferred<Awaited<ReturnType<typeof recognizeReimbursementDraftFile>>>()
     const expense = useExpenseStore()
@@ -937,7 +1379,10 @@ describe('ExpenseItemsCard durable files', () => {
     const drafts = useReimbursementDraftStore()
     drafts.currentDraft = draft(8)
     const source = recognizedFile('file-1', '待核对票据.pdf', '10.00')
-    drafts.files = [source]
+    drafts.files = [source,
+      serverFile('itinerary-1', '行程单.pdf', 'ATTACHMENT_ONLY', { attachmentKind: 'itinerary' }),
+      serverFile('payment-1', '付款.pdf', 'ATTACHMENT_ONLY', { attachmentKind: 'payment_proof' }),
+    ]
     expense.upsertDraftOcrItem(source)
     vi.mocked(recognizeReimbursementDraftFile).mockReturnValueOnce(pending.promise)
     const warning = vi.spyOn(ElMessage, 'warning')
@@ -954,7 +1399,7 @@ describe('ExpenseItemsCard durable files', () => {
     })
     await flushPromises()
     expect(expense.items[0]).toEqual(expect.objectContaining({ ...changedFields, amount: '10.00' }))
-    expect(drafts.files[0]?.ocrResult?.amount).toBe('20.00')
+    expect(receiptOcrResult(drafts.files[0])?.amount).toBe('20.00')
     expect(warning).toHaveBeenCalledWith(expect.stringContaining('未自动新增或覆盖'))
     wrapper.unmount()
   })
@@ -1088,7 +1533,7 @@ describe('ExpenseItemsCard durable files', () => {
     ])
     expect(expense.items.some((item) => item.id === 'ocr-file-1')).toBe(false)
     expect(expense.dismissedOcrFileIds).toEqual(['file-1'])
-    expect(drafts.files[0]?.ocrResult?.amount).toBe('20.00')
+    expect(receiptOcrResult(drafts.files[0])?.amount).toBe('20.00')
     expect(warning).toHaveBeenCalledWith(expect.stringContaining('未自动新增或覆盖'))
     expect(wrapper.findAll('button').some((button) =>
       button.text().trim() === '添加到费用明细',

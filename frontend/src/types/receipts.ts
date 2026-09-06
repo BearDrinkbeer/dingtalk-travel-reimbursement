@@ -1,3 +1,5 @@
+import type { RailType } from '@/types/expenses'
+
 export type ReceiptFileStatus =
   | 'queued'
   | 'uploading'
@@ -41,6 +43,9 @@ export interface OcrReceiptCandidate {
   amount: string | null
   transportType?: 'ride_hailing' | 'taxi' | 'rail' | 'hotel' | 'other'
   requiresItinerary?: boolean
+  railType?: RailType | null
+  invoiceNumbers?: string[]
+  orderNumbers?: string[]
   originalCurrency?: string | null
   originalAmount?: string | null
   receiptCount: 1
@@ -56,4 +61,39 @@ export interface OcrReceiptCandidateDraft
   date: string
   description: string
   amount: string
+}
+
+export interface ItineraryOcrResult {
+  fileId: string
+  version: 1
+  kind: 'itinerary'
+  status: 'recognized' | 'failed'
+  source: 'pdf_text' | 'paddle' | 'mixed' | 'unknown'
+  pageCount: number
+  processedPageCount: number
+  complete: boolean
+  summary: {
+    currency: string | null
+    amount: string | null
+    startDate: string | null
+    endDate: string | null
+    invoiceNumbers: string[]
+    orderNumbers: string[]
+  }
+  trips: Array<{
+    page: number
+    row: number
+    date: string | null
+    amount: string | null
+    origin: string | null
+    destination: string | null
+    invoiceNumbers: string[]
+    orderNumbers: string[]
+  }>
+  warnings: string[]
+  error: OcrReceiptError | null
+}
+
+export function isItineraryOcrResult(result: OcrReceiptCandidate | ItineraryOcrResult | null | undefined): result is ItineraryOcrResult {
+  return Boolean(result && 'kind' in result && result.kind === 'itinerary')
 }

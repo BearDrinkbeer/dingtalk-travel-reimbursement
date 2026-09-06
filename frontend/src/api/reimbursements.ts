@@ -7,6 +7,7 @@ import type {
   OaReimbursementOptions,
   OaTravelApprovalList,
   ReimbursementDraft,
+  ReimbursementDraftFile,
   ReimbursementDraftDeletion,
   ReimbursementDraftFileDeletion,
   ReimbursementDraftFileList,
@@ -35,6 +36,7 @@ export interface ListReimbursementDraftsOptions extends ReimbursementRequestOpti
 
 export interface UploadReimbursementDraftFileOptions extends ReimbursementRequestOptions {
   role?: ReimbursementDraftFileRole
+  attachmentKind?: ReimbursementDraftFile['attachmentKind']
   onProgress?: (percent: number) => void
 }
 
@@ -221,6 +223,7 @@ export async function uploadReimbursementDraftFile(
       params: {
         expectedRevision,
         role: options.role ?? 'EXPENSE_SOURCE',
+        attachmentKind: options.attachmentKind ?? 'other',
       },
       signal: options.signal,
       timeout: 120_000,

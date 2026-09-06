@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from app.domain.categories import ExpenseCategory
+from app.ocr.document_evidence import extract_document_numbers, extract_rail_type
 from app.ocr.extractors import (
     PASSENGER_OCCURRENCE_DATE_PREFIX,
     average_confidence,
@@ -313,4 +314,14 @@ class ReceiptParserRegistry:
             parsed = self._fallback.parse(lines, context)
         else:
             parsed = parser.parse(lines, context)
-        return _with_transport_evidence(self._apply_keyword_fallback(parsed, lines), lines)
+        parsed = _with_transport_evidence(self._apply_keyword_fallback(parsed, lines), lines)
+        invoice_numbers, order_numbers = extract_document_numbers(lines)
+        return replace(
+            parsed,
+            invoice_numbers=invoice_numbers,
+            order_numbers=order_numbers,
+            rail_type=extract_rail_type(
+                lines,
+                railway_evidence=parsed.receipt_type == "train" or parsed.transport_type == "rail",
+            ),
+        )

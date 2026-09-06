@@ -8,13 +8,17 @@ import { useAuthStore } from '@/stores/auth'
 import { useExpenseStore } from '@/stores/expense'
 import { useReimbursementDraftStore } from '@/stores/reimbursementDraft'
 import type { ExpenseCategoryId, ExpenseItem } from '@/types/expenses'
-import { isForeignExpense } from '@/types/expenses'
+import { isForeignExpense, isTaxiExpense } from '@/types/expenses'
 import type { ReceiptFileState, ReceiptFileStatus } from '@/types/receipts'
+import { isItineraryOcrResult } from '@/types/receipts'
+import { receiptOcrResult } from '@/types/reimbursements'
 import type {
+  ReimbursementAttachmentKind,
   ReimbursementDraftFile,
   ReimbursementDraftFileRole,
 } from '@/types/reimbursements'
 import { formatFileSize } from '@/utils/receiptFiles'
+import { evidenceRailType, hasKnownNonRailEvidence, isActiveProof, requiresPaymentProof } from '@/utils/expenseProofs'
 
 const props = withDefaults(defineProps<{
   durable?: boolean
@@ -30,8 +34,38 @@ const auth = useAuthStore()
 const receiptInput = ref<HTMLInputElement | null>(null)
 const durableExpenseInput = ref<HTMLInputElement | null>(null)
 const durableAttachmentInput = ref<HTMLInputElement | null>(null)
+const durableItineraryInput = ref<HTMLInputElement | null>(null)
+const durablePaymentProofInput = ref<HTMLInputElement | null>(null)
+const materialEditorVisible = ref(false)
+const materialEditorFile = ref<ReimbursementDraftFile | null>(null)
+const materialEditorKind = ref<ReimbursementAttachmentKind>('other')
 const durableOperating = ref(false)
 const durableErrors = reactive<Record<string, string>>({})
+type BatchFileStatus = 'queued' | 'uploading' | 'uploaded' | 'recognizing' | 'done' | 'failed'
+interface BatchFile {
+  key: string
+  name: string
+  status: BatchFileStatus
+  uploaded?: ReimbursementDraftFile
+  error?: string
+}
+const batchFiles = ref<BatchFile[]>([])
+const batchPhase = ref<'uploading' | 'recognizing' | 'done' | null>(null)
+const batchNeedsOcr = ref(false)
+let batchScope: DurableOperationScope | null = null
+let batchOriginalFileIds = new Set<string>()
+const batchActive = computed(() => batchPhase.value === 'uploading' || batchPhase.value === 'recognizing')
+const visibleBatchFiles = computed(() => batchActive.value ? batchFiles.value : batchFiles.value.filter((file) => file.status === 'failed'))
+const batchProgress = computed(() => {
+  const stages = batchNeedsOcr.value ? 2 : 1
+  const completed = batchFiles.value.reduce((sum, file) => sum
+    + (file.status === 'done' || file.status === 'failed' ? stages
+      : file.status === 'uploaded' || file.status === 'recognizing' ? 1 : 0), 0)
+  return batchFiles.value.length ? Math.round(completed / (batchFiles.value.length * stages) * 100) : 0
+})
+const batchStatusLabels: Record<BatchFileStatus, string> = {
+  queued: '等待上传', uploading: '上传中', uploaded: '等待识别', recognizing: '识别中', done: '已完成', failed: '需要处理',
+}
 let durableOperationGeneration = 0
 let durableUnmounted = false
 let activeDurableOperation: DurableOperationScope | null = null
@@ -50,8 +84,12 @@ const editor = reactive({
   description: '',
   amount: '',
   receiptCount: 1,
+  transportType: 'other' as NonNullable<ExpenseItem['transportType']>,
   requiresItinerary: false,
   itineraryFileIds: [] as string[],
+  itineraryAutoMatchDisabled: false,
+  paymentProofFileIds: [] as string[],
+  railType: 'unknown' as NonNullable<ExpenseItem['railType']>,
   originalCurrency: '',
   originalAmount: '',
   cnyAmountConfirmed: false,
@@ -86,6 +124,9 @@ const durableRoleLabels: Record<ReimbursementDraftFileRole, string> = {
   EXPENSE_SOURCE: '票据/发票',
   ATTACHMENT_ONLY: '行程单/证明材料',
 }
+const attachmentKindLabels: Record<ReimbursementAttachmentKind, string> = {
+  itinerary: '行程单', payment_proof: '付款凭证', other: '其他材料',
+}
 
 const categoryNames = computed<Record<string, string>>(() =>
   Object.fromEntries(expense.categories.map((item) => [item.id, item.name])),
@@ -95,22 +136,36 @@ const unlinkedReceiptFiles = computed(() =>
 )
 const durableFiles = computed(() => drafts.files.filter((file) => file.status !== 'PURGED'))
 const unlinkedDurableFiles = computed(() => durableFiles.value.filter((file) =>
-  !expense.items.some((item) => item.sourceFileId === file.id || item.itineraryFileIds?.includes(file.id)),
+  (!batchActive.value || batchOriginalFileIds.has(file.id))
+  && !expense.items.some((item) => item.sourceFileId === file.id || item.itineraryFileIds?.includes(file.id)
+    || item.paymentProofFileIds?.includes(file.id)),
 ))
 const itineraryOptions = computed(() => durableFiles.value.filter((file) =>
-  file.status === 'ACTIVE' && file.role === 'ATTACHMENT_ONLY',
+  isActiveProof(file, 'itinerary'),
 ))
+const paymentProofOptions = computed(() => durableFiles.value.filter((file) => isActiveProof(file, 'payment_proof')))
 const foreignEditor = computed(() => Boolean(editor.originalCurrency && editor.originalCurrency.toUpperCase() !== 'CNY')
   || expense.items.find((item) => item.id === editor.id)?.requiresCnyConfirmation
-  || editorSource.value?.ocrResult?.type === 'foreign_receipt'
-  || editorSource.value?.ocrResult?.warnings.includes('FOREIGN_CURRENCY_REQUIRES_CNY_AMOUNT'))
+  || editorEvidence.value?.type === 'foreign_receipt'
+  || editorEvidence.value?.warnings.includes('FOREIGN_CURRENCY_REQUIRES_CNY_AMOUNT'))
 const editorSource = computed(() => durableFiles.value.find((file) =>
   file.id === expense.items.find((item) => item.id === editor.id)?.sourceFileId,
 ))
-const sourceRequiresItinerary = computed(() => editorSource.value?.ocrResult?.requiresItinerary
-  || editorSource.value?.ocrResult?.transportType === 'ride_hailing')
+const editorEvidence = computed(() => receiptOcrResult(editorSource.value))
+const sourceRequiresItinerary = computed(() => editorEvidence.value?.requiresItinerary
+  || editorEvidence.value?.transportType === 'ride_hailing')
+const editorSourceInvoice = computed(() => {
+  const item = expense.items.find((entry) => entry.id === editor.id)
+  return Boolean(item?.sourceFileId || item?.source === 'ocr')
+})
+const editorIsTaxi = computed(() => isTaxiExpense(editor) || Boolean(sourceRequiresItinerary.value))
+const editorCanSelectRailType = computed(() => editor.category === 'rail_fare'
+  && !hasKnownNonRailEvidence(editorEvidence.value))
+const sourceRailType = computed(() => editorEvidence.value?.railType)
+const editorRailType = computed(() => evidenceRailType(editor.category, editor.railType, editorEvidence.value))
+const editorNeedsPaymentProof = computed(() => requiresPaymentProof({ ...editor, railType: editorRailType.value }))
 const unresolvedDurableOcrFiles = computed(() => durableFiles.value.filter(
-  (file) => isUnresolvedDurableOcrFile(file),
+  (file) => (!batchActive.value || batchOriginalFileIds.has(file.id)) && isUnresolvedDurableOcrFile(file),
 ))
 const durableBusy = computed(() => durableOperating.value || drafts.busy)
 const durableMutationDisabledReason = computed(() => {
@@ -170,6 +225,7 @@ onBeforeUnmount(() => {
   durableUnmounted = true
   durableOperationGeneration += 1
   activeDurableOperation = null
+  if (batchScope?.generation === durableOperationGeneration - 1) drafts.processingFiles = false
   releaseReceiptPreview()
   previewController?.abort()
 })
@@ -182,6 +238,15 @@ watch(
     props.readonly,
   ] as const,
   () => {
+    materialEditorVisible.value = false
+    materialEditorFile.value = null
+    if (batchScope && (drafts.currentDraft?.id !== batchScope.draftId
+      || (auth.session?.selectedDepartment?.id ?? '') !== batchScope.departmentId)) {
+      batchScope = null
+      batchFiles.value = []
+      batchPhase.value = null
+      drafts.processingFiles = false
+    }
     const active = activeDurableOperation
     if (
       !active
@@ -194,9 +259,38 @@ watch(
     durableOperationGeneration += 1
     activeDurableOperation = null
     durableOperating.value = false
+    batchFiles.value = []
+    batchPhase.value = null
+    drafts.processingFiles = false
   },
   { flush: 'sync' },
 )
+
+watch(() => editor.category, (category) => {
+  if (!editorSourceInvoice.value && category !== 'local_transport') editor.transportType = 'other'
+})
+
+const itineraryEvidenceSignature = computed(() => JSON.stringify([
+  drafts.currentDraft?.id, auth.session?.selectedDepartment?.id,
+  drafts.files.map((file) => [file.id, file.role, file.attachmentKind, file.status, file.ocrResult]),
+  expense.items.map((item) => [
+    item.sourceFileId ?? item.id, item.transportType, item.amount, item.date, item.description, item.itineraryAutoMatchDisabled,
+  ]),
+]))
+let processedItineraryEvidenceSignature: string | null = null
+watch([
+  itineraryEvidenceSignature,
+  () => [durableOperating.value, drafts.pendingMutations, drafts.loadingCurrentDraft, props.readonly, drafts.currentDraft?.status],
+], ([signature]) => {
+  if (!props.durable || !isDurableDraftEditable() || durableOperating.value
+    || drafts.pendingMutations || drafts.loadingCurrentDraft) return
+  // A save/re-render is not new evidence: keep an employee's cleared link empty.
+  // Do not mark busy evidence processed, so the completed batch still matches.
+  if (signature === processedItineraryEvidenceSignature) return
+  processedItineraryEvidenceSignature = signature
+  expense.reconcileDraftProofs(drafts.files)
+  expense.matchDraftItineraries(drafts.files)
+}, { immediate: true, flush: 'post' })
 
 function beginDurableOperation(): DurableOperationScope | null {
   const current = drafts.currentDraft
@@ -245,8 +339,12 @@ function openNewItem(): void {
     description: '',
     amount: '',
     receiptCount: 1,
+    transportType: 'other',
     requiresItinerary: false,
     itineraryFileIds: [],
+    itineraryAutoMatchDisabled: false,
+    paymentProofFileIds: [],
+    railType: 'unknown',
     originalCurrency: '',
     originalAmount: '',
     cnyAmountConfirmed: false,
@@ -263,9 +361,13 @@ function openEditItem(item: ExpenseItem): void {
     date: item.date ?? '',
     description: item.description,
     amount: item.amount,
-    receiptCount: item.receiptCount,
+    receiptCount: item.sourceFileId || item.source === 'ocr' ? 1 : item.receiptCount,
+    transportType: item.transportType ?? (item.requiresItinerary ? 'ride_hailing' : 'other'),
     requiresItinerary: item.requiresItinerary || item.transportType === 'ride_hailing' || false,
     itineraryFileIds: [...(item.itineraryFileIds ?? [])],
+    itineraryAutoMatchDisabled: item.itineraryAutoMatchDisabled ?? false,
+    paymentProofFileIds: [...(item.paymentProofFileIds ?? [])],
+    railType: item.railType ?? 'unknown',
     originalCurrency: item.originalCurrency ?? '',
     originalAmount: item.originalAmount ?? '',
     cnyAmountConfirmed: item.cnyAmountConfirmed ?? false,
@@ -287,7 +389,7 @@ function durableStatusLabel(file: ReimbursementDraftFile): string {
   if (file.status === 'FAILED') return '上传失败'
   if (file.status === 'DELETING') return '删除中'
   if (file.status === 'PURGED') return '已删除'
-  if (file.role === 'ATTACHMENT_ONLY') return '已上传'
+  if (file.role === 'ATTACHMENT_ONLY' && file.attachmentKind !== 'itinerary') return '已上传'
   if (file.ocrStatus === 'RUNNING') return '识别中'
   if (file.ocrStatus === 'COMPLETE') return '识别完成'
   if (file.ocrStatus === 'FAILED') return '识别失败'
@@ -314,6 +416,39 @@ function itineraryFiles(item: ExpenseItem): ReimbursementDraftFile[] {
   return durableFiles.value.filter((file) => item.itineraryFileIds?.includes(file.id))
 }
 
+function linkedProofFiles(item: ExpenseItem): ReimbursementDraftFile[] {
+  return durableFiles.value.filter((file) => item.itineraryFileIds?.includes(file.id) || item.paymentProofFileIds?.includes(file.id))
+}
+
+function missingPaymentProof(item: ExpenseItem): boolean {
+  return requiresPaymentProof(item) && !item.paymentProofFileIds?.some((id) => paymentProofOptions.value.some((file) => file.id === id))
+}
+
+function openMaterialEditor(file: ReimbursementDraftFile): void {
+  if (durableActionDisabledReason.value) return
+  materialEditorFile.value = file
+  materialEditorKind.value = file.attachmentKind ?? 'other'
+  materialEditorVisible.value = true
+}
+
+async function saveMaterialKind(): Promise<void> {
+  const file = materialEditorFile.value
+  if (!file || durableActionDisabledReason.value) return
+  const scope = beginDurableOperation()
+  if (!scope) return
+  const kind = materialEditorKind.value
+  durableOperating.value = true
+  try {
+    const result = await drafts.updateFile(file.id, { attachmentKind: kind })
+    if (!acceptsDurableOperation(scope)) return
+    expense.reconcileDraftProofs(drafts.files)
+    if (kind === 'itinerary') await recognizeDurableFile(result.file, scope, false)
+    if (acceptsDurableOperation(scope)) materialEditorVisible.value = false
+  } catch (error) {
+    if (acceptsDurableOperation(scope)) ElMessage.error(readableOperationError(error, '材料用途修改失败，请重试'))
+  } finally { finishDurableOperation(scope) }
+}
+
 function needsItinerary(item: ExpenseItem): boolean {
   return Boolean(item.requiresItinerary || item.transportType === 'ride_hailing')
 }
@@ -328,6 +463,11 @@ function durableFileError(file: ReimbursementDraftFile | undefined): string {
 function durableOcrSummary(file: ReimbursementDraftFile): string {
   const result = file.ocrResult
   if (!result) return ''
+  if (isItineraryOcrResult(result)) {
+    const summary = result.summary
+    return [summary.startDate, `${result.trips.length} 次行程`, summary.amount ? `${summary.amount} ${summary.currency ?? ''}` : null,
+      !result.complete || result.warnings.length ? '识别不完整或存在疑问，请手动核对关联' : null].filter(Boolean).join(' · ')
+  }
   return [
     result.date,
     result.description?.trim(),
@@ -338,7 +478,7 @@ function durableOcrSummary(file: ReimbursementDraftFile): string {
 function canRetryDurableRecognition(file: ReimbursementDraftFile | undefined): boolean {
   return Boolean(file
     && file.status === 'ACTIVE'
-    && file.role === 'EXPENSE_SOURCE'
+    && (file.role === 'EXPENSE_SOURCE' || isActiveProof(file, 'itinerary'))
     && file.ocrStatus !== 'RUNNING')
 }
 
@@ -368,9 +508,10 @@ function chooseReceiptFiles(): void {
   else receiptInput.value?.click()
 }
 
-function chooseAttachmentFiles(): void {
+function chooseAttachmentFiles(kind: ReimbursementAttachmentKind = 'other'): void {
   if (props.readonly) return
-  durableAttachmentInput.value?.click()
+  const input = kind === 'itinerary' ? durableItineraryInput : kind === 'payment_proof' ? durablePaymentProofInput : durableAttachmentInput
+  input.value?.click()
 }
 
 function releaseReceiptPreview(): void {
@@ -474,6 +615,7 @@ async function recognizeDurableFile(
 async function onDurableSelection(
   event: Event,
   role: ReimbursementDraftFileRole,
+  attachmentKind: ReimbursementAttachmentKind = 'other',
 ): Promise<void> {
   const input = event.target as HTMLInputElement
   const files = [...(input.files ?? [])]
@@ -483,23 +625,60 @@ async function onDurableSelection(
   if (!scope) return
 
   durableOperating.value = true
+  drafts.processingFiles = true
+  batchScope = scope
+  batchOriginalFileIds = new Set(drafts.files.map((file) => file.id))
+  batchNeedsOcr.value = role === 'EXPENSE_SOURCE' || attachmentKind === 'itinerary'
+  batchPhase.value = 'uploading'
+  batchFiles.value = files.map((file, index) => ({ key: `${scope.generation}-${index}`, name: file.name, status: 'queued' }))
+  const entries = batchFiles.value
+  const recognized: ReimbursementDraftFile[] = []
   try {
-    for (const file of files) {
+    for (const [index, file] of files.entries()) {
       if (!acceptsDurableOperation(scope)) break
+      const entry = entries[index]!
+      entry.status = 'uploading'
       try {
-        const uploaded = await drafts.uploadFile(file, role)
+        const uploaded = await drafts.uploadFile(file, role, attachmentKind)
         if (!acceptsDurableOperation(scope) || uploaded.draftId !== scope.draftId) break
         delete durableErrors[uploaded.file.id]
-        if (
-          role === 'EXPENSE_SOURCE'
-          && await recognizeDurableFile(uploaded.file, scope, true) === null
-        ) break
+        entry.uploaded = uploaded.file
+        entry.status = batchNeedsOcr.value ? 'uploaded' : 'done'
       } catch (error) {
         if (!acceptsDurableOperation(scope)) break
-        ElMessage.error(`${file.name}：${readableOperationError(error, '文件处理失败，请重试')}`)
+        entry.status = 'failed'
+        entry.error = readableOperationError(error, '文件上传失败，请重试')
       }
     }
+    if (acceptsDurableOperation(scope) && batchNeedsOcr.value) {
+      batchPhase.value = 'recognizing'
+      for (const entry of entries) {
+        if (!acceptsDurableOperation(scope)) break
+        if (!entry.uploaded) continue
+        entry.status = 'recognizing'
+        try {
+          const result = await recognizeDurableFile(entry.uploaded, scope, false)
+          if (!result) break
+          recognized.push(result)
+          entry.status = result.ocrResult?.status === 'failed' ? 'failed' : 'done'
+          if (entry.status === 'failed') entry.error = result.ocrResult?.error?.message ?? '识别未完成，请重新识别或手动关联'
+        } catch (error) {
+          if (!acceptsDurableOperation(scope)) break
+          entry.status = 'failed'
+          entry.error = readableOperationError(error, '票据识别失败，请重试')
+        }
+      }
+    }
+    if (acceptsDurableOperation(scope)) {
+      // Publish together; the parent autosave/calculation watchers observe one update.
+      for (const file of recognized) {
+        if (file.role !== 'EXPENSE_SOURCE') continue
+        if (!expense.upsertDraftOcrItem(file)) durableErrors[file.id] = '识别结果不完整，请重试或手工添加费用明细'
+      }
+      batchPhase.value = 'done'
+    }
   } finally {
+    if (scope.generation === durableOperationGeneration) drafts.processingFiles = false
     finishDurableOperation(scope)
   }
 }
@@ -515,6 +694,7 @@ async function retryDurableRecognition(file: ReimbursementDraftFile): Promise<vo
   try {
     const recognized = await recognizeDurableFile(file, scope, false)
     if (!recognized) return
+    if (isItineraryOcrResult(recognized.ocrResult)) return
     if (
       linkedItemSnapshot === null
       || expenseItemSnapshot(expense.items.find((item) => item.sourceFileId === file.id))
@@ -660,6 +840,17 @@ async function removeReceipt(localId: string): Promise<void> {
   }
 }
 
+function chooseEditorItineraries(fileIds: string[]): void {
+  editor.itineraryFileIds = [...fileIds]
+  editor.itineraryAutoMatchDisabled = true
+}
+
+function retryEditorItineraryMatching(): void {
+  if (props.readonly || !isDurableDraftEditable() || editor.itineraryFileIds.length) return
+  editor.itineraryAutoMatchDisabled = false
+  saveItem()
+}
+
 function saveItem(): void {
   if (props.readonly) return
   try {
@@ -673,11 +864,13 @@ function saveItem(): void {
       displayDate: editor.date,
       description: editor.description,
       amount: editor.amount,
-      receiptCount: editor.receiptCount,
-      requiresItinerary: editor.requiresItinerary || Boolean(sourceRequiresItinerary.value),
-      transportType: editor.requiresItinerary ? 'ride_hailing'
-        : editorSource.value?.ocrResult?.transportType ?? 'other',
-      itineraryFileIds: [...editor.itineraryFileIds],
+      receiptCount: editorSourceInvoice.value ? 1 : editor.receiptCount,
+      requiresItinerary: editor.transportType === 'ride_hailing' || Boolean(sourceRequiresItinerary.value),
+      transportType: sourceRequiresItinerary.value ? 'ride_hailing' : editor.transportType,
+      itineraryFileIds: editorIsTaxi.value ? [...editor.itineraryFileIds] : [],
+      itineraryAutoMatchDisabled: editor.itineraryAutoMatchDisabled,
+      paymentProofFileIds: [...editor.paymentProofFileIds],
+      railType: editorRailType.value,
       originalCurrency: editor.originalCurrency.trim().toUpperCase() || undefined,
       originalAmount: editor.originalAmount.trim() || undefined,
       cnyAmountConfirmed: foreignEditor.value && editor.cnyAmountConfirmed,
@@ -762,9 +955,23 @@ async function retryItemRecognition(id: string): Promise<void> {
             :loading="durableBusy"
             :disabled="Boolean(receiptUploadDisabledReason)"
             :title="receiptUploadDisabledReason"
-            @click="chooseAttachmentFiles"
+            @click="chooseAttachmentFiles('itinerary')"
           >
-            添加行程单 / 证明材料
+            添加行程单
+          </el-button>
+          <el-button
+            v-if="props.durable"
+            :disabled="Boolean(receiptUploadDisabledReason)"
+            @click="chooseAttachmentFiles('payment_proof')"
+          >
+            添加付款凭证
+          </el-button>
+          <el-button
+            v-if="props.durable"
+            :disabled="Boolean(receiptUploadDisabledReason)"
+            @click="chooseAttachmentFiles('other')"
+          >
+            添加其他材料
           </el-button>
         </div>
         <input
@@ -790,6 +997,28 @@ async function retryItemRecognition(id: string): Promise<void> {
         >
         <input
           v-if="props.durable"
+          ref="durableItineraryInput"
+          data-testid="durable-itinerary-input"
+          class="visually-hidden"
+          type="file"
+          accept=".jpg,.jpeg,.png,.pdf,image/jpeg,image/png,application/pdf"
+          multiple
+          :disabled="Boolean(durableActionDisabledReason)"
+          @change="onDurableSelection($event, 'ATTACHMENT_ONLY', 'itinerary')"
+        >
+        <input
+          v-if="props.durable"
+          ref="durablePaymentProofInput"
+          data-testid="durable-payment-proof-input"
+          class="visually-hidden"
+          type="file"
+          accept=".jpg,.jpeg,.png,.pdf,image/jpeg,image/png,application/pdf"
+          multiple
+          :disabled="Boolean(durableActionDisabledReason)"
+          @change="onDurableSelection($event, 'ATTACHMENT_ONLY', 'payment_proof')"
+        >
+        <input
+          v-if="props.durable"
           ref="durableAttachmentInput"
           data-testid="durable-attachment-input"
           class="visually-hidden"
@@ -811,7 +1040,7 @@ async function retryItemRecognition(id: string): Promise<void> {
     <el-alert
       :title="props.durable ? '票据自动识别，其他材料作为附件保存' : '一个文件只能放一张票据'"
       :description="props.durable
-        ? '发票上传后自动填入下方明细；行程单请使用“添加行程单 / 证明材料”，并在对应费用的编辑窗口中选择。提交时按费用顺序汇总为一个 PDF。'
+        ? '发票自动填入费用；行程单识别后按明确证据匹配打车费用，未匹配的可手动关联。付款凭证和其他材料不识别、不计票据张数。已上传材料可修改用途。'
         : '支持一次选择多个 JPG、JPEG、PNG 和单页 PDF。OCR 结果会直接成为可编辑的费用条目；不支持多页汇总 PDF、行程单或文件合并。临时文件由后台自动清理。'"
       type="info"
       :closable="false"
@@ -844,6 +1073,31 @@ async function retryItemRecognition(id: string): Promise<void> {
       class="receipt-alert"
     />
     <div
+      v-if="batchFiles.length"
+      class="batch-progress"
+      role="status"
+      aria-live="polite"
+      data-testid="batch-progress"
+    >
+      <p>{{ batchPhase === 'done' ? `本批 ${batchFiles.length} 个文件已处理完成` : `正在${batchPhase === 'uploading' ? '上传' : '识别'}本批 ${batchFiles.length} 个文件` }}</p>
+      <el-progress :percentage="batchProgress" />
+      <div
+        v-for="file in visibleBatchFiles"
+        :key="file.key"
+        class="batch-file"
+        data-testid="batch-file"
+      >
+        <span>{{ file.name }}</span>
+        <span>{{ batchStatusLabels[file.status] }}</span>
+        <p
+          v-if="file.error"
+          class="field-error"
+        >
+          {{ file.error }}
+        </p>
+      </div>
+    </div>
+    <div
       v-if="props.durable && unlinkedDurableFiles.length"
       class="receipt-list"
       aria-live="polite"
@@ -867,7 +1121,7 @@ async function retryItemRecognition(id: string): Promise<void> {
               {{ file.name }} · 预览
             </button>
             <el-tag size="small">
-              {{ durableRoleLabels[file.role] }}
+              {{ file.role === 'ATTACHMENT_ONLY' ? attachmentKindLabels[file.attachmentKind ?? 'other'] : durableRoleLabels[file.role] }}
             </el-tag>
             <el-tag
               size="small"
@@ -895,6 +1149,14 @@ async function retryItemRecognition(id: string): Promise<void> {
           </p>
         </div>
         <div class="receipt-actions">
+          <el-button
+            v-if="file.role === 'ATTACHMENT_ONLY'"
+            link
+            :disabled="Boolean(durableActionDisabledReason)"
+            @click="openMaterialEditor(file)"
+          >
+            用途
+          </el-button>
           <el-button
             v-if="canAdoptDurableRecognition(file)"
             link
@@ -1077,20 +1339,33 @@ async function retryItemRecognition(id: string): Promise<void> {
             >
               {{ durableFileByItemId(scope.row.id)?.name }} · 预览
             </button>
-            <button
-              v-for="file in itineraryFiles(scope.row)"
+            <span
+              v-for="file in linkedProofFiles(scope.row)"
               :key="file.id"
-              type="button"
-              class="receipt-file-preview-link receipt-meta"
-              :disabled="previewLoading"
-              @click="previewDurableFile(file)"
+              class="receipt-meta"
             >
-              行程单：{{ file.name }} · 预览
-            </button>
+              <button
+                type="button"
+                class="receipt-file-preview-link receipt-meta"
+                :disabled="previewLoading"
+                @click="previewDurableFile(file)"
+              >
+                {{ attachmentKindLabels[file.attachmentKind] }}：{{ file.name }} · 预览
+              </button>
+              <el-button
+                link
+                :disabled="Boolean(durableActionDisabledReason)"
+                @click="openMaterialEditor(file)"
+              >用途</el-button>
+            </span>
             <span
               v-if="needsItinerary(scope.row) && itineraryFiles(scope.row).length === 0"
               class="field-error"
             >缺少行程单，请编辑补齐</span>
+            <span
+              v-if="props.durable && missingPaymentProof(scope.row)"
+              class="field-error"
+            >本行超过 500 元，缺少付款凭证</span>
             <span
               v-if="scope.row.warnings?.length"
               class="ocr-warning"
@@ -1240,7 +1515,7 @@ async function retryItemRecognition(id: string): Promise<void> {
           </button>
         </p>
         <p
-          v-for="file in itineraryFiles(item)"
+          v-for="file in linkedProofFiles(item)"
           :key="file.id"
           class="receipt-meta"
         >
@@ -1250,14 +1525,27 @@ async function retryItemRecognition(id: string): Promise<void> {
             :disabled="previewLoading"
             @click="previewDurableFile(file)"
           >
-            行程单：{{ file.name }} · 预览
+            {{ attachmentKindLabels[file.attachmentKind] }}：{{ file.name }} · 预览
           </button>
+          <el-button
+            link
+            :disabled="Boolean(durableActionDisabledReason)"
+            @click="openMaterialEditor(file)"
+          >
+            用途
+          </el-button>
         </p>
         <p
           v-if="needsItinerary(item) && itineraryFiles(item).length === 0"
           class="field-error"
         >
           缺少行程单，请编辑补齐
+        </p>
+        <p
+          v-if="props.durable && missingPaymentProof(item)"
+          class="field-error"
+        >
+          本行超过 500 元，缺少付款凭证
         </p>
         <p
           v-if="isForeignExpense(item)"
@@ -1358,6 +1646,42 @@ async function retryItemRecognition(id: string): Promise<void> {
   </el-dialog>
 
   <el-dialog
+    v-model="materialEditorVisible"
+    title="修改材料用途"
+    width="min(520px, calc(100% - 24px))"
+  >
+    <p>{{ materialEditorFile?.name }}</p>
+    <el-select
+      v-model="materialEditorKind"
+      aria-label="材料用途"
+      :disabled="durableBusy"
+      class="full-width"
+    >
+      <el-option
+        v-for="(label, kind) in attachmentKindLabels"
+        :key="kind"
+        :value="kind"
+        :label="label"
+      />
+    </el-select>
+    <p class="field-help">
+      改为行程单后自动识别；原用途的费用关联会清除，请重新核对。
+    </p>
+    <template #footer>
+      <el-button @click="materialEditorVisible = false">
+        取消
+      </el-button>
+      <el-button
+        type="primary"
+        :disabled="Boolean(durableActionDisabledReason)"
+        @click="saveMaterialKind"
+      >
+        保存用途
+      </el-button>
+    </template>
+  </el-dialog>
+
+  <el-dialog
     v-model="editorVisible"
     :title="editor.id ? '编辑费用明细' : '新增费用明细'"
     width="min(520px, calc(100% - 24px))"
@@ -1379,6 +1703,46 @@ async function retryItemRecognition(id: string): Promise<void> {
           />
         </el-select>
       </el-form-item>
+      <el-form-item
+        v-if="props.durable && editorCanSelectRailType"
+        label="铁路票种"
+      >
+        <el-select
+          v-model="editor.railType"
+          aria-label="铁路票种"
+          class="full-width"
+          :disabled="Boolean(sourceRailType && sourceRailType !== 'unknown')"
+        >
+          <el-option
+            value="unknown"
+            label="待确认"
+          />
+          <el-option
+            value="high_speed"
+            label="高铁"
+          />
+          <el-option
+            value="emu"
+            label="动车"
+          />
+          <el-option
+            value="regular"
+            label="普通列车"
+          />
+        </el-select>
+        <p
+          v-if="sourceRailType && sourceRailType !== 'unknown'"
+          class="field-help"
+        >
+          票种来自原始票据识别；如有误请核对原件后重新识别。
+        </p>
+      </el-form-item>
+      <p
+        v-if="props.durable && editor.category === 'rail_fare' && !editorCanSelectRailType"
+        class="field-help"
+      >
+        原始票据已识别为非铁路费用，修改类别不会获得高铁付款凭证豁免；请核对原件。
+      </p>
       <el-form-item label="发生日期">
         <el-date-picker
           v-model="editor.date"
@@ -1406,7 +1770,10 @@ async function retryItemRecognition(id: string): Promise<void> {
             @input="editor.cnyAmountConfirmed = false"
           />
         </el-form-item>
-        <el-form-item label="票据张数">
+        <el-form-item
+          v-if="!editorSourceInvoice"
+          label="票据张数"
+        >
           <el-input-number
             :key="editorRevision"
             v-model="editor.receiptCount"
@@ -1416,6 +1783,15 @@ async function retryItemRecognition(id: string): Promise<void> {
             step-strictly
             class="full-width"
           />
+          <p class="field-help">
+            手工汇总多张票据时填写；行程单和证明材料不计入。
+          </p>
+          <p
+            v-if="editor.receiptCount > 1"
+            class="field-help"
+          >
+            付款凭证按本行金额判断；如需按单张发票判断，请分别录入。
+          </p>
         </el-form-item>
       </div>
       <div class="trip-grid">
@@ -1447,21 +1823,40 @@ async function retryItemRecognition(id: string): Promise<void> {
           人民币金额请按实际报销金额填写，系统不会把原币金额直接当作人民币。
         </p>
       </el-form-item>
-      <template v-if="props.durable">
-        <el-form-item>
-          <el-checkbox
-            v-model="editor.requiresItinerary"
-            :disabled="Boolean(sourceRequiresItinerary)"
-          >
-            网约车费用（必须有对应行程单）
-          </el-checkbox>
-        </el-form-item>
-        <el-form-item label="对应行程单 / 证明材料">
+      <el-form-item
+        v-if="props.durable && !sourceRequiresItinerary && editor.category === 'local_transport'"
+        label="市内交通类型"
+      >
+        <el-select
+          v-model="editor.transportType"
+          aria-label="打车类型"
+          class="full-width"
+        >
+          <el-option
+            value="other"
+            label="其他市内交通"
+          />
+          <el-option
+            value="taxi"
+            label="出租车（行程单可选）"
+          />
+          <el-option
+            value="ride_hailing"
+            label="网约车（必须有行程单）"
+          />
+        </el-select>
+      </el-form-item>
+      <template v-if="props.durable && editorIsTaxi">
+        <p class="field-help">
+          {{ editor.transportType === 'ride_hailing' || sourceRequiresItinerary ? '网约车费用必须有对应行程单。' : '出租车费用可按需关联行程单。' }}
+        </p>
+        <el-form-item label="对应行程单">
           <el-select
-            v-model="editor.itineraryFileIds"
+            :model-value="editor.itineraryFileIds"
             multiple
             class="full-width"
             placeholder="选择已经上传的对应材料"
+            @update:model-value="chooseEditorItineraries"
           >
             <el-option
               v-for="file in itineraryOptions"
@@ -1473,8 +1868,43 @@ async function retryItemRecognition(id: string): Promise<void> {
           <p class="field-help">
             先上传行程单，再确认对应关系。一份行程单包含多次行程时，可关联多条费用；汇总 PDF 中只保留一份。
           </p>
+          <template v-if="editor.itineraryAutoMatchDisabled && editorSourceInvoice">
+            <p class="field-help">
+              已保留你的手动选择，刷新后也不会自动改变。需要重新匹配时，请先清空选择；重新匹配将保存当前编辑。
+            </p>
+            <el-button
+              v-if="!editor.itineraryFileIds.length"
+              link
+              type="primary"
+              :disabled="props.readonly"
+              @click="retryEditorItineraryMatching"
+            >
+              重新自动匹配
+            </el-button>
+          </template>
         </el-form-item>
       </template>
+      <el-form-item
+        v-if="props.durable && (editorNeedsPaymentProof || editor.paymentProofFileIds.length)"
+        label="付款凭证"
+      >
+        <el-select
+          v-model="editor.paymentProofFileIds"
+          multiple
+          class="full-width"
+          placeholder="选择已上传的付款凭证"
+        >
+          <el-option
+            v-for="file in paymentProofOptions"
+            :key="file.id"
+            :label="file.name"
+            :value="file.id"
+          />
+        </el-select>
+        <p class="field-help">
+          除高铁外，本行确认人民币金额超过 500 元须有付款凭证；500 元无需补充。
+        </p>
+      </el-form-item>
     </el-form>
     <template #footer>
       <el-button @click="editorVisible = false">
@@ -1490,3 +1920,10 @@ async function retryItemRecognition(id: string): Promise<void> {
     </template>
   </el-dialog>
 </template>
+
+<style scoped>
+.batch-progress { margin-top: 16px; padding: 16px; border: 1px solid var(--el-border-color-light); border-radius: 8px; }
+.batch-file { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 16px; padding-top: 12px; }
+.batch-file > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.batch-file > p { grid-column: 1 / -1; margin: 0; }
+</style>

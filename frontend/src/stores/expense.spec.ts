@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { calculateTotals, getExpenseCategories } from '@/api/expenses'
 import { useExpenseStore } from '@/stores/expense'
+import type { OcrReceiptCandidate } from '@/types/receipts'
 import type {
   ReimbursementDraft,
   ReimbursementDraftFile,
@@ -70,12 +71,13 @@ function durableDraft(
 
 function durableFile(
   id: string,
-  overrides: Partial<ReimbursementDraftFile> = {},
-): ReimbursementDraftFile {
+  overrides: Partial<ReimbursementDraftFile & { ocrResult: OcrReceiptCandidate }> = {},
+): ReimbursementDraftFile & { ocrResult: OcrReceiptCandidate } {
   return {
     id,
     name: `${id}.pdf`,
     role: 'EXPENSE_SOURCE',
+    attachmentKind: 'other',
     sortOrder: 0,
     status: 'ACTIVE',
     mediaType: 'application/pdf',
@@ -110,6 +112,22 @@ describe('expense store', () => {
     setActivePinia(createPinia())
     vi.mocked(calculateTotals).mockReset()
     vi.mocked(getExpenseCategories).mockReset()
+  })
+
+  it('round-trips payment associations and rail evidence, clears invalid purpose links, and removes deleted proofs', () => {
+    const store = useExpenseStore()
+    const source = durableFile('source', { ocrResult: { ...durableFile('source').ocrResult, railType: 'regular' } })
+    const itinerary = durableFile('itinerary', { role: 'ATTACHMENT_ONLY', attachmentKind: 'itinerary' })
+    const payment = durableFile('payment', { role: 'ATTACHMENT_ONLY', attachmentKind: 'payment_proof' })
+    const row = { category: 'rail_fare', date: '2026-09-01', displayDate: '2026-09-01', description: '员工确认费用', amount: '600.00', receiptCount: 4, sourceFileId: 'source', railType: 'high_speed' as const, itineraryFileIds: ['itinerary'], paymentProofFileIds: ['payment'] }
+    store.hydrateFromDraft(durableDraft([row]), [source, itinerary, payment])
+    expect(store.items[0]).toMatchObject({ railType: 'regular', receiptCount: 1, itineraryFileIds: ['itinerary'], paymentProofFileIds: ['payment'] })
+    expect(store.buildDraftExpenseItems()[0]).toMatchObject({ railType: 'regular', paymentProofFileIds: ['payment'] })
+    store.reconcileDraftProofs([source, { ...itinerary, attachmentKind: 'payment_proof' }, payment])
+    expect(store.items[0]?.itineraryFileIds).toEqual([])
+    expect(store.items[0]?.paymentProofFileIds).toEqual(['payment'])
+    store.removeDraftFileAssociation('payment')
+    expect(store.buildDraftExpenseItems()[0]?.paymentProofFileIds).toEqual([])
   })
 
   it('hydrates persisted OCR lines by source file id without overwriting user edits', () => {
@@ -352,7 +370,7 @@ describe('expense store', () => {
       displayDate: '2026-09-02',
       description: '人工修改后的行程',
       amount: '455.00',
-      receiptCount: 2,
+      receiptCount: 1,
     })])
   })
 
@@ -413,6 +431,47 @@ describe('expense store', () => {
         confidence: '0.96',
       }),
     ])
+  })
+
+  it('normalizes source invoices to one receipt while preserving manual aggregate counts', () => {
+    const store = useExpenseStore()
+    store.categories = MANUAL_CATEGORIES
+    const source = durableFile('file-1')
+    store.upsertDraftOcrItem(source)
+    store.upsertManualItem({ ...store.items[0]!, receiptCount: 8 })
+    expect(store.items[0]?.receiptCount).toBe(1)
+    const input = store.buildDraftExpenseItems()
+    input[0]!.receiptCount = 8
+    store.hydrateFromDraft(durableDraft(input), [source])
+    expect(store.items[0]?.receiptCount).toBe(1)
+    expect(store.buildDraftExpenseItems()[0]?.receiptCount).toBe(1)
+    store.upsertManualItem({
+      category: 'rail_fare', date: '2026-09-01', displayDate: '2026-09-01',
+      description: '手工汇总', amount: '100.00', receiptCount: 3,
+    })
+    expect(store.items[1]?.receiptCount).toBe(3)
+    expect(store.localReceiptCount).toBe(4)
+    const locked = durableDraft(input)
+    locked.status = 'LOCKED'
+    store.hydrateFromDraft(locked, [source])
+    expect(store.items[0]?.receiptCount).toBe(8)
+  })
+
+  it('preserves manual itinerary intent across manual edits, re-recognition and draft hydration', () => {
+    const store = useExpenseStore()
+    store.categories = MANUAL_CATEGORIES
+    const file = durableFile('file-1')
+    store.upsertDraftOcrItem(file)
+    expect(store.items[0]?.itineraryAutoMatchDisabled).toBe(false)
+    store.items[0]!.itineraryAutoMatchDisabled = true
+    const item = store.items[0]!
+    store.upsertManualItem({ id: item.id, category: item.category, date: item.date, displayDate: item.displayDate, description: '人工确认', amount: item.amount, receiptCount: 1 })
+    expect(store.items[0]?.itineraryAutoMatchDisabled).toBe(true)
+    store.upsertDraftOcrItem(file)
+    expect(store.items[0]?.itineraryAutoMatchDisabled).toBe(true)
+    const items = store.buildDraftExpenseItems()
+    store.hydrateFromDraft(durableDraft(items), [file])
+    expect(store.buildDraftExpenseItems()[0]?.itineraryAutoMatchDisabled).toBe(true)
   })
 
   it('keeps foreign original amounts separate from RMB and preserves explicit confirmation after reload', () => {

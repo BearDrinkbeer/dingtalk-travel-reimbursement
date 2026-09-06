@@ -98,6 +98,7 @@ function serverFile(id = 'file-1'): ReimbursementDraftFile {
     id,
     name: '票据.jpg',
     role: 'EXPENSE_SOURCE',
+    attachmentKind: 'other',
     sortOrder: 0,
     status: 'ACTIVE',
     mediaType: 'image/jpeg',

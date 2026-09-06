@@ -921,7 +921,10 @@ def test_excel_preview_releases_sync_session_before_generation(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_ocr_finishes_as_failed_and_releases_worker_copy(client_factory) -> None:
+@pytest.mark.parametrize("itinerary", [False, True])
+async def test_cancelled_ocr_finishes_as_failed_and_releases_worker_copy(
+    client_factory, itinerary,
+) -> None:
     client = client_factory(auth_mock_enabled=True)
     csrf = str(mock_login(client)["csrfToken"])
     draft_id = _insert_draft(client)
@@ -931,6 +934,10 @@ async def test_cancelled_ocr_finishes_as_failed_and_releases_worker_copy(client_
         draft = database.get(ReimbursementDraft, draft_id)
         assert draft is not None
         draft.status = "REVIEW_READY"
+        if itinerary:
+            file = database.get(ReimbursementDraftFile, file_id)
+            file.processing_role = "ATTACHMENT_ONLY"
+            file.attachment_kind = "itinerary"
         database.commit()
     started = asyncio.Event()
 
@@ -938,6 +945,8 @@ async def test_cancelled_ocr_finishes_as_failed_and_releases_worker_copy(client_
         async def recognize_file(self, *_args, **_kwargs):
             started.set()
             await asyncio.Event().wait()
+
+        recognize_itinerary_file = recognize_file
 
     task = asyncio.create_task(
         recognize_draft_file(
@@ -975,4 +984,6 @@ async def test_cancelled_ocr_finishes_as_failed_and_releases_worker_copy(client_
         assert draft is not None and draft.revision == 3
         assert file is not None and file.ocr_status == "FAILED"
         assert "OCR_CANCELLED" in str(file.ocr_result_json)
+        if itinerary:
+            assert json.loads(file.ocr_result_json)["kind"] == "itinerary"
     assert not list((client.app.state.settings.temp_dir / ".spool").glob("ocr-*"))

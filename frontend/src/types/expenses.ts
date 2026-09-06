@@ -33,11 +33,16 @@ export interface TripInput {
   noSubsidyException?: boolean
 }
 
+export type RailType = 'high_speed' | 'emu' | 'regular' | 'unknown'
+
 export interface ExpenseItem {
   id: string
   /** Stable provenance for a line created from a persisted reimbursement draft file. */
   sourceFileId?: string
   itineraryFileIds?: string[]
+  itineraryAutoMatchDisabled?: boolean
+  paymentProofFileIds?: string[]
+  railType?: RailType
   requiresItinerary?: boolean
   transportType?: 'ride_hailing' | 'taxi' | 'rail' | 'hotel' | 'other'
   originalCurrency?: string
@@ -53,6 +58,10 @@ export interface ExpenseItem {
   source: 'ocr' | 'manual' | 'system'
   confidence?: string
   warnings?: string[]
+}
+
+export function isTaxiExpense(item: Pick<ExpenseItem, 'transportType'>): boolean {
+  return item.transportType === 'ride_hailing' || item.transportType === 'taxi'
 }
 
 export function isForeignExpense(item: Pick<ExpenseItem, 'originalCurrency' | 'warnings' | 'requiresCnyConfirmation'>): boolean {

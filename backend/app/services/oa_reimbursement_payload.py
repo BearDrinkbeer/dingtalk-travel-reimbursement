@@ -27,6 +27,7 @@ from app.core.errors import ApiError
 from app.domain.categories import CATEGORY_BY_ID, ExpenseCategory
 from app.domain.expenses import ExpenseTotals, calculate_expense_totals
 from app.domain.money import money_string
+from app.domain.reimbursement_proofs import payment_proof_required
 from app.domain.subsidy import SubsidyCalculation, TripType
 from app.integrations.dingtalk.storage import ApprovalAttachment
 from app.integrations.dingtalk.workflow import (
@@ -76,7 +77,7 @@ from app.services.reimbursement_staging import (
     ReimbursementStagingError,
 )
 
-SNAPSHOT_VERSION = 2
+SNAPSHOT_VERSION = 3
 _MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
 _SIGNED_INT64_MAX = 9_223_372_036_854_775_807
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -198,6 +199,10 @@ class SnapshotExpenseItem(_SnapshotModel):
         Annotated[str, StringConstraints(min_length=1, max_length=36)], ...
     ] = ()
     requires_itinerary: bool = False
+    payment_proof_file_ids: tuple[
+        Annotated[str, StringConstraints(min_length=1, max_length=36)], ...
+    ] = ()
+    rail_type: Literal["high_speed", "emu", "regular", "unknown"] = "unknown"
     transport_type: Literal["ride_hailing", "taxi", "rail", "hotel", "other"] | None = None
     original_currency: Annotated[str, StringConstraints(pattern=r"^[A-Z]{3}$")] | None = None
     original_amount: DecimalString | None = None
@@ -266,6 +271,7 @@ class SnapshotOriginalFile(_SnapshotModel):
     draft_file_id: Annotated[str, StringConstraints(min_length=1, max_length=36)]
     sort_order: NonNegativeInt
     processing_role: Literal["EXPENSE_SOURCE", "ATTACHMENT_ONLY"]
+    attachment_kind: Literal["itinerary", "payment_proof", "other"] = "other"
     storage_key: Annotated[str, StringConstraints(min_length=1, max_length=255)]
     file_name: ShortText
     file_type: Literal["jpg", "jpeg", "png", "pdf"]
@@ -302,7 +308,7 @@ class SnapshotFormValue(_SnapshotModel):
 
 
 class ReimbursementSnapshot(_SnapshotModel):
-    snapshot_version: Literal[1, 2] = SNAPSHOT_VERSION
+    snapshot_version: Literal[1, 2, 3] = SNAPSHOT_VERSION
     draft_id: Annotated[str, StringConstraints(min_length=1, max_length=36)]
     draft_revision: PositiveInt
     identity: SnapshotIdentity
@@ -353,6 +359,7 @@ class OriginalFileSource:
     size_bytes: int
     sha256: str
     ocr_status: str
+    attachment_kind: str = "other"
 
 
 @dataclass(frozen=True, slots=True)
@@ -494,6 +501,7 @@ def collect_snapshot_source(
             for item in draft_input.items
             for file_id in ([item.source_file_id] if item.source_file_id else [])
             + item.itinerary_file_ids
+            + item.payment_proof_file_ids
         )
     )
     active_by_id = {item.id: item for item in active_files}
@@ -626,6 +634,12 @@ def build_snapshot(source: SnapshotSource) -> ReimbursementSnapshot:
 def serialize_snapshot(snapshot: ReimbursementSnapshot) -> str:
     snapshot = _require_snapshot(snapshot)
     value = snapshot.model_dump(mode="json", by_alias=True)
+    if snapshot.snapshot_version < 3:
+        for item in value["input"]["items"]:
+            item.pop("paymentProofFileIds", None)
+            item.pop("railType", None)
+        for file in value["originalFiles"]:
+            file.pop("attachmentKind", None)
     if snapshot.snapshot_version == 1:
         for item in value["input"]["items"]:
             for key in (
@@ -851,6 +865,7 @@ def _original_source(
         size_bytes=item.size_bytes,
         sha256=item.sha256,
         ocr_status=item.ocr_status,
+        attachment_kind=item.attachment_kind,
     )
 
 
@@ -978,6 +993,8 @@ def _snapshot_expense_item(
         source_file_id=item.source_file_id,
         itinerary_file_ids=tuple(item.itinerary_file_ids),
         requires_itinerary=item.requires_itinerary,
+        payment_proof_file_ids=tuple(item.payment_proof_file_ids),
+        rail_type=item.rail_type,
         transport_type=item.transport_type,
         original_currency=item.original_currency,
         original_amount=item.original_amount,
@@ -1031,6 +1048,7 @@ def _snapshot_original(item: OriginalFileSource) -> SnapshotOriginalFile:
         size_bytes=item.size_bytes,
         sha256=item.sha256,
         ocr_status=item.ocr_status,
+        attachment_kind=item.attachment_kind,
     )
 
 
@@ -1291,6 +1309,23 @@ def _validate_business_snapshot(snapshot: ReimbursementSnapshot) -> None:
                 and not item.cny_amount_confirmed
             ):
                 raise ValueError("foreign receipts require a confirmed CNY amount")
+            if snapshot.snapshot_version >= 3:
+                if item.source_file_id is not None and item.receipt_count != 1:
+                    raise ValueError("one source receipt must have receipt count one")
+                by_id = {file.draft_file_id: file for file in snapshot.original_files}
+                for proof_ids, kind in (
+                    (item.itinerary_file_ids, "itinerary"),
+                    (item.payment_proof_file_ids, "payment_proof"),
+                ):
+                    if len(proof_ids) != len(set(proof_ids)) or any(
+                        file_id not in support_ids or by_id[file_id].attachment_kind != kind
+                        for file_id in proof_ids
+                    ):
+                        raise ValueError("proof must reference support files of the correct kind")
+                if payment_proof_required(
+                    amount=item.amount, category=item.category, rail_type=item.rail_type,
+                ) and not item.payment_proof_file_ids:
+                    raise ValueError("payment proof is required for this receipt")
         if (
             snapshot.input.project.display_text != snapshot.selections.budget_code.label
             or snapshot.input.project.manual_text != snapshot.selections.budget_code.label

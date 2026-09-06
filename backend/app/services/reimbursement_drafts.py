@@ -8,7 +8,9 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app.core.errors import ApiError
+from app.domain.categories import ExpenseCategory
 from app.domain.expenses import calculate_expense_totals
+from app.domain.reimbursement_proofs import payment_proof_required
 from app.domain.subsidy import calculate_subsidy
 from app.integrations.dingtalk.workflow import DingTalkWorkflowClient, FormOption
 from app.models.reimbursement import (
@@ -193,7 +195,7 @@ def create_reimbursement_draft(
 ) -> dict[str, object]:
     created_at = now or utc_now()
     if _draft_file_reference_ids(draft_input) or any(
-        item.itinerary_file_ids for item in draft_input.items
+        item.itinerary_file_ids or item.payment_proof_file_ids for item in draft_input.items
     ):
         raise _invalid_file_reference_error()
     draft_input = draft_input.model_copy(
@@ -591,13 +593,18 @@ def validate_draft_file_references(
         raise _invalid_file_reference_error()
 
     for item in draft_input.items:
-        if any(
-            file_id not in files_by_id
-            or files_by_id[file_id].processing_role
-            != ReimbursementDraftFileRole.ATTACHMENT_ONLY.value
-            for file_id in item.itinerary_file_ids
+        for proof_ids, kind in (
+            (item.itinerary_file_ids, "itinerary"),
+            (item.payment_proof_file_ids, "payment_proof"),
         ):
-            raise _invalid_file_reference_error()
+            if any(
+                file_id not in files_by_id
+                or files_by_id[file_id].processing_role
+                != ReimbursementDraftFileRole.ATTACHMENT_ONLY.value
+                or files_by_id[file_id].attachment_kind != kind
+                for file_id in proof_ids
+            ):
+                raise _invalid_file_reference_error()
     if require_submission_proofs:
         validate_submission_evidence(draft_input, files_by_id)
 
@@ -623,6 +630,11 @@ def validate_submission_evidence(
 ) -> None:
     for item in draft_input.items:
         evidence = file_ocr_evidence(files_by_id.get(item.source_file_id or ""))
+        if payment_proof_required(
+            amount=item.amount, category=item.category,
+            rail_type=_authoritative_rail_type(item, evidence),
+        ) and not item.payment_proof_file_ids:
+            raise _not_ready_error("单张票据金额超过500元，请上传并关联付款凭证")
         requires_itinerary = (
             item.requires_itinerary
             or item.transport_type == "ride_hailing"
@@ -645,6 +657,20 @@ def _evidence_requires_cny_confirmation(evidence: dict[str, object]) -> bool:
     return evidence.get("type") == "foreign_receipt" or (
         isinstance(warnings, list) and "FOREIGN_CURRENCY_REQUIRES_CNY_AMOUNT" in warnings
     )
+
+
+def _authoritative_rail_type(
+    item: ReimbursementDraftExpenseItemInput, evidence: dict[str, object]
+) -> str:
+    # "other" is an unclassified fallback, not positive non-rail evidence.
+    if item.category is not ExpenseCategory.RAIL_FARE or evidence.get("categoryId") not in (
+        None, "other", "rail_fare",
+    ):
+        return "unknown"
+    observed = evidence.get("railType")
+    if observed in {"high_speed", "emu", "regular"}:
+        return str(observed)
+    return item.rail_type
 
 
 def file_ocr_evidence(file: ReimbursementDraftFile | None) -> dict[str, object]:
@@ -674,6 +700,9 @@ def apply_ocr_evidence(
     for item in draft_input.items:
         evidence = file_ocr_evidence(by_id.get(item.source_file_id or ""))
         values = item.model_dump(mode="json", by_alias=True)
+        if item.source_file_id is not None:
+            values["receiptCount"] = 1
+        values["railType"] = _authoritative_rail_type(item, evidence)
         if (
             evidence.get("requiresItinerary") is True
             or evidence.get("transportType") == "ride_hailing"
@@ -710,7 +739,10 @@ def detach_draft_file_from_input(
             update={
                 "itinerary_file_ids": [
                     value for value in item.itinerary_file_ids if value != file_id
-                ]
+                ],
+                "payment_proof_file_ids": [
+                    value for value in item.payment_proof_file_ids if value != file_id
+                ],
             }
         )
         for item in draft_input.items

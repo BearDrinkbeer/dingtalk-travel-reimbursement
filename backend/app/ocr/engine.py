@@ -296,6 +296,57 @@ class PaddleLocalOcrEngine:
         except Exception as exc:
             raise OcrRuntimeError("本地 OCR 识别失败") from exc
 
+    @classmethod
+    def _itinerary_layout(cls, payload: dict[str, Any]) -> str:
+        texts, boxes = payload.get("rec_texts"), payload.get("rec_boxes")
+        if not isinstance(texts, list) or not isinstance(boxes, list) or len(texts) != len(boxes):
+            return "\n".join(line.text for line in cls._lines(payload))
+        cells = [(text, cls._box(box)) for text, box in zip(texts, boxes, strict=True)]
+        positioned = [
+            (text, box) for text, box in cells if isinstance(text, str) and box is not None
+        ]
+        if len(positioned) != len(cells) or not positioned:
+            return "\n".join(line.text for line in cls._lines(payload))
+        scale = max(4.0, max(box[2] for _text, box in positioned) / 500)
+        rows: list[list[tuple[str, tuple[int, int, int, int]]]] = []
+        for text, box in sorted(positioned, key=lambda cell: (cell[1][1], cell[1][0])):
+            center = (box[1] + box[3]) / 2
+            if rows:
+                previous = rows[-1][0][1]
+                previous_center = (previous[1] + previous[3]) / 2
+                tolerance = min(box[3] - box[1], previous[3] - previous[1]) / 2
+            if rows and abs(center - previous_center) < tolerance:
+                rows[-1].append((text, box))
+            else:
+                rows.append([(text, box)])
+        output = []
+        for row in rows:
+            line = ""
+            for text, box in sorted(row, key=lambda cell: cell[1][0]):
+                start = round(box[0] / scale)
+                line += " " * max(2 if line else 0, start - len(line)) + text.strip()
+            output.append(line)
+        return "\n".join(output)
+
+    def recognize_itinerary(self, image: object) -> tuple[list[OcrLine], str]:
+        """Keep table geometry from the same prediction, without a second OCR pass."""
+        self.ensure_ready()
+        assert self._pipeline is not None
+        try:
+            lines: list[OcrLine] = []
+            layouts: list[str] = []
+            for result in self._pipeline.predict(image):
+                payload = self._payload(result)
+                lines.extend(self._lines(payload))
+                layouts.append(self._itinerary_layout(payload))
+            return lines, "\n".join(layouts)
+        except OcrRuntimeError:
+            raise
+        except MemoryError:
+            raise
+        except Exception as exc:
+            raise OcrRuntimeError("本地行程单识别失败") from exc
+
 
 class FakeOcrEngine:
     """Explicit test/development seam; never enabled from a production setting."""

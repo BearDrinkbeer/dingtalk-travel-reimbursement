@@ -181,7 +181,7 @@ def _draft_input(
                 "displayDate": "9月1日",
                 "description": "机场到酒店",
                 "amount": "44.89",
-                "receiptCount": 2,
+                "receiptCount": 1 if source_file_id else 2,
                 **({"sourceFileId": source_file_id} if source_file_id else {}),
             },
             {
@@ -316,7 +316,7 @@ def test_snapshot_is_versioned_canonical_immutable_and_hash_verified() -> None:
 
     serialized = serialize_snapshot(first)
     assert serialized == serialize_snapshot(second)
-    assert json.loads(serialized)["snapshotVersion"] == 2
+    assert json.loads(serialized)["snapshotVersion"] == 3
     assert parse_snapshot(serialized, expected_sha256=snapshot_sha256(first)) == first
     assert len(first.template.fields) == 10
     assert first.template.schema_fingerprint in first.template.schema_canonical_json
@@ -358,8 +358,12 @@ def test_v1_snapshot_canonical_bytes_and_legacy_attachments_remain_readable() ->
             "originalAmount",
             "cnyAmountConfirmed",
             "requiresCnyConfirmation",
+            "paymentProofFileIds",
+            "railType",
         ):
             item.pop(key)
+    for file in value["originalFiles"]:
+        file.pop("attachmentKind")
     original = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     parsed = parse_snapshot(original, expected_sha256=hashlib.sha256(original.encode()).hexdigest())
     assert serialize_snapshot(parsed) == original
@@ -384,6 +388,75 @@ def test_snapshot_rejects_missing_proof_and_unconfirmed_foreign_amount() -> None
             build_snapshot(
                 replace(source, draft_input=source.draft_input.model_copy(update={"items": items}))
             )
+
+
+@pytest.mark.parametrize("legacy_version", [1, 2])
+def test_old_large_receipt_snapshots_remain_readable_without_new_proof_fields(legacy_version):
+    source = _source()
+    source.draft_input.items[0].amount = Decimal("600.00")
+    source.draft_input.items[0].payment_proof_file_ids = ["source-file-1"]
+    subsidy = calculate_subsidy(
+        trip_type=source.draft_input.trip.subsidy_trip_type(),
+        period=source.draft_input.trip.as_period(), configured_daily_rate=Decimal("180.00"),
+    )
+    totals = calculate_expense_totals(source.draft_input.items, subsidy).as_api_dict()
+    totals["subsidy"] = subsidy.as_api_dict()
+    source = replace(
+        source, totals_data=totals,
+        original_files=(source.original_files[0], replace(
+            source.original_files[1], attachment_kind="payment_proof",
+        )),
+    )
+    current = build_snapshot(source)
+    value = json.loads(serialize_snapshot(current))
+    value["snapshotVersion"] = legacy_version
+    value["input"]["items"][0]["receiptCount"] = 2
+    value["totals"]["receiptCount"] += 1
+    for item in value["input"]["items"]:
+        for field in ("paymentProofFileIds", "railType"):
+            item.pop(field)
+        if legacy_version == 1:
+            for field in (
+                "itineraryFileIds", "requiresItinerary", "transportType", "originalCurrency",
+                "originalAmount", "cnyAmountConfirmed", "requiresCnyConfirmation",
+            ):
+                item.pop(field)
+    for file in value["originalFiles"]:
+        file.pop("attachmentKind")
+    historical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    restored = parse_snapshot(
+        historical, expected_sha256=hashlib.sha256(historical.encode()).hexdigest(),
+    )
+    assert serialize_snapshot(restored) == historical
+    assert restored.input.items[0].amount == Decimal("600.00")
+    assert restored.input.items[0].receipt_count == 2
+    assert restored.input.items[0].payment_proof_file_ids == ()
+    assert build_create_command(restored, _attachments(restored))
+    # The equivalent *new* snapshot cannot silently omit the required proof.
+    source.draft_input.items[0].payment_proof_file_ids = []
+    with pytest.raises(ApiError):
+        build_snapshot(source)
+
+
+def test_new_snapshot_rejects_multiple_receipts_for_one_source_file():
+    source = _source()
+    source.draft_input.items[0].receipt_count = 2
+    with pytest.raises(ApiError):
+        build_snapshot(source)
+
+
+@pytest.mark.parametrize("snapshot_version", [1, 2, 3])
+def test_editing_only_matching_intent_never_changes_snapshot_hash(snapshot_version):
+    source = _source()
+    assert source.draft_input.items[0].itinerary_auto_match_disabled is False
+    before = build_snapshot(source).model_copy(update={"snapshot_version": snapshot_version})
+    source.draft_input.items[0].itinerary_auto_match_disabled = True
+    after = build_snapshot(source).model_copy(update={"snapshot_version": snapshot_version})
+    assert serialize_snapshot(after) == serialize_snapshot(before)
+    assert snapshot_sha256(after) == snapshot_sha256(before)
+    assert "itineraryAutoMatchDisabled" not in serialize_snapshot(after)
+    restored = parse_snapshot(serialize_snapshot(before), expected_sha256=snapshot_sha256(before))
+    assert serialize_snapshot(restored) == serialize_snapshot(before)
 
 
 def test_snapshot_rejects_a_terminal_ocr_file_without_a_disposition() -> None:

@@ -641,6 +641,27 @@ def extract_passenger_route_from_layout(layout_text: str) -> str | None:
     return extract_passenger_fields_from_layout(layout_text)[1]
 
 
+def extract_passenger_transport_from_layout(layout_text: str) -> str | None:
+    """Read an explicit vehicle cell after the dated route, never company names."""
+    if not all(header in layout_text for header in _PASSENGER_ROW_HEADERS):
+        return None
+    candidates: set[str] = set()
+    for raw in layout_text.splitlines():
+        cells = _layout_cells(raw)
+        for index, (value, _position) in enumerate(cells):
+            match = _LAYOUT_FULL_DATE.search(value)
+            if match is None or _date_from_match(match, 2000) is None:
+                continue
+            # Some native PDFs merge the date and first location into a cell.
+            merged_origin = bool(_compact_layout_value(value[match.end() :]))
+            after_route = index + (2 if merged_origin else 3)
+            for candidate, _position in cells[after_route:]:
+                compact = _compact_layout_value(candidate)
+                if compact in _PASSENGER_TRANSPORT_VALUES:
+                    candidates.add(compact)
+    return candidates.pop() if len(candidates) == 1 else None
+
+
 def extract_passenger_occurrence_date_from_layout(layout_text: str) -> date | None:
     return extract_passenger_fields_from_layout(layout_text)[0]
 

@@ -84,6 +84,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
   const pendingMutations = ref(0)
   const downloadingPreview = ref(false)
   const uploading = ref(false)
+  const processingFiles = ref(false)
   const uploadProgress = ref<number | null>(null)
   const listError = ref('')
   const loadError = ref('')
@@ -116,6 +117,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
     || loadingReimbursementOptions.value
     || loadingTravelApprovals.value
     || pendingMutations.value > 0
+    || processingFiles.value
     || downloadingPreview.value,
   )
   const currentRevision = computed(() => currentDraft.value?.revision ?? null)
@@ -804,6 +806,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
   async function uploadFile(
     file: File,
     role: ReimbursementDraftFileRole = 'EXPENSE_SOURCE',
+    attachmentKind: ReimbursementDraftFile['attachmentKind'] = 'other',
   ): Promise<ReimbursementDraftFileMutation> {
     if (uploading.value) throw new Error('已有文件正在上传，请稍后再试')
     const requestVersion = ++uploadRequestVersion
@@ -817,6 +820,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
           file,
           {
             role,
+            attachmentKind,
             signal,
             onProgress: (percent) => {
               if (
@@ -995,6 +999,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
     pendingMutations.value = 0
     downloadingPreview.value = false
     uploading.value = false
+    processingFiles.value = false
     uploadProgress.value = null
     listError.value = ''
     loadError.value = ''
@@ -1022,6 +1027,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
     pendingMutations,
     downloadingPreview,
     uploading,
+    processingFiles,
     uploadProgress,
     listError,
     loadError,

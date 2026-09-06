@@ -51,6 +51,12 @@ class ReimbursementDraftFileRole(StrEnum):
     ATTACHMENT_ONLY = "ATTACHMENT_ONLY"
 
 
+class ReimbursementAttachmentKind(StrEnum):
+    ITINERARY = "itinerary"
+    PAYMENT_PROOF = "payment_proof"
+    OTHER = "other"
+
+
 class ReimbursementDraftFileStatus(StrEnum):
     RESERVED = "RESERVED"
     WRITING = "WRITING"
@@ -274,6 +280,10 @@ class ReimbursementDraftFile(Base):
             name="ck_reimbursement_draft_files_processing_role",
         ),
         CheckConstraint(
+            f"attachment_kind IN ({_sql_values(ReimbursementAttachmentKind)})",
+            name="ck_reimbursement_draft_files_attachment_kind",
+        ),
+        CheckConstraint(
             f"file_status IN ({_sql_values(ReimbursementDraftFileStatus)})",
             name="ck_reimbursement_draft_files_status",
         ),
@@ -338,6 +348,9 @@ class ReimbursementDraftFile(Base):
     )
     sort_order: Mapped[int] = mapped_column(Integer)
     processing_role: Mapped[str] = mapped_column(String(32))
+    attachment_kind: Mapped[str] = mapped_column(
+        String(32), default="other", server_default="other"
+    )
     file_status: Mapped[str] = mapped_column(
         String(32),
         default=ReimbursementDraftFileStatus.RESERVED.value,

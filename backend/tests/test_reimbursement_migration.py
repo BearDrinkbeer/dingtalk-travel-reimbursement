@@ -584,7 +584,7 @@ def test_reimbursement_migration_upgrade_downgrade_and_reupgrade(
         command.upgrade(config, "head")
         with sqlite3.connect(database_path) as connection:
             assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
-                "20260906_0012",
+                "20260906_0013",
             )
             assert set(EXPECTED_COLUMNS).issubset(table_names(connection))
     finally:
@@ -688,7 +688,7 @@ def test_related_approval_catalog_migration_upgrade_downgrade_and_reupgrade(
         command.upgrade(config, "head")
         with sqlite3.connect(database_path) as connection:
             assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
-                "20260906_0012",
+                "20260906_0013",
             )
             assert "reimbursement_draft_related_approvals" in table_names(connection)
     finally:

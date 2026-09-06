@@ -127,6 +127,7 @@ const activeFile: ReimbursementDraftFile = {
   id: 'file-1',
   name: '打车发票.pdf',
   role: 'EXPENSE_SOURCE',
+  attachmentKind: 'other',
   sortOrder: 0,
   status: 'ACTIVE',
   mediaType: 'application/pdf',
@@ -724,6 +725,46 @@ describe('ReimburseView single-form OA flow', () => {
     await visibleButton(wrapper, '提交 OA').trigger('click')
     expect(confirm).not.toHaveBeenCalled()
     expect(submitOaReimbursement).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it.each([
+    { amount: '500.00', railType: 'unknown', kind: 'other', linked: false, blocked: false },
+    { amount: '500.01', railType: 'unknown', kind: 'other', linked: false, blocked: true },
+    { amount: '900.00', railType: 'high_speed', kind: 'other', linked: false, blocked: false },
+    { amount: '900.00', railType: 'emu', kind: 'other', linked: false, blocked: true },
+    { amount: '900.00', railType: 'regular', kind: 'itinerary', linked: true, blocked: true },
+    { amount: '900.00', railType: 'regular', kind: 'payment_proof', linked: true, blocked: false },
+  ] as const)('checks payment evidence before review, independent of receipt count: %j', async ({ amount, railType, kind, linked, blocked }) => {
+    const confirm = vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue(undefined as never)
+    const { wrapper, expense } = await mountView()
+    const drafts = useReimbursementDraftStore()
+    expense.categories.push({ id: 'rail_fare', name: '火车票', order: 2, manualSelectable: true })
+    Object.assign(expense.items[0]!, { category: 'rail_fare', amount, railType, receiptCount: 10, paymentProofFileIds: linked ? ['proof-1'] : [] })
+    drafts.files.push({ ...activeFile, id: 'proof-1', role: 'ATTACHMENT_ONLY', attachmentKind: kind, ocrResult: null })
+    wrapper.findComponent(TravelApprovalSelectorStub).vm.$emit('update:modelValue', [selection])
+    await nextTick()
+    await visibleButton(wrapper, '提交 OA').trigger('click')
+    await flushPromises()
+    expect(confirm).toHaveBeenCalledTimes(blocked ? 0 : 1)
+    expect(markReimbursementDraftReviewReady).toHaveBeenCalledTimes(blocked ? 0 : 1)
+    expect(submitOaReimbursement).toHaveBeenCalledTimes(blocked ? 0 : 1)
+    wrapper.unmount()
+  })
+
+  it('autosaves payment and itinerary associations through the existing save queue', async () => {
+    vi.useFakeTimers()
+    const { wrapper, expense } = await mountView()
+    expense.items[0]!.paymentProofFileIds = ['payment-1']
+    expense.items[0]!.itineraryFileIds = ['itinerary-1']
+    expense.items[0]!.railType = 'unknown'
+    await nextTick()
+    await vi.advanceTimersByTimeAsync(650)
+    await flushPromises()
+    expect(updateReimbursementDraft).toHaveBeenCalledOnce()
+    expect(vi.mocked(updateReimbursementDraft).mock.calls[0]?.[2].items[0]).toMatchObject({
+      paymentProofFileIds: ['payment-1'], itineraryFileIds: ['itinerary-1'], railType: 'unknown',
+    })
     wrapper.unmount()
   })
 

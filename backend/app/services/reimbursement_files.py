@@ -22,6 +22,7 @@ from app.core.errors import ApiError
 from app.domain.expenses import ExpenseTotals, calculate_expense_totals
 from app.domain.subsidy import SubsidyCalculation, calculate_subsidy
 from app.models.reimbursement import (
+    ReimbursementAttachmentKind,
     ReimbursementDraft,
     ReimbursementDraftFile,
     ReimbursementDraftFileRole,
@@ -42,6 +43,7 @@ from app.services.oa_template_profiles import require_submission_ready_catalog
 from app.services.ocr_service import (
     OcrService,
     failed_expense_payload,
+    failed_itinerary_payload,
     parsed_expense_payload,
 )
 from app.services.process_jobs import KillableProcessRunner
@@ -100,6 +102,7 @@ class DraftFileSnapshot:
     sha256: str
     ocr_status: str
     ocr_result_json: str | None
+    attachment_kind: str = "other"
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +154,7 @@ def serialize_draft_file(file: DraftFileSnapshot) -> dict[str, object]:
         "id": file.id,
         "name": file.original_name,
         "role": file.processing_role,
+        "attachmentKind": file.attachment_kind,
         "sortOrder": file.sort_order,
         "status": file.file_status,
         "mediaType": file.media_type,
@@ -220,7 +224,10 @@ async def persist_draft_upload(
     quota: ReimbursementQuotaCoordinator,
     staging: ReimbursementStaging,
     process_runner: KillableProcessRunner,
+    attachment_kind: ReimbursementAttachmentKind = ReimbursementAttachmentKind.OTHER,
 ) -> DraftFileMutationResult:
+    if processing_role is ReimbursementDraftFileRole.EXPENSE_SOURCE and attachment_kind != "other":
+        raise ApiError("VALIDATION_ERROR", "费用来源文件不能指定证明材料用途", 422)
     size_bytes, first_bytes, worker_path = _inspect_upload_spool(upload, settings=settings)
     upload_type = validate_upload_type(upload.filename, first_bytes)
     await validate_new_file(
@@ -285,6 +292,7 @@ async def persist_draft_upload(
             owner,
             sort_order=sort_order,
             processing_role=processing_role,
+            attachment_kind=attachment_kind.value,
             original_name=upload_type.original_name,
             extension=upload_type.extension,
             media_type=upload_type.media_type,
@@ -325,6 +333,7 @@ def update_draft_file(
     expected_revision: int,
     processing_role: ReimbursementDraftFileRole | None,
     original_name: str | None,
+    attachment_kind: ReimbursementAttachmentKind | None = None,
 ) -> DraftFileMutationResult:
     draft = require_owned_draft(
         database,
@@ -340,7 +349,7 @@ def update_draft_file(
             "票据正在识别，请稍后再修改",
             409,
         )
-    if processing_role is None and original_name is None:
+    if processing_role is None and original_name is None and attachment_kind is None:
         raise ApiError("VALIDATION_ERROR", "请指定要修改的文件信息", 422)
     if original_name is not None:
         file.original_name = validate_upload_name(
@@ -348,17 +357,20 @@ def update_draft_file(
             expected_extension=file.extension,
         )
     detached_input_json: str | None = None
-    if processing_role is not None:
-        if processing_role is ReimbursementDraftFileRole.ATTACHMENT_ONLY:
-            detached_input_json = detach_draft_file_from_input(
-                database,
-                draft=draft,
-                file_id=file.id,
-            ).canonical_json
-        file.processing_role = processing_role.value
-        if processing_role is ReimbursementDraftFileRole.ATTACHMENT_ONLY:
-            file.ocr_status = ReimbursementOcrStatus.NOT_REQUESTED.value
-            file.ocr_result_json = None
+    next_role = processing_role.value if processing_role is not None else file.processing_role
+    next_kind = attachment_kind.value if attachment_kind is not None else file.attachment_kind
+    if next_role == ReimbursementDraftFileRole.EXPENSE_SOURCE.value:
+        if attachment_kind is not None and attachment_kind != "other":
+            raise ApiError("VALIDATION_ERROR", "费用来源文件不能指定证明材料用途", 422)
+        next_kind = "other"
+    if next_role != file.processing_role or next_kind != file.attachment_kind:
+        detached_input_json = detach_draft_file_from_input(
+            database, draft=draft, file_id=file.id,
+        ).canonical_json
+        file.processing_role = next_role
+        file.attachment_kind = next_kind
+        file.ocr_status = ReimbursementOcrStatus.NOT_REQUESTED.value
+        file.ocr_result_json = None
 
     new_revision = bump_owned_draft_revision(
         database,
@@ -548,10 +560,17 @@ async def recognize_draft_file(
         )
         _require_revision(draft, expected_revision)
         file = _require_active_file(database, draft_id=draft.id, file_id=file_id)
-        if file.processing_role != ReimbursementDraftFileRole.EXPENSE_SOURCE.value:
+        is_itinerary = (
+            file.processing_role == ReimbursementDraftFileRole.ATTACHMENT_ONLY.value
+            and file.attachment_kind == ReimbursementAttachmentKind.ITINERARY.value
+        )
+        if (
+            file.processing_role != ReimbursementDraftFileRole.EXPENSE_SOURCE.value
+            and not is_itinerary
+        ):
             raise ApiError(
                 "REIMBURSEMENT_FILE_OCR_NOT_ALLOWED",
-                "仅费用来源文件可进行票据识别",
+                "仅票据来源或行程单材料可进行识别",
                 409,
             )
         running_cutoff = utc_now() - timedelta(
@@ -582,23 +601,25 @@ async def recognize_draft_file(
 
     worker_path: Path | None = None
     final_status = ReimbursementOcrStatus.COMPLETE
+    failure_payload = failed_itinerary_payload if is_itinerary else failed_expense_payload
     try:
         worker_path = await _materialize_cancellation_safe(source, settings, staging)
-        parsed = await ocr_service.recognize_file(
-            StoredFile(
-                temp_id=file_id,
-                path=worker_path,
-                extension=source.extension,
-                media_type=source.media_type,
-                size=source.size_bytes,
-                original_name=source.original_name,
-            ),
-            reference_year=reference_year,
-            keyword_rules=keyword_rules,
+        stored = StoredFile(
+            temp_id=file_id, path=worker_path, extension=source.extension,
+            media_type=source.media_type, size=source.size_bytes,
+            original_name=source.original_name,
         )
-        payload = parsed_expense_payload(file_id, parsed)
+        if is_itinerary:
+            payload = await ocr_service.recognize_itinerary_file(
+                stored, reference_year=reference_year,
+            )
+        else:
+            parsed = await ocr_service.recognize_file(
+                stored, reference_year=reference_year, keyword_rules=keyword_rules,
+            )
+            payload = parsed_expense_payload(file_id, parsed)
     except asyncio.CancelledError:
-        payload = failed_expense_payload(
+        payload = failure_payload(
             file_id,
             "OCR_CANCELLED",
             "票据识别已中断，请重试",
@@ -618,14 +639,14 @@ async def recognize_draft_file(
         raise
     except ApiError as exc:
         final_status = ReimbursementOcrStatus.FAILED
-        payload = failed_expense_payload(file_id, exc.code, exc.message)
+        payload = failure_payload(file_id, exc.code, exc.message)
     except Exception as exc:  # Defensive: never log OCR text or a staging path.
         logger.error(
             "Unexpected durable reimbursement OCR error",
             extra={"draft_file_id": file_id, "exception_type": type(exc).__name__},
         )
         final_status = ReimbursementOcrStatus.FAILED
-        payload = failed_expense_payload(
+        payload = failure_payload(
             file_id,
             "OCR_FAILED",
             "票据识别失败，请手工填写",
@@ -722,7 +743,9 @@ def _workbook_preview_snapshot(
             f"当前部署每张报销单最多处理 {settings.expense_max_items} 条费用明细",
             422,
         )
-    draft_input = apply_ocr_evidence(database, draft_id=draft.id, draft_input=draft_input)
+    # A locked historical draft keeps its original receipt counts and evidence.
+    if draft.locked_at is None:
+        draft_input = apply_ocr_evidence(database, draft_id=draft.id, draft_input=draft_input)
     require_complete_draft_input(draft_input)
     catalog = require_submission_ready_catalog(database)
     calculation = validate_and_calculate_input(
@@ -1099,6 +1122,7 @@ def _snapshot(file: ReimbursementDraftFile) -> DraftFileSnapshot:
         sha256=file.sha256,
         ocr_status=file.ocr_status,
         ocr_result_json=file.ocr_result_json,
+        attachment_kind=file.attachment_kind,
     )
 
 

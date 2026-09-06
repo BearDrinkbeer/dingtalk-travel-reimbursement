@@ -111,6 +111,9 @@ def _proof_setup(client_factory, monkeypatch):
         ocr_status="NOT_REQUESTED",
         record_disposition=False,
     )
+    with client.app.state.database_session_factory() as database:
+        database.get(ReimbursementDraftFile, support).attachment_kind = "itinerary"
+        database.commit()
     return client, headers, draft_id, source, support
 
 
@@ -154,7 +157,10 @@ def test_authoritative_ride_hailing_evidence_cannot_be_cleared_by_client(
 
 
 @pytest.mark.parametrize("bad_link", ["unknown", "invoice", "other_record", "deleted"])
-def test_proof_must_be_active_support_from_same_application(client_factory, monkeypatch, bad_link):
+@pytest.mark.parametrize("proof_field", ["itineraryFileIds", "paymentProofFileIds"])
+def test_proof_must_be_active_support_from_same_application(
+    client_factory, monkeypatch, bad_link, proof_field,
+):
     client, headers, draft_id, source, support = _proof_setup(client_factory, monkeypatch)
     link = support
     if bad_link == "unknown":
@@ -171,10 +177,15 @@ def test_proof_must_be_active_support_from_same_application(client_factory, monk
             record_disposition=False,
         )
     with client.app.state.database_session_factory() as database:
+        linked_file = database.get(ReimbursementDraftFile, link)
+        if linked_file is not None:
+            linked_file.attachment_kind = (
+                "payment_proof" if proof_field == "paymentProofFileIds" else "itinerary"
+            )
         if bad_link == "deleted":
             database.get(ReimbursementDraftFile, support).file_status = "PURGED"
             database.get(ReimbursementDraftFile, support).purged_at = utc_now()
-            database.commit()
+        database.commit()
         value = ReimbursementDraftInput.model_validate(
             {
                 **_input(),
@@ -182,7 +193,7 @@ def test_proof_must_be_active_support_from_same_application(client_factory, monk
                     {
                         **_input()["items"][0],
                         "sourceFileId": source,
-                        "itineraryFileIds": [link],
+                        proof_field: [link],
                         "transportType": "ride_hailing",
                     }
                 ],

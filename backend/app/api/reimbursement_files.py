@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import Settings
 from app.core.errors import ApiError
 from app.database.session import get_db
-from app.models.reimbursement import ReimbursementDraftFileRole
+from app.models.reimbursement import ReimbursementAttachmentKind, ReimbursementDraftFileRole
 from app.schemas.common import success
 from app.schemas.reimbursements import DraftRevisionRequest
 from app.services.excel_generator import XLSX_MEDIA_TYPE, content_disposition
@@ -65,11 +65,14 @@ class StrictRequest(BaseModel):
 class UpdateDraftFileRequest(StrictRequest):
     expected_revision: int = Field(alias="expectedRevision", ge=1, strict=True)
     role: ReimbursementDraftFileRole | None = None
+    attachment_kind: ReimbursementAttachmentKind | None = Field(
+        default=None, alias="attachmentKind"
+    )
     name: str | None = Field(default=None, min_length=1, max_length=255)
 
     @model_validator(mode="after")
     def require_change(self) -> UpdateDraftFileRequest:
-        if self.role is None and self.name is None:
+        if self.role is None and self.name is None and self.attachment_kind is None:
             raise ValueError("at least one file field must be supplied")
         return self
 
@@ -118,6 +121,9 @@ async def upload_file(
         ReimbursementDraftFileRole,
         Query(),
     ] = ReimbursementDraftFileRole.EXPENSE_SOURCE,
+    attachment_kind: Annotated[
+        ReimbursementAttachmentKind, Query(alias="attachmentKind")
+    ] = ReimbursementAttachmentKind.OTHER,
 ) -> dict[str, object]:
     _require_multipart(request)
     actor = draft_actor(current)
@@ -156,6 +162,7 @@ async def upload_file(
                 draft_id=draft_id,
                 expected_revision=expected_revision,
                 processing_role=role,
+                attachment_kind=attachment_kind,
                 settings=settings,
                 session_factory=session_factory,
                 quota=quota,
@@ -229,6 +236,7 @@ def patch_file(
         file_id=file_id,
         expected_revision=body.expected_revision,
         processing_role=body.role,
+        attachment_kind=body.attachment_kind,
         original_name=body.name,
     )
     return success(

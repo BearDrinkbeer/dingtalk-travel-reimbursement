@@ -26,6 +26,9 @@ import type {
   ReimbursementDraftExpenseItemInput,
   ReimbursementDraftFile,
 } from '@/types/reimbursements'
+import { receiptOcrResult } from '@/types/reimbursements'
+import { evidenceRailType, isActiveProof } from '@/utils/expenseProofs'
+import { matchItineraries } from '@/utils/itineraryMatching'
 import { centsToMoney, moneyToCents } from '@/utils/money'
 import { DEFAULT_RECEIPT_LIMITS, validateReceiptFiles } from '@/utils/receiptFiles'
 
@@ -267,9 +270,11 @@ export const useExpenseStore = defineStore('expense', () => {
     const source = existing?.source === 'ocr' ? 'ocr' : 'manual'
     const item: ExpenseItem = {
       ...input,
+      receiptCount: existing?.source === 'ocr' || existing?.sourceFileId ? 1 : input.receiptCount,
       id,
       source,
       sourceFileId: existing?.sourceFileId,
+      itineraryAutoMatchDisabled: input.itineraryAutoMatchDisabled ?? existing?.itineraryAutoMatchDisabled ?? false,
       amount: centsToMoney(amountCents),
       displayDate: input.displayDate.trim(),
       description: input.description.trim(),
@@ -361,7 +366,7 @@ export const useExpenseStore = defineStore('expense', () => {
   }
 
   function draftOcrExpenseItem(file: ReimbursementDraftFile): ExpenseItem | null {
-    const candidate = file.ocrResult
+    const candidate = receiptOcrResult(file)
     if (
       file.role !== 'EXPENSE_SOURCE'
       || file.status !== 'ACTIVE'
@@ -400,6 +405,9 @@ export const useExpenseStore = defineStore('expense', () => {
       transportType: candidate.transportType,
       requiresItinerary: candidate.requiresItinerary || candidate.transportType === 'ride_hailing',
       itineraryFileIds: [],
+      itineraryAutoMatchDisabled: false,
+      paymentProofFileIds: [],
+      railType: evidenceRailType(categoryId, undefined, candidate),
       originalCurrency: candidate.originalCurrency ?? undefined,
       originalAmount: candidate.originalAmount ?? undefined,
       cnyAmountConfirmed: false,
@@ -423,6 +431,9 @@ export const useExpenseStore = defineStore('expense', () => {
     if (index < 0 && items.value.length >= maxExpenseItems.value) return false
     if (index >= 0) {
       item.itineraryFileIds = items.value[index]?.itineraryFileIds ?? []
+      item.itineraryAutoMatchDisabled = items.value[index]?.itineraryAutoMatchDisabled ?? false
+      item.paymentProofFileIds = items.value[index]?.paymentProofFileIds ?? []
+      item.railType = evidenceRailType(item.category, items.value[index]?.railType, receiptOcrResult(file))
       items.value[index] = item
     }
     else items.value.push(item)
@@ -493,6 +504,11 @@ export const useExpenseStore = defineStore('expense', () => {
         ...(sourceFileId ? { sourceFileId } : {}),
         transportType: persisted.transportType ?? candidate?.transportType,
         itineraryFileIds: [...(persisted.itineraryFileIds ?? [])],
+        itineraryAutoMatchDisabled: persisted.itineraryAutoMatchDisabled ?? false,
+        paymentProofFileIds: [...(persisted.paymentProofFileIds ?? [])],
+        railType: evidenceRailType(persisted.category, persisted.railType, receiptOcrResult(
+          draftFiles.find((file) => file.id === sourceFileId),
+        )),
         requiresItinerary: persisted.requiresItinerary || candidate?.requiresItinerary || false,
         originalCurrency: persisted.originalCurrency ?? candidate?.originalCurrency,
         originalAmount: persisted.originalAmount ?? candidate?.originalAmount,
@@ -507,7 +523,8 @@ export const useExpenseStore = defineStore('expense', () => {
           ? persisted.description.trim()
           : '',
         amount: amountCents === null ? '' : centsToMoney(amountCents),
-        receiptCount: Number.isSafeInteger(persisted.receiptCount)
+        receiptCount: !(sourceFileId && ['DRAFT', 'REVIEW_READY'].includes(draft.status))
+          && Number.isSafeInteger(persisted.receiptCount)
           && persisted.receiptCount > 0
           ? persisted.receiptCount
           : 1,
@@ -602,6 +619,7 @@ export const useExpenseStore = defineStore('expense', () => {
     items.value = items.value.filter((item) => item.sourceFileId !== fileId)
     for (const item of items.value) {
       item.itineraryFileIds = item.itineraryFileIds?.filter((id) => id !== fileId)
+      item.paymentProofFileIds = item.paymentProofFileIds?.filter((id) => id !== fileId)
     }
     dismissedOcrFileIds.value = dismissedOcrFileIds.value.filter((id) => id !== fileId)
     if (items.value.length !== previousLength) {
@@ -617,6 +635,24 @@ export const useExpenseStore = defineStore('expense', () => {
       dismissedOcrFileIds.value = [...dismissedOcrFileIds.value, normalized]
     }
     return true
+  }
+
+  function reconcileDraftProofs(draftFiles: readonly ReimbursementDraftFile[]): void {
+    for (const item of items.value) {
+      const itineraryIds = (item.itineraryFileIds ?? []).filter((id) => draftFiles.some((file) => file.id === id && isActiveProof(file, 'itinerary')))
+      const paymentIds = (item.paymentProofFileIds ?? []).filter((id) => draftFiles.some((file) => file.id === id && isActiveProof(file, 'payment_proof')))
+      if (itineraryIds.length !== (item.itineraryFileIds?.length ?? 0)) item.itineraryFileIds = itineraryIds
+      if (paymentIds.length !== (item.paymentProofFileIds?.length ?? 0)) item.paymentProofFileIds = paymentIds
+    }
+  }
+
+  function matchDraftItineraries(draftFiles: readonly ReimbursementDraftFile[]): number {
+    const matches = matchItineraries(items.value, draftFiles)
+    for (const match of matches) {
+      const item = items.value.find((item) => item.sourceFileId === match.sourceFileId)
+      if (item && !item.itineraryFileIds?.length) item.itineraryFileIds = [match.itineraryFileId]
+    }
+    return matches.length
   }
 
   function excelExpenseItems(): ExcelExpenseItemInput[] {
@@ -712,6 +748,9 @@ export const useExpenseStore = defineStore('expense', () => {
       ...(item.sourceFileId ? { sourceFileId: item.sourceFileId } : {}),
       transportType: item.transportType,
       itineraryFileIds: [...(item.itineraryFileIds ?? [])],
+      itineraryAutoMatchDisabled: item.itineraryAutoMatchDisabled ?? false,
+      paymentProofFileIds: [...(item.paymentProofFileIds ?? [])],
+      railType: item.railType ?? 'unknown',
       requiresItinerary: item.requiresItinerary ?? false,
       originalCurrency: item.originalCurrency,
       originalAmount: item.originalAmount,
@@ -1052,6 +1091,8 @@ export const useExpenseStore = defineStore('expense', () => {
     removeItem,
     removeDraftFileAssociation,
     dismissDraftOcrFile,
+    reconcileDraftProofs,
+    matchDraftItineraries,
     removeExpenseItem,
     refreshCalculations,
     projectPayload,
