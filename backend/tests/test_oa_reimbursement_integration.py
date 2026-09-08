@@ -4,8 +4,9 @@ import asyncio
 import hashlib
 import io
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
+from types import SimpleNamespace
 
 import pytest
 from conftest import mock_login
@@ -63,6 +64,11 @@ from app.services.oa_reimbursement import (
     LinkedLocalFileMaintenance,
     OAReimbursementProcessor,
     SnapshotSubmissionMaterializer,
+)
+from app.services.oa_reimbursement_payload import (
+    parse_snapshot,
+    serialize_snapshot,
+    snapshot_sha256,
 )
 from app.services.oa_template_profiles import (
     TravelProfileConfirmation,
@@ -186,6 +192,8 @@ def _schemas() -> tuple[FormSchema, FormSchema, FormOption]:
         (
             _component("travel-start-id", "DDDateField", "开始日期"),
             _component("travel-end-id", "DDDateField", "结束日期"),
+            _component("travel-company-id", "TextField", "所属公司"),
+            _component("travel-budget-id", "TextField", "预算代码"),
         ),
     )
     return reimbursement, travel, travel_type
@@ -194,7 +202,11 @@ def _schemas() -> tuple[FormSchema, FormSchema, FormOption]:
 def _itinerary_schema() -> FormSchema:
     return _schema(
         TRAVEL_PROCESS_CODE,
-        (_component("travel-itinerary-id", "TableField", "行程"),),
+        (
+            _component("travel-itinerary-id", "TableField", "行程"),
+            _component("travel-company-id", "TextField", "所属公司"),
+            _component("travel-budget-id", "TextField", "预算代码"),
+        ),
     )
 
 
@@ -321,7 +333,15 @@ class LocalWorkflowBoundary:
                 result="agree",
                 created_at="2026-08-20T01:02:03Z",
                 finished_at="2026-08-20T02:02:03Z",
-                form_values=form_values,
+                form_values=(
+                    *form_values,
+                    WorkflowFormValue(
+                        "travel-company-id", "所属公司", "TextField", "北京", None, None
+                    ),
+                    WorkflowFormValue(
+                        "travel-budget-id", "预算代码", "TextField", "26007 项目", None, None
+                    ),
+                ),
             )
         assert instance_id == OA_INSTANCE_ID
         assert self.created_command is not None
@@ -539,7 +559,7 @@ def _persist_ready_draft(
         calculation = validate_and_calculate_input(
             database,
             catalog=catalog,
-            draft_input=_draft_input(),
+            draft_input=_draft_input().model_copy(update={"accounting_source_verified": True}),
             max_items=settings.expense_max_items,
             validate_project=True,
         )
@@ -621,9 +641,7 @@ def _persist_ready_draft(
                         else ReimbursementOcrStatus.NOT_REQUESTED.value
                     ),
                     ocr_result_json=(
-                        "{}"
-                        if role == ReimbursementDraftFileRole.EXPENSE_SOURCE.value
-                        else None
+                        "{}" if role == ReimbursementDraftFileRole.EXPENSE_SOURCE.value else None
                     ),
                 )
             )
@@ -632,7 +650,9 @@ def _persist_ready_draft(
         linked_calculation = validate_and_calculate_input(
             database,
             catalog=catalog,
-            draft_input=_draft_input(source_file_id=files[0].id),
+            draft_input=_draft_input(source_file_id=files[0].id).model_copy(
+                update={"accounting_source_verified": True}
+            ),
             max_items=settings.expense_max_items,
             validate_project=True,
         )
@@ -747,6 +767,145 @@ def enabled_manual_worker_client(client_factory, monkeypatch):
 
     monkeypatch.setattr(DurableOAReimbursementWorker, "run", wait_for_manual_worker)
     return client_factory(auth_mock_enabled=True, dingtalk_oa_worker_enabled=True)
+
+
+@pytest.mark.parametrize("changed_field", ["travel-company-id", "travel-budget-id"])
+def test_worker_rechecks_source_accounting_before_any_upload(
+    enabled_manual_worker_client,
+    changed_field,
+) -> None:
+    reimbursement_schema, travel_schema, travel_type = _schemas()
+
+    class ChangedAccountingWorkflow(LocalWorkflowBoundary):
+        async def get_process_instance(self, instance_id):
+            instance = await super().get_process_instance(instance_id)
+            return replace(
+                instance,
+                form_values=tuple(
+                    replace(value, value="不再可用")
+                    if value.component_id == changed_field
+                    else value
+                    for value in instance.form_values
+                ),
+            )
+
+    workflow = ChangedAccountingWorkflow(reimbursement_schema, travel_schema)
+    client = enabled_manual_worker_client
+    csrf = str(mock_login(client)["csrfToken"])
+    draft_id, _ = _persist_ready_draft(client, workflow, travel_type)
+    response = client.post(
+        f"/api/oa/reimbursements/{draft_id}/submit",
+        json={"expectedRevision": 4},
+        headers={"X-CSRF-Token": csrf, "Idempotency-Key": "77777777-7777-4777-8777-777777777777"},
+    )
+    assert response.status_code == 202, response.text
+    storage = LocalStorageBoundary()
+    assert asyncio.run(_worker(client, workflow, storage).run_once()) is True
+    result = client.get(
+        f"/api/oa/reimbursements/submissions/{response.json()['data']['submissionId']}"
+    )
+    assert result.json()["data"]["error"]["code"] == "TRAVEL_APPROVAL_ACCOUNTING_CHANGED"
+    assert storage.put_files == []
+    assert workflow.create_calls == 0
+
+
+@pytest.mark.parametrize("status", ["DRAFT", "REVIEW_READY"])
+def test_old_mutable_accounting_requires_reconfirmation_before_lock(
+    enabled_manual_worker_client,
+    status,
+) -> None:
+    reimbursement_schema, travel_schema, travel_type = _schemas()
+    workflow = LocalWorkflowBoundary(reimbursement_schema, travel_schema)
+    client = enabled_manual_worker_client
+    csrf = str(mock_login(client)["csrfToken"])
+    draft_id, _ = _persist_ready_draft(client, workflow, travel_type)
+    with client.app.state.database_session_factory() as database:
+        draft = database.get(ReimbursementDraft, draft_id)
+        value = json.loads(draft.input_json)
+        value.pop("accountingSourceVerified")
+        value["companyValue"] = "旧手填公司"
+        draft.input_json = json.dumps(value)
+        draft.status = status
+        database.commit()
+    path = (
+        f"/api/reimbursements/drafts/{draft_id}/review"
+        if status == "DRAFT"
+        else f"/api/oa/reimbursements/{draft_id}/submit"
+    )
+    response = client.post(
+        path,
+        json={"expectedRevision": 4},
+        headers={"X-CSRF-Token": csrf, "Idempotency-Key": "77777777-7777-4777-8777-777777777779"},
+    )
+    assert response.status_code == 409, response.text
+    assert "重新确认关联出差审批" in response.json()["error"]["message"]
+    with client.app.state.database_session_factory() as database:
+        assert database.get(ReimbursementDraft, draft_id).locked_at is None
+        assert database.scalar(select(ReimbursementSubmission)) is None
+
+
+def test_legacy_v3_materializer_validates_without_new_source_mapping_requirements(
+    enabled_manual_worker_client,
+    monkeypatch,
+) -> None:
+    reimbursement_schema, travel_schema, travel_type = _schemas()
+    workflow = LocalWorkflowBoundary(reimbursement_schema, travel_schema)
+    client = enabled_manual_worker_client
+    csrf = str(mock_login(client)["csrfToken"])
+    draft_id, _ = _persist_ready_draft(client, workflow, travel_type)
+    response = client.post(
+        f"/api/oa/reimbursements/{draft_id}/submit",
+        json={"expectedRevision": 4},
+        headers={"X-CSRF-Token": csrf, "Idempotency-Key": "77777777-7777-4777-8777-777777777778"},
+    )
+    assert response.status_code == 202, response.text
+    with client.app.state.database_session_factory() as database:
+        row = database.get(ReimbursementSubmission, response.json()["data"]["submissionId"])
+        snapshot = parse_snapshot(row.form_snapshot_json)
+    snapshot = snapshot.model_copy(
+        update={
+            "snapshot_version": 3,
+            "template": snapshot.template.model_copy(
+                update={
+                    "travel_profiles": tuple(
+                        profile.model_copy(
+                            update={"company_component_id": None, "budget_code_component_id": None}
+                        )
+                        for profile in snapshot.template.travel_profiles
+                    ),
+                }
+            ),
+        }
+    )
+    raw = serialize_snapshot(snapshot)
+    job = SimpleNamespace(
+        draft_id=snapshot.draft_id,
+        process_code=snapshot.template.process_code,
+        originator_user_id=snapshot.identity.user_id,
+        originator_union_id=snapshot.identity.union_id,
+        department_id=int(snapshot.identity.department_id),
+        snapshot_json=raw,
+        snapshot_sha256=snapshot_sha256(snapshot),
+        uploads=(),
+    )
+    materializer = SnapshotSubmissionMaterializer(
+        workflow=workflow,
+        staging=client.app.state.reimbursement_staging,
+        excel_template_path=client.app.state.settings.excel_template_path,
+    )
+
+    def new_accounting_must_not_run(*args, **kwargs):
+        raise AssertionError("Legacy snapshots must retain their original validation contract")
+
+    monkeypatch.setattr(
+        "app.services.oa_reimbursement.travel_accounting_options", new_accounting_must_not_run
+    )
+
+    async def heartbeat():
+        return None
+
+    asyncio.run(materializer.validate(job, heartbeat=heartbeat))
+    assert workflow.travel_detail_calls > 0
 
 
 def test_validation_shares_membership_pages_across_related_approvals(
@@ -894,15 +1053,12 @@ def test_submit_worker_readback_and_cleanup_are_one_durable_local_flow(
         assert [item.sort_order for item in uploads] == [0, 1]
         assert uploads[0].file_name == "票据汇总(1).pdf"
         assert all(item.source_draft_file_id is None for item in uploads)
-        assert {item.upload_status for item in uploads} == {
-            ReimbursementUploadStatus.LINKED.value
-        }
+        assert {item.upload_status for item in uploads} == {ReimbursementUploadStatus.LINKED.value}
         assert {item.local_status for item in uploads} == {
             ReimbursementUploadLocalStatus.READY.value
         }
         local_paths = tuple(
-            client.app.state.reimbursement_staging.root / item.local_storage_key
-            for item in uploads
+            client.app.state.reimbursement_staging.root / item.local_storage_key for item in uploads
         )
         assert all(path.is_file() for path in local_paths)
 
@@ -915,9 +1071,7 @@ def test_submit_worker_readback_and_cleanup_are_one_durable_local_flow(
             .order_by(ReimbursementUpload.sort_order)
         ).all()
         sources = tuple(database.get(ReimbursementDraftFile, item) for item in source_file_ids)
-        assert {item.upload_status for item in uploads} == {
-            ReimbursementUploadStatus.LINKED.value
-        }
+        assert {item.upload_status for item in uploads} == {ReimbursementUploadStatus.LINKED.value}
         assert {item.local_status for item in uploads} == {
             ReimbursementUploadLocalStatus.DELETED.value
         }
@@ -1027,9 +1181,9 @@ def test_resume_generation_keeps_existing_pdf_without_duplicate_generation(
     worker = _worker(client, workflow, storage, clock=lambda: now[0])
     assert asyncio.run(worker.run_once())
     with client.app.state.database_session_factory() as database:
-        upload = database.scalar(select(ReimbursementUpload).where(
-            ReimbursementUpload.submission_id == submission_id
-        ))
+        upload = database.scalar(
+            select(ReimbursementUpload).where(ReimbursementUpload.submission_id == submission_id)
+        )
         assert upload is not None and upload.role == "GENERATED_PDF"
         pdf_id = upload.id
         assert {database.get(ReimbursementDraftFile, source).file_status for source in sources} == {
@@ -1088,10 +1242,7 @@ def test_damaged_locked_source_stops_before_any_remote_upload(
                 expected_sha256=damaged.sha256,
             )
         else:
-            damaged_path = (
-                client.app.state.reimbursement_staging.root
-                / damaged.storage_key
-            )
+            damaged_path = client.app.state.reimbursement_staging.root / damaged.storage_key
             damaged_path.write_bytes(b"corrupted locked attachment")
 
     worker = _worker(client, workflow, storage)

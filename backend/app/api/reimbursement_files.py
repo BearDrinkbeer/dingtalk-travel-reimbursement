@@ -29,7 +29,9 @@ from app.services.reimbursement_drafts import (
 )
 from app.services.reimbursement_files import (
     begin_draft_file_delete,
+    begin_draft_files_clear,
     complete_draft_file_delete,
+    complete_draft_files_clear,
     generate_draft_excel_preview,
     list_draft_files,
     map_reimbursement_storage_error,
@@ -38,6 +40,7 @@ from app.services.reimbursement_files import (
     recognize_draft_file,
     serialize_draft_file,
     update_draft_file,
+    validate_expense_source_conversion,
 )
 from app.services.reimbursement_quota import (
     ReimbursementQuotaCoordinator,
@@ -79,6 +82,7 @@ class UpdateDraftFileRequest(StrictRequest):
 
 class DraftFileOcrRequest(DraftRevisionRequest):
     trip_year: int | None = Field(default=None, alias="tripYear", ge=2000, le=2100)
+    allow_upload_overlap: bool = Field(default=False, alias="allowUploadOverlap", strict=True)
 
 
 def _require_multipart(request: Request) -> None:
@@ -124,6 +128,7 @@ async def upload_file(
     attachment_kind: Annotated[
         ReimbursementAttachmentKind, Query(alias="attachmentKind")
     ] = ReimbursementAttachmentKind.OTHER,
+    auto_classify: Annotated[bool, Query(alias="autoClassify")] = False,
 ) -> dict[str, object]:
     _require_multipart(request)
     actor = draft_actor(current)
@@ -143,7 +148,7 @@ async def upload_file(
     session_factory: sessionmaker[Session] = request.app.state.database_session_factory
     quota: ReimbursementQuotaCoordinator = request.app.state.reimbursement_quota
     staging: ReimbursementStaging = request.app.state.reimbursement_staging
-    process_runner: KillableProcessRunner = request.app.state.process_runner
+    process_runner: KillableProcessRunner = request.app.state.file_validation_runner
     coordinator: SessionFileCoordinator = request.app.state.file_coordinator
     uploads = []
     try:
@@ -163,6 +168,7 @@ async def upload_file(
                 expected_revision=expected_revision,
                 processing_role=role,
                 attachment_kind=attachment_kind,
+                auto_classify=auto_classify,
                 settings=settings,
                 session_factory=session_factory,
                 quota=quota,
@@ -222,13 +228,25 @@ def preview_file(
 
 
 @router.patch("/reimbursements/drafts/{draft_id}/files/{file_id}")
-def patch_file(
+async def patch_file(
     draft_id: str,
     file_id: str,
     body: UpdateDraftFileRequest,
+    request: Request,
     database: Annotated[Session, Depends(get_db)],
     current: Annotated[CurrentSession, Depends(require_csrf)],
 ) -> dict[str, object]:
+    if body.role is ReimbursementDraftFileRole.EXPENSE_SOURCE:
+        await validate_expense_source_conversion(
+            database=database,
+            actor=draft_actor(current),
+            draft_id=draft_id,
+            file_id=file_id,
+            expected_revision=body.expected_revision,
+            settings=request.app.state.settings,
+            staging=request.app.state.reimbursement_staging,
+            process_runner=request.app.state.process_runner,
+        )
     result = update_draft_file(
         database,
         actor=draft_actor(current),
@@ -283,6 +301,39 @@ async def delete_file(
     )
 
 
+@router.post("/reimbursements/drafts/{draft_id}/files/clear")
+async def clear_files(
+    draft_id: str,
+    body: DraftRevisionRequest,
+    request: Request,
+    database: Annotated[Session, Depends(get_db)],
+    current: Annotated[CurrentSession, Depends(require_csrf)],
+) -> dict[str, object]:
+    actor = draft_actor(current)
+    revision, deletions = begin_draft_files_clear(
+        database,
+        actor=actor,
+        draft_id=draft_id,
+        expected_revision=body.expected_revision,
+    )
+    try:
+        await complete_draft_files_clear(
+            deletions=deletions,
+            actor=actor,
+            session_factory=request.app.state.database_session_factory,
+            staging=request.app.state.reimbursement_staging,
+        )
+    except ReimbursementStagingError as exc:
+        raise map_reimbursement_storage_error(exc) from exc
+    return success(
+        {
+            "draftId": draft_id,
+            "revision": revision,
+            "deletedFileIds": [item.file_id for item in deletions],
+        }
+    )
+
+
 @router.post("/reimbursements/drafts/{draft_id}/files/{file_id}/ocr")
 async def recognize_file(
     draft_id: str,
@@ -307,6 +358,8 @@ async def recognize_file(
         session_factory=request.app.state.database_session_factory,
         staging=request.app.state.reimbursement_staging,
         ocr_service=ocr_service,
+        allow_upload_overlap=body.allow_upload_overlap,
+        session_id_hash=current.record.session_id_hash if body.allow_upload_overlap else None,
     )
     return success(
         {

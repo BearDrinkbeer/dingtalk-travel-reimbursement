@@ -52,6 +52,7 @@ from app.services.reimbursement_quota import ReimbursementQuotaCoordinator
 from app.services.reimbursement_staging import ReimbursementStaging
 from app.services.sessions import SessionCleanupGate, purge_expired_sessions
 from app.services.temp_files import cleanup_expired_temp_files
+from app.services.warm_ocr_process import WarmOcrProcess
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,14 @@ def create_app(
     )
     if runtime_settings.ocr_fake_enabled:
         ocr_engine = ocr_engine or FakeOcrEngine()
+    warm_ocr_process = WarmOcrProcess()
     process_runner = KillableProcessRunner(
+        warm_ocr_process,
+        admission_timeout_seconds=runtime_settings.process_job_admission_wait_seconds,
+    )
+    # One bounded image/PDF validation process may overlap the single OCR
+    # process. Validation retains its 512 MiB profile and never loads models.
+    file_validation_runner = KillableProcessRunner(
         admission_timeout_seconds=runtime_settings.process_job_admission_wait_seconds
     )
     ocr_service = OcrService(runtime_settings, ocr_engine, process_runner)
@@ -202,7 +210,9 @@ def create_app(
             resources.callback(database_engine.dispose)
             resources.push_async_callback(dingtalk_client.close)
             resources.push_async_callback(dingtalk_storage.close)
+            resources.push_async_callback(warm_ocr_process.close)
             resources.push_async_callback(process_runner.close)
+            resources.push_async_callback(file_validation_runner.close)
             resources.push_async_callback(ocr_service.close)
 
             Path(runtime_settings.temp_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -250,6 +260,7 @@ def create_app(
     application.state.session_cleanup_gate = session_cleanup_gate
     application.state.ocr_service = ocr_service
     application.state.process_runner = process_runner
+    application.state.file_validation_runner = file_validation_runner
     application.state.file_coordinator = file_coordinator
     application.state.oa_reimbursement_materializer = oa_materializer
     application.state.oa_reimbursement_state = oa_submission_state

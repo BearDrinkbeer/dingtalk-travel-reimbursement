@@ -9,8 +9,9 @@ from app.domain.categories import CATEGORY_BY_ID, ExpenseCategory
 from app.domain.money import money_string
 from app.ocr.extractors import normalized_lines
 from app.ocr.itinerary_worker import recognize_itinerary_worker
-from app.ocr.parsers import ReceiptParserRegistry, is_passenger_transport_text
+from app.ocr.parsers import ReceiptParserRegistry
 from app.ocr.qr import invoice_qr_from_payload
+from app.ocr.receipt_evidence import merge_pdf_ocr_lines, needs_pdf_ocr_fallback
 from app.ocr.types import (
     InvoiceQrEvidence,
     LocalOcrEngine,
@@ -179,6 +180,65 @@ class OcrService:
     async def close(self) -> None:
         return None
 
+    async def recognize_material_file(
+        self,
+        stored: StoredFile,
+        *,
+        reference_year: int | None,
+        keyword_rules: tuple[ReceiptKeywordRule, ...] | None = None,
+    ) -> dict[str, object]:
+        """Classify and parse from the same bounded extraction, never from a filename."""
+        if not self._settings.ocr_enabled:
+            raise ApiError("OCR_DISABLED", "本地 OCR 尚未配置，请确认材料用途", 503)
+        detection = self._settings.ocr_detection_model_dir
+        recognition = self._settings.ocr_recognition_model_dir
+        try:
+            result = await self._process_runner.run(
+                recognize_itinerary_worker,
+                str(stored.path),
+                stored.extension,
+                {
+                    "ocr_detection_model_dir": str(detection) if detection else None,
+                    "ocr_recognition_model_dir": str(recognition) if recognition else None,
+                    "ocr_engine": self._settings.ocr_engine,
+                    "ocr_cpu_threads": self._settings.ocr_cpu_threads,
+                },
+                self._settings.pdf_limits,
+                self._settings.ocr_worker_limits,
+                reference_year,
+                self._engine if self._engine is not None and self._engine.is_fake else None,
+                True,
+                keyword_rules,
+                timeout_seconds=self._settings.ocr_timeout_seconds,
+            )
+        except ProcessJobBusy as exc:
+            raise ApiError("OCR_BUSY", "本地识别繁忙，请稍后重试", 429) from exc
+        except ProcessJobTimeout as exc:
+            raise ApiError("OCR_TIMEOUT", "材料识别超时，请重试或确认用途", 504) from exc
+        except ProcessJobResourceLimit as exc:
+            raise ApiError("OCR_FAILED", "材料识别超过处理限制，请确认用途", 422) from exc
+        if not isinstance(result, dict) or not result.get("ok"):
+            raise ApiError("OCR_FAILED", "材料识别失败，请重试或确认用途", 422)
+        kind = result.get("materialKind", "unknown")
+        payload: dict[str, object] = {}
+        if kind == "expense" and isinstance(result.get("expense"), ParsedExpense):
+            payload = parsed_expense_payload(stored.temp_id, result["expense"])
+        elif kind == "itinerary" and isinstance(result.get("parsed"), ParsedItinerary):
+            payload = parsed_itinerary_payload(stored.temp_id, result["parsed"])
+        elif kind == "payment_proof" and isinstance(result.get("paymentDetails"), dict):
+            payload["paymentDetails"] = result["paymentDetails"]
+        elif kind == "hotel_bill" and isinstance(result.get("hotelBillDetails"), dict):
+            payload["hotelBillDetails"] = result["hotelBillDetails"]
+        elif kind != "payment_proof":
+            kind = "unknown"
+        payload["_materialClassification"] = {
+            "status": "needs_confirmation" if kind == "unknown" else "classified",
+            "kind": kind,
+            "reason": result.get("reason"),
+            "pageCount": result.get("pageCount"),
+        }
+        return payload
+
     async def recognize_itinerary_file(
         self,
         stored: StoredFile,
@@ -319,49 +379,18 @@ class OcrService:
             raise ApiError("OCR_FAILED", "票据识别失败，请手工填写", 422) from exc
 
     @staticmethod
-    def _has_required_fields(parsed: ParsedExpense) -> bool:
-        if parsed.amount is None or parsed.date is None:
-            return False
-        return parsed.receipt_type != "train" or bool(parsed.description)
-
-    @classmethod
     def _needs_pdf_ocr_fallback(
-        cls,
         parsed: ParsedExpense,
         lines: list[OcrLine],
     ) -> bool:
-        if parsed.receipt_type == "foreign_receipt":
-            # Foreign values deliberately leave CNY amount empty. Date/currency
-            # ambiguity requires confirmation, not another expensive OCR pass.
-            return parsed.original_amount is None
-        if not cls._has_required_fields(parsed):
-            return True
-        if parsed.receipt_type != "invoice":
-            return False
-        text = " ".join(line.text for line in lines)
-        if not is_passenger_transport_text(text):
-            return False
-        return (
-            parsed.category is ExpenseCategory.OTHER
-            or parsed.description is None
-            or "INVOICE_DATE_USED_AS_OCCURRENCE" in parsed.warnings
-        )
+        return needs_pdf_ocr_fallback(parsed, lines)
 
     @staticmethod
     def _merge_pdf_ocr_lines(
         pdf_text_lines: list[OcrLine],
         image_ocr_lines: list[OcrLine],
     ) -> list[OcrLine]:
-        """Combine complementary evidence while keeping image row order for route parsing."""
-
-        merged: list[OcrLine] = []
-        seen: set[str] = set()
-        for line in (*image_ocr_lines, *pdf_text_lines):
-            if line.text in seen:
-                continue
-            seen.add(line.text)
-            merged.append(line)
-        return merged
+        return merge_pdf_ocr_lines(pdf_text_lines, image_ocr_lines)
 
     async def recognize_file(
         self,

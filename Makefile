@@ -69,6 +69,16 @@ dev-dingtalk-frontend:
 dev-dingtalk:
 	$(MAKE) -j2 dev-dingtalk-backend dev-dingtalk-frontend
 
+.PHONY: dev-dingtalk-prod dev-dingtalk-prod-backend dev-dingtalk-prod-frontend
+dev-dingtalk-prod:
+	$(MAKE) -j2 dev-dingtalk-prod-backend dev-dingtalk-prod-frontend
+
+dev-dingtalk-prod-backend:
+	sh scripts/dev-dingtalk-backend.sh prod
+
+dev-dingtalk-prod-frontend:
+	sh scripts/dev-dingtalk-frontend.sh prod
+
 up:
 	docker compose up --build
 

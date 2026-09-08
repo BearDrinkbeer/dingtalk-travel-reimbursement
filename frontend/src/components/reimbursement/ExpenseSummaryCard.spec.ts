@@ -52,6 +52,21 @@ describe('ExpenseSummaryCard', () => {
     setActivePinia(createPinia())
   })
 
+  it.each([false, true])('omits uppercase amount before and after calculation (calculated: %s)', (calculated) => {
+    const expense = useExpenseStore()
+    expense.totals = calculated ? draft().totals : null
+    const wrapper = mount(ExpenseSummaryCard, {
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.text()).not.toContain('人民币大写')
+    expect(wrapper.text()).not.toContain('待服务端计算')
+    expect(wrapper.text()).not.toContain('零元整')
+    expect(wrapper.findAll('.totals-grid > div')).toHaveLength(4)
+    expect(wrapper.text()).toContain('预览 Excel')
+    wrapper.unmount()
+  })
+
   it('downloads only the persisted draft preview and explains final server generation', async () => {
     const drafts = useReimbursementDraftStore()
     drafts.currentDraft = draft()

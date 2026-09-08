@@ -108,6 +108,47 @@ vi.mock('@/api/expenses', () => ({
 }))
 
 describe('expense store', () => {
+  it('uses server-calculated overseas subsidy from the configured daily rate', () => {
+    setActivePinia(createPinia())
+    const store = useExpenseStore()
+    store.setSubsidyIncluded(true)
+    store.setTripType('overseas')
+    store.trip.startDate = '2026-09-01'
+    store.trip.endDate = '2026-09-03'
+    expect(store.tripPayload()).toEqual({
+      tripType: 'overseas', startDate: '2026-09-01', startTime: '09:00',
+      endDate: '2026-09-03', endTime: '18:00',
+    })
+    expect(store.policyInputError).toBe('')
+    store.totals = {
+      expenseTotal: '0.00', subsidyTotal: '360.00', totalAmount: '360.00',
+      receiptCount: 0, uppercaseAmount: '叁佰陆拾元整',
+      subsidy: { tripType: 'overseas', calendarDays: 3, effectiveDays: '3.0', dailyRate: '120.00', total: '360.00' },
+    }
+    expect(store.displaySubsidyTotal).toBe('360.00')
+    expect(store.displayTotal).toBe('360.00')
+    store.setSubsidyIncluded(false)
+    expect(store.tripPayload()).toBeNull()
+    expect(store.displaySubsidyTotal).toBe('0.00')
+  })
+
+  it('hydrates and resets an overseas trip without a manual total', () => {
+    setActivePinia(createPinia())
+    const store = useExpenseStore()
+    const draft = durableDraft([])
+    const trip = { ...draft.input.trip!, tripType: 'overseas' as const }
+    draft.input.trip = trip
+    store.hydrateFromDraft(draft, [])
+    expect(store.trip.tripType).toBe('overseas')
+    expect(store.tripPayload()).not.toHaveProperty('manualSubsidyAmount')
+    draft.input.trip = null
+    draft.input.editingState = { includeSubsidy: false, trip }
+    store.hydrateFromDraft(draft, [])
+    expect(store.includeSubsidy).toBe(false)
+    expect(store.displaySubsidyTotal).toBe('0.00')
+    store.reset()
+    expect(store.trip.tripType).toBe('business')
+  })
   beforeEach(() => {
     setActivePinia(createPinia())
     vi.mocked(calculateTotals).mockReset()
@@ -663,6 +704,22 @@ describe('expense store', () => {
       confirmedEffectiveDays: '1.5',
       noSubsidyException: true,
     })
+  })
+
+  it.each([
+    ['11:59', '09:00', '09:00', '09:00'],
+    ['18:00', '12:00', '18:00', '18:00'],
+    ['11:59', '12:00', '09:00', '18:00'],
+    ['12:00', '11:59', '18:00', '09:00'],
+  ])('normalizes legacy %s–%s to half-day times without changing saved editing values', (start, end, expectedStart, expectedEnd) => {
+    const store = useExpenseStore()
+    store.setSubsidyIncluded(true)
+    Object.assign(store.trip, {
+      startDate: '2026-06-30', endDate: '2026-06-30', startTime: start, endTime: end,
+    })
+    expect(store.tripPayload()).toMatchObject({ startTime: expectedStart, endTime: expectedEnd })
+    expect(store.trip.startTime).toBe(start)
+    expect(store.trip.endTime).toBe(end)
   })
 
   it('does not build a payload from non-exact time strings', () => {

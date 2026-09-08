@@ -3,6 +3,8 @@ from __future__ import annotations
 from conftest import mock_login
 
 from app.models.setting import Setting
+from app.services.dingtalk import DepartmentIdentity, DingTalkIdentity
+from app.services.sessions import create_session
 
 
 def test_business_apis_require_auth_and_admin_guard(client_factory) -> None:
@@ -96,12 +98,14 @@ def test_settings_defaults_and_admin_update_use_decimal_string(client_factory) -
     user = client_factory(auth_mock_enabled=True)
     mock_login(user)
     assert user.get("/api/settings").json()["data"] == {
+        "appTitle": "智能差旅费报销申请",
         "subsidyRates": {
             "business": "100.00",
             "short_term_project": "100.00",
             "long_term_project": "150.00",
             "same_city_project": "50.00",
             "internal": "100.00",
+            "overseas": "0.00",
         },
         "calculationMode": "half_day_12",
     }
@@ -111,11 +115,17 @@ def test_settings_defaults_and_admin_update_use_decimal_string(client_factory) -
         "long_term_project": "150.00",
         "same_city_project": "50.00",
         "internal": "100.00",
+        "overseas": "0.00",
     }
     assert (
         user.put(
             "/api/admin/settings",
-            json={"subsidyRates": default_rates, "calculationMode": "half_day_12"},
+            json={
+                "appTitle": "智能差旅费报销申请",
+                "adminUserIds": [],
+                "subsidyRates": default_rates,
+                "calculationMode": "half_day_12",
+            },
             headers={"X-CSRF-Token": user.get("/api/me").json()["data"]["csrfToken"]},
         ).status_code
         == 403
@@ -127,18 +137,33 @@ def test_settings_defaults_and_admin_update_use_decimal_string(client_factory) -
         admin_user_ids="admin-1",
     )
     csrf = mock_login(admin)["csrfToken"]
-    updated_rates = default_rates | {"business": "88.50", "long_term_project": "160.00"}
+    updated_rates = default_rates | {
+        "business": "88.50",
+        "long_term_project": "160.00",
+        "overseas": "120.00",
+    }
     updated = admin.put(
         "/api/admin/settings",
-        json={"subsidyRates": updated_rates, "calculationMode": "half_day_12"},
+        json={
+            "appTitle": "企业差旅费报销",
+            "adminUserIds": ["admin-2"],
+            "subsidyRates": updated_rates,
+            "calculationMode": "half_day_12",
+        },
         headers={"X-CSRF-Token": csrf},
     )
     assert updated.status_code == 200
     assert updated.json()["data"]["subsidyRates"] == updated_rates
+    assert updated.json()["data"]["appTitle"] == "企业差旅费报销"
+    assert updated.json()["data"]["adminUserIds"] == ["admin-2"]
+    assert updated.json()["data"]["environmentAdminUserIds"] == ["admin-1"]
+    assert admin.get("/api/config/public").json()["data"]["appTitle"] == "企业差旅费报销"
     assert (
         admin.put(
             "/api/admin/settings",
             json={
+                "appTitle": "企业差旅费报销",
+                "adminUserIds": ["admin-2"],
                 "subsidyRates": default_rates | {"business": "88.501"},
                 "calculationMode": "half_day_12",
             },
@@ -149,7 +174,12 @@ def test_settings_defaults_and_admin_update_use_decimal_string(client_factory) -
     assert (
         admin.put(
             "/api/admin/settings",
-            json={"subsidyRates": default_rates, "calculationMode": "policy_engine"},
+            json={
+                "appTitle": "企业差旅费报销",
+                "adminUserIds": ["admin-2"],
+                "subsidyRates": default_rates,
+                "calculationMode": "policy_engine",
+            },
             headers={"X-CSRF-Token": csrf},
         ).status_code
         == 422
@@ -160,6 +190,8 @@ def test_settings_defaults_and_admin_update_use_decimal_string(client_factory) -
             "/api/admin/settings",
             json={
                 "subsidyRates": default_rates | {"business": invalid_rate},
+                "appTitle": "企业差旅费报销",
+                "adminUserIds": ["admin-2"],
                 "calculationMode": "half_day_12",
             },
             headers={"X-CSRF-Token": csrf},
@@ -170,6 +202,8 @@ def test_settings_defaults_and_admin_update_use_decimal_string(client_factory) -
     maximum = admin.put(
         "/api/admin/settings",
         json={
+            "appTitle": "企业差旅费报销",
+            "adminUserIds": ["admin-2"],
             "subsidyRates": default_rates | {"business": "10000.00"},
             "calculationMode": "half_day_12",
         },
@@ -177,6 +211,64 @@ def test_settings_defaults_and_admin_update_use_decimal_string(client_factory) -
     )
     assert maximum.status_code == 200
     assert maximum.json()["data"]["subsidyRates"]["business"] == "10000.00"
+
+    zero_overseas = admin.put(
+        "/api/admin/settings",
+        json={
+            "appTitle": "企业差旅费报销",
+            "adminUserIds": ["admin-2"],
+            "subsidyRates": default_rates | {"overseas": "0.00"},
+            "calculationMode": "half_day_12",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert zero_overseas.status_code == 200
+
+
+def test_environment_admin_can_add_and_remove_runtime_administrators(client_factory) -> None:
+    client = client_factory(
+        auth_mock_enabled=True,
+        auth_mock_user_id="admin-1",
+        admin_user_ids="admin-1",
+    )
+    environment_admin = mock_login(client)
+    current = client.get("/api/admin/settings").json()["data"]
+    writable = {
+        "appTitle": current["appTitle"],
+        "subsidyRates": current["subsidyRates"],
+        "calculationMode": current["calculationMode"],
+    }
+    added = client.put(
+        "/api/admin/settings",
+        json=writable | {"adminUserIds": ["admin-2"]},
+        headers={"X-CSRF-Token": environment_admin["csrfToken"]},
+    )
+    assert added.status_code == 200
+
+    identity = DingTalkIdentity(
+        user_id="admin-2",
+        union_id="union-admin-2",
+        name="新增管理员",
+        departments=(DepartmentIdentity(id="100", name="测试部门"),),
+    )
+    with client.app.state.database_session_factory() as database:
+        _, session_token, csrf_token = create_session(
+            database,
+            client.app.state.settings,
+            identity,
+            None,
+        )
+    client.cookies.set(client.app.state.settings.session_cookie_name, session_token)
+
+    assert client.get("/api/admin/settings").status_code == 200
+    removed = client.put(
+        "/api/admin/settings",
+        json=writable | {"adminUserIds": []},
+        headers={"X-CSRF-Token": csrf_token},
+    )
+    assert removed.status_code == 200
+    assert removed.json()["data"]["environmentAdminUserIds"] == ["admin-1"]
+    assert client.get("/api/admin/settings").status_code == 403
 
 
 def test_corrupt_subsidy_setting_fails_closed_without_logging_value(client_factory, capsys) -> None:
@@ -232,4 +324,5 @@ def test_legacy_single_rate_is_safely_migrated_to_old_automatic_types(client_fac
         "long_term_project": "150.00",
         "same_city_project": "50.00",
         "internal": "100.00",
+        "overseas": "0.00",
     }

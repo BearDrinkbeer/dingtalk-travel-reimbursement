@@ -154,6 +154,8 @@ function toggle(row: ApprovalRow, checked: boolean): void {
     )
     return
   }
+  const reason = unavailableReason(row)
+  if (reason) { localError.value = reason; return }
   const selection = selectionForRow(row)
   if (!selection) {
     localError.value = '该审批的查询凭据已失效，请重新加载后再选择'
@@ -161,27 +163,61 @@ function toggle(row: ApprovalRow, checked: boolean): void {
   }
   emit('update:modelValue', [...props.modelValue, selection])
 }
+
+function unavailableReason(row: ApprovalRow): string {
+  // A selected row must always be removable, including a stale restored row.
+  if (selectedIds.value.has(row.processInstanceId)) return ''
+  const candidate = candidateCache.get(row.processInstanceId)
+  if (candidate?.unavailableReason) return candidate.unavailableReason
+  if (!candidate?.companyOption || !candidate.budgetCodeOption) return '所属公司或预算代码不可用，请联系管理员'
+  const first = props.modelValue[0]
+  if (!first) return ''
+  const baseline = candidateCache.get(first.processInstanceId)
+  const company = baseline?.companyOption?.value ?? drafts.currentDraft?.input.companyValue
+  const budget = baseline?.budgetCodeOption?.value ?? drafts.currentDraft?.input.budgetCodeValue
+  const profile = drafts.reimbursementOptions?.travelProfiles
+    .find((item) => item.profileKey === first.profileKey)
+  const restoredSource = props.linkedApprovals?.find(
+    (item) => item.processInstanceId === first.processInstanceId,
+  )?.sourceTravelTypeValue
+  const restoredType = profile?.travelTypeMappings
+    ? (restoredSource ? profile.travelTypeMappings[restoredSource]?.value : undefined)
+    : profile?.travelTypeOption.value
+  const travelType = baseline?.travelTypeOption.value ?? restoredType
+  if (!baseline && profile?.travelTypeMappings && !restoredType) return '已选审批的出差类别来源失效，请重新选择'
+  if (!company || !budget || !travelType) return '请等待已选审批核验完成，或重新查询该审批'
+  if (candidate.companyOption.value !== company) return '所属公司与已选审批不同'
+  if (candidate.budgetCodeOption.value !== budget) return '预算代码与已选审批不同'
+  if (candidate.travelTypeOption.value !== travelType) return '出差类别与已选审批不同'
+  return ''
+}
+
+function accountingLabel(row: ApprovalRow): string {
+  const approval = candidateCache.get(row.processInstanceId)
+  return [approval?.companyOption?.label, approval?.budgetCodeOption?.label].filter(Boolean).join(' · ')
+}
 </script>
 
 <template>
-  <el-card
-    shadow="never"
-    class="content-card reimbursement-card travel-approval-card"
+  <section
+    class="travel-approval-section"
+    data-testid="travel-approval-section"
+    aria-labelledby="travel-approval-heading"
   >
-    <template #header>
-      <div class="card-header">
-        <div>
-          <strong>关联已通过的出差审批</strong>
-          <span class="section-note">可关联多张；系统只显示当前员工发起且已通过的审批</span>
-        </div>
-        <el-tag
-          :type="modelValue.length ? 'success' : 'warning'"
-          effect="light"
-        >
-          已选 {{ modelValue.length }} 张
-        </el-tag>
+    <div class="card-header travel-approval-heading">
+      <div>
+        <h2 id="travel-approval-heading">
+          关联已通过的出差审批
+        </h2>
+        <p>先选本人已通过的审批；可继续关联相同公司、预算和出差类别的多张审批。</p>
       </div>
-    </template>
+      <el-tag
+        :type="modelValue.length ? 'success' : 'warning'"
+        effect="light"
+      >
+        已选 {{ modelValue.length }} 张
+      </el-tag>
+    </div>
 
     <fieldset
       class="plain-fieldset"
@@ -281,7 +317,7 @@ function toggle(row: ApprovalRow, checked: boolean): void {
       >
         <el-checkbox
           :model-value="selectedIds.has(row.processInstanceId)"
-          :disabled="readonly"
+          :disabled="readonly || Boolean(unavailableReason(row))"
           :aria-label="`选择出差审批 ${row.title}`"
           @change="(checked: boolean) => toggle(row, checked)"
         />
@@ -298,6 +334,11 @@ function toggle(row: ApprovalRow, checked: boolean): void {
           </span>
           <span>{{ row.startDate }} 至 {{ row.endDate }} · {{ row.profileDisplayName }}</span>
           <small>审批编号：{{ row.businessId }}</small>
+          <small v-if="accountingLabel(row)">{{ accountingLabel(row) }}</small>
+          <small
+            v-if="unavailableReason(row)"
+            role="status"
+          >不可选择：{{ unavailableReason(row) }}</small>
         </span>
       </article>
     </div>
@@ -305,7 +346,7 @@ function toggle(row: ApprovalRow, checked: boolean): void {
     <p class="field-help">
       默认查询近期审批；需要更早记录时设置日期范围。选中的审批会自动保存并由服务器重新核验。
     </p>
-  </el-card>
+  </section>
 </template>
 
 <style scoped>
@@ -314,6 +355,30 @@ function toggle(row: ApprovalRow, checked: boolean): void {
   margin: 0;
   padding: 0;
   border: 0;
+}
+
+.travel-approval-section {
+  margin-top: 22px;
+  padding-top: 22px;
+  border-top: 1px solid var(--el-border-color-lighter);
+}
+
+.travel-approval-heading {
+  align-items: flex-start;
+  margin-bottom: 16px;
+}
+
+.travel-approval-heading h2 {
+  margin: 0;
+  color: var(--el-text-color-primary);
+  font-size: 16px;
+}
+
+.travel-approval-heading p {
+  margin: 6px 0 0;
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
+  line-height: 1.55;
 }
 
 .travel-query-grid {

@@ -31,6 +31,8 @@ interface EditableTravelProfile {
   logicalFields: OaLogicalField[]
   mappings: OaFieldMappings
   travelTypeOptionIdentity: string
+  dynamicTravelType: boolean
+  travelTypeMappings: Record<string, string>
   confirmedSchemaFingerprint: string | null
 }
 
@@ -139,14 +141,15 @@ const saveDisabledReason = computed(() => {
   )) return '请完成报销模板的全部字段映射'
   if (relatedApprovalPolicyError.value) return relatedApprovalPolicyError.value
   for (const profile of travelProfiles.value) {
-    if (!mappingComplete(profile.schema, profile.logicalFields, profile.mappings)) {
+    if (!mappingComplete(profile.schema, profile.logicalFields, profile.mappings, true)) {
       return `请完成“${profile.displayName || profile.profileKey || '出差模板'}”的日期字段映射`
     }
-    if (resolveTravelTypeOption(profile.travelTypeOptionIdentity) === null) {
+    if (profile.dynamicTravelType ? !sourceTravelOptions(profile).length
+      || sourceTravelOptions(profile).some((option) => !resolveTravelTypeOption(profile.travelTypeMappings[option.value] ?? ''))
+      : resolveTravelTypeOption(profile.travelTypeOptionIdentity) === null) {
       return `请选择“${profile.displayName || profile.profileKey || '出差模板'}”对应的出差类别`
     }
   }
-  if (!relatedApprovalSmokeTestConfirmed.value) return '请确认已完成关联审批测试'
   return ''
 })
 
@@ -162,6 +165,8 @@ function blankTravelProfile(): EditableTravelProfile {
     logicalFields: [],
     mappings: {},
     travelTypeOptionIdentity: '',
+    dynamicTravelType: false,
+    travelTypeMappings: {},
     confirmedSchemaFingerprint: null,
   }
 }
@@ -237,7 +242,9 @@ function profileFromCatalog(profile: OaTravelTemplateCatalog): EditableTravelPro
     schema: profile.schema,
     logicalFields: profile.logicalFields,
     mappings: { ...profile.mappings },
-    travelTypeOptionIdentity: optionIdentity(profile.travelTypeOption),
+    travelTypeOptionIdentity: profile.travelTypeOption ? optionIdentity(profile.travelTypeOption) : '',
+    dynamicTravelType: Boolean(Object.keys(profile.travelTypeMappings ?? {}).length),
+    travelTypeMappings: Object.fromEntries(Object.entries(profile.travelTypeMappings ?? {}).map(([key, option]) => [key, optionIdentity(option)])),
     confirmedSchemaFingerprint: profile.confirmedSchemaFingerprint,
   }
 }
@@ -433,6 +440,8 @@ function profileFromInspection(
       item.mappings,
     ),
     travelTypeOptionIdentity: selectedOption,
+    dynamicTravelType: existing.dynamicTravelType || Boolean(Object.keys(item.travelTypeMappings ?? {}).length),
+    travelTypeMappings: Object.fromEntries(Object.entries(item.travelTypeMappings ?? {}).map(([key, option]) => [key, optionIdentity(option)]).concat(Object.entries(existing.travelTypeMappings))),
     confirmedSchemaFingerprint: item.confirmedSchemaFingerprint,
   }
 }
@@ -459,7 +468,9 @@ function usableMappings(
       .find((componentId) => components.some(
         (component) => component.componentId === componentId,
       ))
-    return [field.key, candidate ?? (components.length === 1 ? components[0]!.componentId : '')]
+    const exactLabels = components.filter((component) => component.label === field.label)
+    return [field.key, candidate ?? (exactLabels.length === 1 ? exactLabels[0]!.componentId
+      : components.length === 1 && !['company', 'budgetCode'].includes(field.key) ? components[0]!.componentId : '')]
   }))
 }
 
@@ -467,16 +478,21 @@ function mappingComplete(
   schema: OaFormSchema | null,
   logicalFields: OaLogicalField[],
   mappings: OaFieldMappings,
+  optionalTravelType = false,
 ): boolean {
   return schema !== null
     && logicalFields.length > 0
-    && logicalFields.every((field) => compatibleComponents(schema, field.key).some(
+    && logicalFields.every((field) => optionalTravelType && field.key === 'travelType' && !mappings[field.key] || compatibleComponents(schema, field.key).some(
       (component) => component.componentId === mappings[field.key],
     ))
 }
 
 function componentDisplay(component: OaFormComponent): string {
   return `${component.label}（${component.componentType} · ${component.componentId}）`
+}
+
+function sourceTravelOptions(profile: EditableTravelProfile): OaFormOption[] {
+  return profile.schema?.components.find((component) => component.componentId === profile.mappings.travelType)?.options ?? []
 }
 
 function optionIdentity(option: OaFormOption): string {
@@ -527,14 +543,15 @@ async function saveCatalog(): Promise<void> {
   if (reimbursementSchema === null) return
   const profiles = travelProfiles.value.map((profile) => {
     const option = resolveTravelTypeOption(profile.travelTypeOptionIdentity)
-    if (profile.schema === null || option === null) return null
+    if (profile.schema === null || !profile.dynamicTravelType && option === null) return null
     return {
       profileKey: profile.profileKey,
       displayName: profile.displayName,
       processCode: profile.processCode,
       schemaFingerprint: profile.schema.schemaFingerprint,
-      mappings: { ...profile.mappings },
-      travelTypeOption: option,
+      mappings: Object.fromEntries(Object.entries(profile.mappings).filter(([key, value]) => value && (key !== 'travelType' || profile.dynamicTravelType))),
+      travelTypeOption: profile.dynamicTravelType ? travelTypeOptions.value[0]! : option!,
+      ...(profile.dynamicTravelType ? { travelTypeMappings: Object.fromEntries(sourceTravelOptions(profile).map((source) => [source.value, resolveTravelTypeOption(profile.travelTypeMappings[source.value] ?? '')!])) } : {}),
     }
   })
   if (profiles.some((profile) => profile === null)) return
@@ -546,7 +563,7 @@ async function saveCatalog(): Promise<void> {
       mappings: { ...reimbursement.mappings },
     },
     travelProfiles: profiles as ConfirmOaTemplateCatalogInput['travelProfiles'],
-    relatedApprovalSmokeTestConfirmed: true,
+    relatedApprovalSmokeTestConfirmed: relatedApprovalSmokeTestConfirmed.value,
   }
 
   try {
@@ -769,7 +786,7 @@ function inspectionFromCatalog(catalog: OaTemplateCatalog): OaTemplateCatalogIns
               <h3 id="travel-template-heading">
                 可关联的出差审批模板
               </h3>
-              <p>每个模板对应报销表单“出差类别”中的一个精确选项。</p>
+              <p>可为整个模板设置固定类别，也可按出差申请中的类别逐项对应。</p>
             </div>
             <el-button
               plain
@@ -840,7 +857,7 @@ function inspectionFromCatalog(catalog: OaTemplateCatalog): OaTemplateCatalogIns
               class="oa-template-header-grid"
             >
               <el-form-item
-                v-for="field in profile.logicalFields"
+                v-for="field in profile.logicalFields.filter((item) => item.key !== 'travelType' || profile.dynamicTravelType)"
                 :key="field.key"
                 :label="field.label"
               >
@@ -849,7 +866,7 @@ function inspectionFromCatalog(catalog: OaTemplateCatalog): OaTemplateCatalogIns
                   filterable
                   class="full-width"
                   :aria-label="`${profile.displayName} ${field.label}字段映射`"
-                  placeholder="选择 OA 日期控件"
+                  placeholder="选择 OA 控件"
                   @change="travelContractChanged"
                 >
                   <el-option
@@ -860,7 +877,18 @@ function inspectionFromCatalog(catalog: OaTemplateCatalog): OaTemplateCatalogIns
                   />
                 </el-select>
               </el-form-item>
-              <el-form-item label="对应的报销出差类别">
+              <el-form-item label="出差类别对应方式">
+                <el-switch
+                  v-model="profile.dynamicTravelType"
+                  active-text="按申请类别对应"
+                  inactive-text="固定类别"
+                  @change="travelContractChanged"
+                />
+              </el-form-item>
+              <el-form-item
+                v-if="!profile.dynamicTravelType"
+                label="对应的报销出差类别"
+              >
                 <el-select
                   v-model="profile.travelTypeOptionIdentity"
                   class="full-width"
@@ -879,6 +907,28 @@ function inspectionFromCatalog(catalog: OaTemplateCatalog): OaTemplateCatalogIns
                   </el-option>
                 </el-select>
               </el-form-item>
+              <template v-else>
+                <el-form-item
+                  v-for="source in sourceTravelOptions(profile)"
+                  :key="source.value"
+                  :label="`${source.label} → 报销类别`"
+                >
+                  <el-select
+                    v-model="profile.travelTypeMappings[source.value]"
+                    class="full-width"
+                    :aria-label="`${profile.displayName} ${source.label}对应的报销类别`"
+                    placeholder="请选择对应类别"
+                    @change="travelContractChanged"
+                  >
+                    <el-option
+                      v-for="option in travelTypeOptions"
+                      :key="optionIdentity(option)"
+                      :label="option.label"
+                      :value="optionIdentity(option)"
+                    />
+                  </el-select>
+                </el-form-item>
+              </template>
             </div>
             <p
               v-else
@@ -897,7 +947,7 @@ function inspectionFromCatalog(catalog: OaTemplateCatalog): OaTemplateCatalogIns
           >
             已在当前企业完成“出差审批关联到报销审批”的实际测试
           </el-checkbox>
-          <p>该确认只记录模板关联能力；不会执行付款或财务审核。</p>
+          <p>选填，仅记录是否实际测试过；未测试也可保存配置并手动提交验证。保存不会创建审批。</p>
         </section>
 
         <div class="oa-template-actions">

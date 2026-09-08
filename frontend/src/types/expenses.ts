@@ -14,6 +14,7 @@ export type TripType =
   | 'project'
   | 'same_city_project'
   | 'internal'
+  | 'overseas'
 
 export type SubsidyRateType =
   | 'business'
@@ -21,6 +22,7 @@ export type SubsidyRateType =
   | 'long_term_project'
   | 'same_city_project'
   | 'internal'
+  | 'overseas'
 
 export interface TripInput {
   tripType: TripType
@@ -42,6 +44,7 @@ export interface ExpenseItem {
   itineraryFileIds?: string[]
   itineraryAutoMatchDisabled?: boolean
   paymentProofFileIds?: string[]
+  hotelBillFileIds?: string[]
   railType?: RailType
   requiresItinerary?: boolean
   transportType?: 'ride_hailing' | 'taxi' | 'rail' | 'hotel' | 'other'
@@ -71,7 +74,7 @@ export function isForeignExpense(item: Pick<ExpenseItem, 'originalCurrency' | 'w
 }
 
 export interface SubsidyResult {
-  tripType: SubsidyRateType
+  tripType: SubsidyRateType | 'overseas'
   calendarDays: number
   effectiveDays: string
   dailyRate: string

@@ -584,7 +584,7 @@ def test_reimbursement_migration_upgrade_downgrade_and_reupgrade(
         command.upgrade(config, "head")
         with sqlite3.connect(database_path) as connection:
             assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
-                "20260906_0013",
+                "20260907_0016",
             )
             assert set(EXPECTED_COLUMNS).issubset(table_names(connection))
     finally:
@@ -688,7 +688,7 @@ def test_related_approval_catalog_migration_upgrade_downgrade_and_reupgrade(
         command.upgrade(config, "head")
         with sqlite3.connect(database_path) as connection:
             assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
-                "20260906_0013",
+                "20260907_0016",
             )
             assert "reimbursement_draft_related_approvals" in table_names(connection)
     finally:
@@ -860,6 +860,7 @@ def test_migrated_schema_preserves_irreversible_remote_history(
     engine = create_database_engine(database_url)
     try:
         now = utc_now()
+        now_sql = now.isoformat(sep=" ")
         with Session(engine) as database:
             draft = ReimbursementDraft(
                 corp_id="corp-test",
@@ -1132,7 +1133,7 @@ def test_migrated_schema_preserves_irreversible_remote_history(
             with engine.begin() as connection:
                 connection.exec_driver_sql(
                     submit_result_sql,
-                    (now, result_submission_id),
+                    (now_sql, result_submission_id),
                 )
 
         with Session(engine) as database:
@@ -1165,7 +1166,7 @@ def test_migrated_schema_preserves_irreversible_remote_history(
             with engine.begin() as connection:
                 connection.exec_driver_sql(
                     submit_result_sql,
-                    (now, result_submission_id),
+                    (now_sql, result_submission_id),
                 )
 
         with engine.begin() as connection:
@@ -1181,19 +1182,19 @@ def test_migrated_schema_preserves_irreversible_remote_history(
             with engine.begin() as connection:
                 connection.exec_driver_sql(
                     submit_result_sql,
-                    (now, result_submission_id),
+                    (now_sql, result_submission_id),
                 )
 
         with engine.begin() as connection:
             connection.exec_driver_sql(
                 "UPDATE reimbursement_uploads SET upload_status = 'LINKED', linked_at = ? "
                 "WHERE id = ?",
-                (now, pending_excel_id),
+                (now_sql, pending_excel_id),
             )
         with engine.begin() as connection:
             connection.exec_driver_sql(
                 submit_result_sql,
-                (now, result_submission_id),
+                (now_sql, result_submission_id),
             )
         with pytest.raises(IntegrityError):
             with engine.begin() as connection:
@@ -1215,7 +1216,7 @@ def test_migrated_schema_preserves_irreversible_remote_history(
             connection.exec_driver_sql(
                 "UPDATE reimbursement_uploads SET local_status = 'DELETED', "
                 "local_deleted_at = ?, status_version = status_version + 1 WHERE id = ?",
-                (now, pending_excel_id),
+                (now_sql, pending_excel_id),
             )
         with pytest.raises(
             IntegrityError,
@@ -1267,7 +1268,7 @@ def test_migrated_schema_preserves_irreversible_remote_history(
                     "UPDATE reimbursement_submissions SET status = 'ORPHAN_CLEANUP', "
                     "process_instance_id = NULL, orphan_confirmed_at = ?, "
                     "orphan_confirmation_code = 'UNSAFE_CLEAR' WHERE id = ?",
-                    (now, linked_submission_id),
+                    (now_sql, linked_submission_id),
                 )
 
         with Session(engine) as database:
@@ -1346,7 +1347,7 @@ def test_migrated_schema_preserves_irreversible_remote_history(
                 connection.exec_driver_sql(
                     "UPDATE reimbursement_uploads SET upload_status = 'CLEANUP_PENDING', "
                     "cleanup_started_at = ? WHERE id = ?",
-                    (now, committed_id),
+                    (now_sql, committed_id),
                 )
         with pytest.raises(
             IntegrityError,
@@ -1355,7 +1356,7 @@ def test_migrated_schema_preserves_irreversible_remote_history(
             with engine.begin() as connection:
                 connection.exec_driver_sql(
                     "UPDATE reimbursement_submissions SET updated_at = ? WHERE id = ?",
-                    (now, cleanup_submission_id),
+                    (now_sql, cleanup_submission_id),
                 )
         with engine.begin() as connection:
             connection.exec_driver_sql(
@@ -1395,7 +1396,7 @@ def test_migrated_schema_preserves_irreversible_remote_history(
                     "UPDATE reimbursement_uploads SET upload_status = 'LINKED', "
                     "space_id = 'unsafe-linked-space', file_id = 'unsafe-linked-file', "
                     "linked_at = ? WHERE id = ?",
-                    (now, link_candidate_id),
+                    (now_sql, link_candidate_id),
                 )
         with pytest.raises(IntegrityError):
             with engine.begin() as connection:
@@ -1476,7 +1477,7 @@ def test_migrated_schema_preserves_irreversible_remote_history(
                     "UPDATE reimbursement_submissions SET status = 'VERIFYING', "
                     "oa_create_started_at = ?, oa_request_hash = ?, "
                     "process_instance_id = 'process-unsafe' WHERE id = ?",
-                    (now, "5" * 64, cleanup_submission_id),
+                    (now_sql, "5" * 64, cleanup_submission_id),
                 )
 
         with pytest.raises(

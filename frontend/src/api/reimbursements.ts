@@ -37,6 +37,7 @@ export interface ListReimbursementDraftsOptions extends ReimbursementRequestOpti
 export interface UploadReimbursementDraftFileOptions extends ReimbursementRequestOptions {
   role?: ReimbursementDraftFileRole
   attachmentKind?: ReimbursementDraftFile['attachmentKind']
+  autoClassify?: boolean
   onProgress?: (percent: number) => void
 }
 
@@ -224,6 +225,7 @@ export async function uploadReimbursementDraftFile(
         expectedRevision,
         role: options.role ?? 'EXPENSE_SOURCE',
         attachmentKind: options.attachmentKind ?? 'other',
+        ...(options.autoClassify ? { autoClassify: true } : {}),
       },
       signal: options.signal,
       timeout: 120_000,
@@ -242,6 +244,19 @@ export async function updateReimbursementDraftFile(
   const response = await http.patch<ApiEnvelope<ReimbursementDraftFileMutation>>(
     fileUrl(draftId, fileId),
     input,
+    { signal: options.signal },
+  )
+  return response.data.data
+}
+
+export async function clearReimbursementDraftFiles(
+  draftId: string,
+  expectedRevision: number,
+  options: ReimbursementRequestOptions = {},
+): Promise<{ draftId: string; revision: number; deletedFileIds: string[] }> {
+  const response = await http.post<ApiEnvelope<{ draftId: string; revision: number; deletedFileIds: string[] }>>(
+    `/reimbursements/drafts/${encodeURIComponent(draftId)}/files/clear`,
+    { expectedRevision },
     { signal: options.signal },
   )
   return response.data.data
@@ -351,6 +366,17 @@ export async function getOaReimbursementSubmission(
   const response = await http.get<ApiEnvelope<ReimbursementSubmission>>(
     `/oa/reimbursements/submissions/${encodeURIComponent(submissionId)}`,
     { signal: options.signal },
+  )
+  return response.data.data
+}
+
+export async function recheckOaReimbursementSubmission(
+  submissionId: string,
+  options: ReimbursementRequestOptions = {},
+): Promise<ReimbursementSubmission> {
+  const response = await http.post<ApiEnvelope<ReimbursementSubmission>>(
+    `/oa/reimbursements/submissions/${encodeURIComponent(submissionId)}/recheck`,
+    {}, { signal: options.signal },
   )
   return response.data.data
 }

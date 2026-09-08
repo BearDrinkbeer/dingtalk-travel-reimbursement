@@ -8,8 +8,14 @@ export const MAX_DAILY_SUBSIDY_CENTS = 1_000_000
 export type SubsidyRates = Record<SubsidyRateType, string>
 
 export interface ExpenseSettings {
+  appTitle: string
   subsidyRates: SubsidyRates
   calculationMode: 'half_day_12'
+}
+
+export interface AdminExpenseSettings extends ExpenseSettings {
+  adminUserIds: string[]
+  environmentAdminUserIds: string[]
 }
 
 export async function getExpenseSettings(): Promise<ExpenseSettings> {
@@ -17,27 +23,39 @@ export async function getExpenseSettings(): Promise<ExpenseSettings> {
   return response.data.data
 }
 
-export function normalizeSubsidyRate(value: string): string | null {
+export async function getAdminExpenseSettings(): Promise<AdminExpenseSettings> {
+  const response = await http.get<ApiEnvelope<AdminExpenseSettings>>('/admin/settings')
+  return response.data.data
+}
+
+export function normalizeSubsidyRate(value: string, allowZero = false): string | null {
   const cents = moneyToCents(value)
-  if (cents === null || cents <= 0 || cents > MAX_DAILY_SUBSIDY_CENTS) return null
+  if (
+    cents === null
+    || cents < 0
+    || (!allowZero && cents === 0)
+    || cents > MAX_DAILY_SUBSIDY_CENTS
+  ) return null
   return centsToMoney(cents)
 }
 
 export async function updateExpenseSettings(
-  input: ExpenseSettings,
-): Promise<ExpenseSettings> {
+  input: AdminExpenseSettings,
+): Promise<AdminExpenseSettings> {
   const normalizedRates = Object.fromEntries(
     Object.entries(input.subsidyRates).map(([tripType, value]) => {
-      const normalized = normalizeSubsidyRate(value)
+      const normalized = normalizeSubsidyRate(value, tripType === 'overseas')
       if (normalized === null) {
-        throw new Error('各出差类型的每日补助标准必须大于 0 且不超过 10000 元，最多两位小数')
+        throw new Error('境外出差的每日补助可以为 0，其他类型必须大于 0；均不能超过 10000 元')
       }
       return [tripType, normalized]
     }),
   ) as SubsidyRates
-  const response = await http.put<ApiEnvelope<ExpenseSettings>>('/admin/settings', {
-    ...input,
+  const response = await http.put<ApiEnvelope<AdminExpenseSettings>>('/admin/settings', {
+    appTitle: input.appTitle,
+    adminUserIds: input.adminUserIds,
     subsidyRates: normalizedRates,
+    calculationMode: input.calculationMode,
   })
   return response.data.data
 }

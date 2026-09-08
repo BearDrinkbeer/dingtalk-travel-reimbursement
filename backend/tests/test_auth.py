@@ -29,6 +29,7 @@ def test_public_config_exposes_authoritative_upload_limits(
     response = client.get("/api/config/public")
 
     assert response.status_code == 200
+    assert response.json()["data"]["appTitle"] == "智能差旅费报销申请"
     assert response.json()["data"]["oaSubmissionEnabled"] is worker_enabled
     assert response.json()["data"]["uploadLimits"] == {
         "maxFiles": 7,

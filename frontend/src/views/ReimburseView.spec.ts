@@ -13,6 +13,7 @@ import {
   createReimbursementDraft,
   deleteReimbursementDraft,
   deleteReimbursementDraftFile,
+  clearReimbursementDraftFiles,
   getOaReimbursementOptions,
   getOaReimbursementSubmission,
   getOaReimbursementSubmissionForDraft,
@@ -53,6 +54,7 @@ vi.mock('@/api/reimbursements', () => ({
   createReimbursementDraft: vi.fn(),
   deleteReimbursementDraft: vi.fn(),
   deleteReimbursementDraftFile: vi.fn(),
+  clearReimbursementDraftFiles: vi.fn(),
   getOaReimbursementOptions: vi.fn(),
   getOaReimbursementSubmission: vi.fn(),
   getOaReimbursementSubmissionForDraft: vi.fn(),
@@ -88,7 +90,7 @@ const baseInput: ReimbursementDraftInput = {
   ocrDispositionVersion: 1,
   companyValue: '北京',
   budgetCodeValue: '26007',
-  project: { mode: 'manual', text: '合肥长鑫前道 MES 项目' },
+  project: { mode: 'manual', text: '合肥示例前道 MES 项目' },
   trip: null,
   dismissedOcrFileIds: [],
   items: [{
@@ -213,7 +215,10 @@ const ExpenseItemsCardStub = defineComponent({
 })
 const TripSubsidyCardStub = defineComponent({
   name: 'TripSubsidyCard',
-  template: '<section>出差补助</section>',
+  props: {
+    readonly: { type: Boolean, default: false },
+  },
+  template: '<section :data-readonly="String(readonly)">出差补助</section>',
 })
 const ExpenseSummaryCardStub = defineComponent({
   name: 'ExpenseSummaryCard',
@@ -289,6 +294,7 @@ function installServerMocks(): void {
         status: 'DRAFT',
         revision: expectedRevision + 1,
         relatedApprovalCount: selections.length,
+        input: { ...serverDraft.input, companyValue: hasSelection ? '北京' : '', budgetCodeValue: hasSelection ? '26007' : '', accountingSourceVerified: hasSelection },
         relatedApprovals: hasSelection ? [linkedApproval] : [],
         relatedApprovalSummary: hasSelection
           ? { count: 1, startDate: linkedApproval.startDate, endDate: linkedApproval.endDate }
@@ -315,7 +321,7 @@ function installServerMocks(): void {
   vi.mocked(submitOaReimbursement).mockResolvedValue(submissionResult())
 }
 
-async function mountView(setup?: (auth: ReturnType<typeof useAuthStore>) => void): Promise<{
+async function mountView(setup?: (auth: ReturnType<typeof useAuthStore>) => void, realMaterials = false): Promise<{
   wrapper: VueWrapper
   expense: ReturnType<typeof useExpenseStore>
   drafts: ReturnType<typeof useReimbursementDraftStore>
@@ -342,7 +348,7 @@ async function mountView(setup?: (auth: ReturnType<typeof useAuthStore>) => void
     global: {
       plugins: [pinia, ElementPlus],
       stubs: {
-        ExpenseItemsCard: ExpenseItemsCardStub,
+        ExpenseItemsCard: realMaterials ? false : ExpenseItemsCardStub,
         ExpenseSummaryCard: ExpenseSummaryCardStub,
         RouterLink: { template: '<a><slot /></a>' },
         TravelApprovalSelector: TravelApprovalSelectorStub,
@@ -388,6 +394,67 @@ describe('ReimburseView single-form OA flow', () => {
     await wrapper.findComponent(ExpenseSummaryCardStub).props('beforePreview')!()
     await flushPromises()
   }
+
+  it('shows the current userId unobtrusively in the page header', async () => {
+    const { wrapper } = await mountView()
+
+    expect(wrapper.find('.current-user-id').text()).toContain('synthetic-user')
+    wrapper.unmount()
+  })
+
+  it.each(['success', 'failure'] as const)('clears slow uploaded files without autosaving deleted references (%s)', async (outcome) => {
+    vi.useFakeTimers()
+    serverFiles = [activeFile, { ...activeFile, id: 'file-2', name: '第二张发票.pdf' }]
+    serverDraft.input.items.push({ ...baseInput.items[0]!, sourceFileId: 'file-2' })
+    const lastDeletion = deferred<void>()
+    const invalidReferences: string[] = []
+    const errorMessage = '费用明细引用的票据文件无效，请刷新后重试'
+    vi.mocked(updateReimbursementDraft).mockImplementation(async (_id, revision, input) => {
+      const live = new Set(serverFiles.map((file) => file.id))
+      const references = [...input.items.flatMap((item) => [item.sourceFileId,
+        ...(item.itineraryFileIds ?? []), ...(item.paymentProofFileIds ?? [])]), ...(input.dismissedOcrFileIds ?? [])]
+      const missing = references.filter((id): id is string => Boolean(id) && !live.has(id!))
+      if (missing.length) {
+        invalidReferences.push(...missing)
+        throw new Error(errorMessage)
+      }
+      serverDraft = { ...serverDraft, revision: revision + 1, input: structuredClone(input) }
+      return serverDraft
+    })
+    vi.mocked(clearReimbursementDraftFiles).mockImplementation(async (draftId, revision) => {
+      serverFiles = serverFiles.filter((file) => file.id === 'file-2').map((file) => ({ ...file, status: 'DELETING' }))
+      serverDraft = { ...serverDraft, revision: revision + 1, input: {
+        ...serverDraft.input, items: [],
+      } }
+      await lastDeletion.promise
+      serverFiles = []
+      return { draftId, deletedFileIds: ['file-1', 'file-2'], revision: revision + 1 }
+    })
+    vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue({} as never)
+    const { wrapper, drafts, expense } = await mountView(undefined, true)
+    try {
+      await visibleButton(wrapper, '清空文件').trigger('click')
+      await flushPromises()
+      expect(clearReimbursementDraftFiles).toHaveBeenCalledOnce()
+      expect(deleteReimbursementDraftFile).not.toHaveBeenCalled()
+      expect(drafts.processingFiles).toBe(true)
+      // The save timer fires while the last DELETE still owns the mutation queue.
+      await vi.advanceTimersByTimeAsync(650)
+      expect(updateReimbursementDraft).not.toHaveBeenCalled()
+      await expect(saveCurrent(wrapper)).rejects.toThrow('请等待材料处理完成')
+      if (outcome === 'success') lastDeletion.resolve()
+      else lastDeletion.reject(new Error('删除连接中断'))
+      await flushPromises()
+      await vi.advanceTimersByTimeAsync(650)
+      await flushPromises()
+      expect(drafts.files.map((file) => file.id)).toEqual(outcome === 'success' ? [] : ['file-2'])
+      expect(expense.items).toEqual([])
+      expect(invalidReferences).toEqual([])
+      expect(drafts.mutationError).toBe('')
+      expect(wrapper.text()).not.toContain(errorMessage)
+      expect(wrapper.get('[data-testid="autosave-status"]').text()).toBe('已保存')
+    } finally { lastDeletion.resolve(); wrapper.unmount() }
+  })
 
   it.each(['mock_required', 'department_required'] as const)(
     'does not calculate before authentication and department selection (%s), then calculates after login',
@@ -453,6 +520,44 @@ describe('ReimburseView single-form OA flow', () => {
     wrapper.unmount()
   })
 
+  it('shows a per-expense material checklist and keeps preview/editing available until proofs are attached', async () => {
+    const { wrapper, expense, drafts } = await mountView()
+    expense.items[0]!.amount = '600.00'
+    await nextTick()
+    expect(wrapper.get('[data-testid="material-checklist"]').text()).toContain('还有 1 笔费用需补材料')
+    expect(wrapper.get('[data-testid="material-checklist"]').text()).toContain('付款凭证')
+    expect(visibleButton(wrapper, '去补齐').exists()).toBe(true)
+    expect(visibleButton(wrapper, '提交 OA').attributes('disabled')).toBeDefined()
+    expect(wrapper.findComponent(ExpenseItemsCardStub).props('readonly')).toBe(false)
+    expect(wrapper.findComponent(ExpenseSummaryCardStub).props('previewDisabledReason')).toBe('')
+    drafts.files.push({ ...activeFile, id: 'payment-1', role: 'ATTACHMENT_ONLY', attachmentKind: 'payment_proof', status: 'WRITING' })
+    expense.items[0]!.paymentProofFileIds = ['payment-1']
+    await nextTick()
+    expect(visibleButton(wrapper, '提交 OA').attributes('disabled')).toBeDefined()
+    drafts.files[1]!.status = 'ACTIVE'
+    await nextTick()
+    expect(wrapper.find('[data-testid="material-checklist"]').exists()).toBe(false)
+    expect(visibleButton(wrapper, '提交 OA').attributes('disabled')).toBeUndefined()
+    expect(submitOaReimbursement).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('blocks unconfirmed material purposes without treating them as invoices or disabling preview', async () => {
+    const { wrapper, expense, drafts } = await mountView()
+    drafts.files.push({ ...activeFile, id: 'unknown-1', role: 'ATTACHMENT_ONLY', attachmentKind: 'other',
+      materialClassification: { status: 'needs_confirmation', kind: 'unknown', reason: '请确认用途', pageCount: 1 } })
+    await nextTick()
+    expect(wrapper.get('[data-testid="material-checklist"]').text()).toContain('1 份材料待确认用途')
+    expect(visibleButton(wrapper, '提交 OA').attributes('disabled')).toBeDefined()
+    expect(wrapper.findComponent(ExpenseItemsCardStub).props('readonly')).toBe(false)
+    expect(wrapper.findComponent(ExpenseSummaryCardStub).props('previewDisabledReason')).toBe('')
+    expect(expense.items).toHaveLength(1)
+    drafts.files[1]!.materialClassification!.status = 'confirmed'
+    await nextTick()
+    expect(visibleButton(wrapper, '提交 OA').attributes('disabled')).toBeUndefined()
+    wrapper.unmount()
+  })
+
   it('restores queued work without polling a disabled worker and refreshes safely after service recovery', async () => {
     vi.useFakeTimers()
     serverDraft = makeDraft({ status: 'LOCKED', revision: 5 })
@@ -488,7 +593,10 @@ describe('ReimburseView single-form OA flow', () => {
     expect(wrapper.text()).not.toContain('草稿')
     expect(wrapper.text()).not.toContain('内部项目')
     expect(wrapper.text()).not.toContain('项目管理')
-    expect(wrapper.findAllComponents({ name: 'ElSelect' })).toHaveLength(2)
+    const basics = wrapper.get('[data-testid="reimbursement-basics-card"]')
+    expect(basics.text()).toContain('北京分公司')
+    expect(basics.text()).toContain('26007 · MES 项目')
+    expect(wrapper.findAllComponents({ name: 'ElSelect' })).toHaveLength(0)
     wrapper.unmount()
   })
 
@@ -505,6 +613,54 @@ describe('ReimburseView single-form OA flow', () => {
     expect(drafts.currentDraft?.id).toBe('draft-created')
     expect(wrapper.findComponent(ExpenseItemsCardStub).props('readonly')).toBe(false)
     expect(wrapper.text()).not.toContain('创建')
+    wrapper.unmount()
+  })
+
+  it('derives read-only accounting from approvals and clears it without losing expenses or subsidy edits', async () => {
+    serverDraft.input = { ...serverDraft.input, companyValue: '', budgetCodeValue: '' }
+    const { wrapper, expense } = await mountView()
+    const selector = wrapper.findComponent(TravelApprovalSelectorStub)
+    const basics = wrapper.get('[data-testid="reimbursement-basics-card"]')
+    expect(basics.findComponent(TravelApprovalSelectorStub).exists()).toBe(true)
+    expect(basics.text().indexOf('基本信息')).toBeLessThan(basics.text().indexOf('关联出差审批'))
+    selector.vm.$emit('update:modelValue', [selection])
+    await vi.waitFor(() => expect(replaceReimbursementRelatedApprovals).toHaveBeenCalledTimes(1), { timeout: 2000 })
+    await flushPromises()
+    expect(wrapper.get('[data-testid="derived-accounting-summary"]').text()).toContain('北京分公司')
+    expect(wrapper.get('[data-testid="derived-accounting-summary"]').text()).toContain('26007 · MES 项目')
+    const items = JSON.parse(JSON.stringify(expense.items))
+    expense.includeSubsidy = true
+    expense.trip.startDate = '2026-09-01'
+    expense.trip.endDate = ''
+    selector.vm.$emit('update:modelValue', [])
+    await vi.waitFor(() => expect(replaceReimbursementRelatedApprovals).toHaveBeenCalledTimes(2), { timeout: 2000 })
+    await flushPromises()
+    expect(wrapper.get('[data-testid="derived-accounting-summary"]').text()).toContain('选择出差审批后自动填入')
+    expect(expense.items).toEqual(items)
+    expect(expense.includeSubsidy).toBe(true)
+    expect(expense.trip.startDate).toBe('2026-09-01')
+    expect(wrapper.get('[data-testid="autosave-status"]').text()).toBe('已保存')
+    wrapper.unmount()
+  })
+
+  it('offers reconfirmation for legacy related approvals and preserves live edits during verification', async () => {
+    serverDraft.relatedApprovals = [linkedApproval]
+    serverDraft.relatedApprovalCount = 1
+    const { wrapper, expense } = await mountView()
+    expect(wrapper.text()).toContain('此报销需重新核验')
+    const pending = deferred<ReimbursementDraft>()
+    vi.mocked(replaceReimbursementRelatedApprovals).mockReturnValueOnce(pending.promise)
+    await visibleButton(wrapper, '重新确认出差审批').trigger('click')
+    await vi.waitFor(() => expect(replaceReimbursementRelatedApprovals).toHaveBeenCalledOnce())
+    expense.items[0]!.description = '核验期间继续编辑'
+    expense.trip.startDate = '2026-09-03'
+    serverDraft = { ...serverDraft, revision: serverDraft.revision + 1,
+      input: { ...serverDraft.input, accountingSourceVerified: true } }
+    pending.resolve(serverDraft)
+    await flushPromises()
+    expect(expense.items[0]!.description).toBe('核验期间继续编辑')
+    expect(expense.trip.startDate).toBe('2026-09-03')
+    expect(wrapper.text()).not.toContain('此报销需重新核验')
     wrapper.unmount()
   })
 
@@ -592,8 +748,8 @@ describe('ReimburseView single-form OA flow', () => {
       expect(drafts.files).toEqual([activeFile])
       expect(expense.items).toEqual(previousItems)
       expect(expense.trip).toEqual(previousTrip)
-      expect(wrapper.findAllComponents({ name: 'ElSelect' }).map((select) => select.props('modelValue')))
-        .toEqual(['北京', '26007'])
+      expect(wrapper.get('[data-testid="derived-accounting-summary"]').text()).toContain('北京分公司')
+      expect(wrapper.get('[data-testid="derived-accounting-summary"]').text()).toContain('26007 · MES 项目')
       expect(wrapper.findComponent(TravelApprovalSelectorStub).props('modelValue')).toEqual(previousSelections)
       expect(submitOaReimbursement).not.toHaveBeenCalled()
       wrapper.unmount()
@@ -617,6 +773,29 @@ describe('ReimburseView single-form OA flow', () => {
     expect(sent).not.toHaveProperty('project')
     await flushPromises()
     expect(wrapper.get('[data-testid="autosave-status"]').text()).toBe('已保存')
+    wrapper.unmount()
+  })
+
+  it('persists legacy trip times with consistent half-day values for submission validation', async () => {
+    serverDraft.input.trip = {
+      tripType: 'business', startDate: '2026-09-01', endDate: '2026-09-01',
+      startTime: '11:59', endTime: '12:00',
+    }
+    const { wrapper, expense } = await mountView()
+    expect(expense.trip.startTime).toBe('11:59')
+    expect(expense.trip.endTime).toBe('12:00')
+    await saveCurrent(wrapper)
+    const sent = vi.mocked(updateReimbursementDraft).mock.lastCall![2]
+    expect(sent.trip).toMatchObject({ startTime: '09:00', endTime: '18:00' })
+    expect(sent.editingState?.trip).toMatchObject(sent.trip!)
+    expect(wrapper.get('[data-testid="autosave-status"]').text()).toBe('已保存')
+
+    // Changing only the return period must not leave a hidden 11:59 -> 09:00 reversal.
+    expense.trip.endTime = '09:00'
+    await saveCurrent(wrapper)
+    const changed = vi.mocked(updateReimbursementDraft).mock.lastCall![2]
+    expect(changed.trip).toMatchObject({ startTime: '09:00', endTime: '09:00' })
+    expect(changed.editingState?.trip).toMatchObject(changed.trip!)
     wrapper.unmount()
   })
 
@@ -687,6 +866,19 @@ describe('ReimburseView single-form OA flow', () => {
     await flushPromises()
     expect(wrapper.get('[data-testid="autosave-status"]').text()).toBe('已保存')
     expect(updateReimbursementDraft).toHaveBeenCalledTimes(2)
+    wrapper.unmount()
+  })
+
+  it('does not turn an ordinary failed save into an endless automatic retry loop', async () => {
+    vi.useFakeTimers()
+    const { wrapper, expense } = await mountView()
+    vi.mocked(updateReimbursementDraft).mockRejectedValue(new Error('连接暂时中断'))
+    expense.items[0]!.description = '需要保留的修改'
+    await nextTick()
+    await vi.advanceTimersByTimeAsync(3000)
+    await flushPromises()
+    expect(updateReimbursementDraft).toHaveBeenCalledOnce()
+    expect(wrapper.get('[data-testid="autosave-status"]').text()).toContain('保存失败')
     wrapper.unmount()
   })
 
@@ -798,11 +990,36 @@ describe('ReimburseView single-form OA flow', () => {
     expect(wrapper.text()).toContain('OA-20260904001')
     expect(wrapper.get('[data-testid="approval-link"]').attributes('href')).toContain('oa-process-1')
     expect(wrapper.get('[data-testid="autosave-status"]').text()).toBe('OA 已成功发起')
+    expect(wrapper.findComponent(TripSubsidyCardStub).props('readonly')).toBe(true)
+    expect(wrapper.findComponent(ExpenseItemsCardStub).props('readonly')).toBe(true)
     await visibleButton(wrapper, '再报销一笔').trigger('click')
     await flushPromises()
     expect(drafts.currentDraft?.id).toBe('draft-created')
     expect(wrapper.get('[data-testid="autosave-status"]').text()).toBe('已保存')
     expect(wrapper.findComponent(ExpenseItemsCardStub).props('readonly')).toBe(false)
+    expect(submitOaReimbursement).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('restores a locked OA submission even when the current template options are unavailable', async () => {
+    serverDraft = makeDraft({ status: 'LOCKED', revision: 5, lockedAt: '2026-09-04T00:02:00Z' })
+    vi.mocked(getOaReimbursementOptions).mockRejectedValue(new Error('当前 OA 模板尚未确认'))
+    vi.mocked(getOaReimbursementSubmissionForDraft).mockResolvedValue(submissionResult({
+      status: 'SUBMITTED', statusVersion: 8, processInstanceId: 'oa-process-1',
+      businessId: 'OA-20260904001', approvalUrl: 'dingtalk://approval/oa-process-1',
+      pollAfterMs: 0, submittedAt: '2026-09-04T00:03:00Z',
+    }))
+
+    const { wrapper } = await mountView()
+
+    expect(getOaReimbursementSubmissionForDraft).toHaveBeenCalledWith(
+      'draft-1', { signal: expect.any(AbortSignal) },
+    )
+    expect(wrapper.text()).toContain('OA-20260904001')
+    expect(wrapper.get('[data-testid="approval-link"]').attributes('href')).toContain('oa-process-1')
+    expect(wrapper.findComponent(ExpenseItemsCardStub).props('readonly')).toBe(true)
+    expect(calculateTotals).not.toHaveBeenCalled()
+    expect(createReimbursementDraft).not.toHaveBeenCalled()
     expect(submitOaReimbursement).not.toHaveBeenCalled()
     wrapper.unmount()
   })

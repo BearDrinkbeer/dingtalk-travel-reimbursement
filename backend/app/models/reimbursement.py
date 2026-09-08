@@ -54,6 +54,7 @@ class ReimbursementDraftFileRole(StrEnum):
 class ReimbursementAttachmentKind(StrEnum):
     ITINERARY = "itinerary"
     PAYMENT_PROOF = "payment_proof"
+    HOTEL_BILL = "hotel_bill"
     OTHER = "other"
 
 
@@ -249,6 +250,7 @@ class ReimbursementDraftRelatedApproval(Base):
     listed_to_ms: Mapped[int] = mapped_column(BigInteger)
     travel_start_date: Mapped[date] = mapped_column(Date)
     travel_end_date: Mapped[date] = mapped_column(Date)
+    source_travel_type_value: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     title: Mapped[str] = mapped_column(String(500))
     business_id: Mapped[str] = mapped_column(String(128))
     instance_created_at: Mapped[datetime] = mapped_column(DateTime())

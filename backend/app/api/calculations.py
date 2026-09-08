@@ -33,6 +33,7 @@ def _calculate(body: TripInput, database: Session):
         policy_confirmed=body.policy_confirmed,
         confirmed_effective_days=body.confirmed_effective_days,
         no_subsidy_exception=body.no_subsidy_exception,
+        manual_subsidy_amount=body.manual_subsidy_amount,
     )
 
 

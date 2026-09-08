@@ -28,15 +28,15 @@ import type {
 } from '@/types/reimbursements'
 import { receiptOcrResult } from '@/types/reimbursements'
 import { evidenceRailType, isActiveProof } from '@/utils/expenseProofs'
-import { matchItineraries } from '@/utils/itineraryMatching'
+import { itineraryConfirmationWarnings, matchItineraries } from '@/utils/itineraryMatching'
 import { centsToMoney, moneyToCents } from '@/utils/money'
 import { DEFAULT_RECEIPT_LIMITS, validateReceiptFiles } from '@/utils/receiptFiles'
+import { TRIP_PERIOD_TIME, tripPeriodFromTime } from '@/utils/tripPeriod'
 
 const SPECIAL_TRIP_TYPES = new Set<TripType>([
   'same_city_project',
   'internal',
 ])
-const MINUTE_TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/
 const EFFECTIVE_DAYS_PATTERN = /^(?:0|[1-9]\d{0,2})(?:\.(?:0|5))?$/
 const MAX_CONFIRMED_DAYS = 366
 const CALENDAR_DATE_PATTERN = /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/
@@ -170,7 +170,10 @@ export const useExpenseStore = defineStore('expense', () => {
   const displayExpenseTotal = computed(
     () => totals.value?.expenseTotal ?? centsToMoney(localExpenseCents.value),
   )
-  const displaySubsidyTotal = computed(() => totals.value?.subsidyTotal ?? '0.00')
+  const displaySubsidyTotal = computed(() => {
+    if (!includeSubsidy.value) return '0.00'
+    return totals.value?.subsidyTotal ?? '0.00'
+  })
   const displayReceiptCount = computed(() => totals.value?.receiptCount ?? localReceiptCount.value)
   const displayTotal = computed(() => {
     if (totals.value) return totals.value.totalAmount
@@ -206,18 +209,21 @@ export const useExpenseStore = defineStore('expense', () => {
 
   function tripPayload(): TripInput | null {
     if (!includeSubsidy.value) return null
+    const startPeriod = tripPeriodFromTime(trip.startTime)
+    const endPeriod = tripPeriodFromTime(trip.endTime)
     if (
       !trip.startDate ||
       !trip.endDate ||
-      !MINUTE_TIME_PATTERN.test(trip.startTime) ||
-      !MINUTE_TIME_PATTERN.test(trip.endTime)
+      !startPeriod ||
+      !endPeriod
     ) return null
+    // Normalize both ends so legacy exact times cannot conflict within the same half-day.
     const payload: TripInput = {
       tripType: trip.tripType,
       startDate: trip.startDate,
-      startTime: trip.startTime,
+      startTime: TRIP_PERIOD_TIME[startPeriod],
       endDate: trip.endDate,
-      endTime: trip.endTime,
+      endTime: TRIP_PERIOD_TIME[endPeriod],
     }
     if (requiresPolicyConfirmation.value) {
       if (policyInputError.value) return null
@@ -407,6 +413,7 @@ export const useExpenseStore = defineStore('expense', () => {
       itineraryFileIds: [],
       itineraryAutoMatchDisabled: false,
       paymentProofFileIds: [],
+      hotelBillFileIds: [],
       railType: evidenceRailType(categoryId, undefined, candidate),
       originalCurrency: candidate.originalCurrency ?? undefined,
       originalAmount: candidate.originalAmount ?? undefined,
@@ -433,6 +440,7 @@ export const useExpenseStore = defineStore('expense', () => {
       item.itineraryFileIds = items.value[index]?.itineraryFileIds ?? []
       item.itineraryAutoMatchDisabled = items.value[index]?.itineraryAutoMatchDisabled ?? false
       item.paymentProofFileIds = items.value[index]?.paymentProofFileIds ?? []
+      item.hotelBillFileIds = items.value[index]?.hotelBillFileIds ?? []
       item.railType = evidenceRailType(item.category, items.value[index]?.railType, receiptOcrResult(file))
       items.value[index] = item
     }
@@ -506,6 +514,7 @@ export const useExpenseStore = defineStore('expense', () => {
         itineraryFileIds: [...(persisted.itineraryFileIds ?? [])],
         itineraryAutoMatchDisabled: persisted.itineraryAutoMatchDisabled ?? false,
         paymentProofFileIds: [...(persisted.paymentProofFileIds ?? [])],
+        hotelBillFileIds: [...(persisted.hotelBillFileIds ?? [])],
         railType: evidenceRailType(persisted.category, persisted.railType, receiptOcrResult(
           draftFiles.find((file) => file.id === sourceFileId),
         )),
@@ -576,6 +585,7 @@ export const useExpenseStore = defineStore('expense', () => {
       ? []
       : undecidedCandidates.map(({ item }) => item)
     items.value.push(...recovered)
+    for (const item of items.value) item.warnings = itineraryConfirmationWarnings(item, draftFiles)
     ocrUnavailable.value = draftFiles.some(
       (file) => file.ocrResult?.error?.code === 'OCR_DISABLED',
     )
@@ -620,6 +630,7 @@ export const useExpenseStore = defineStore('expense', () => {
     for (const item of items.value) {
       item.itineraryFileIds = item.itineraryFileIds?.filter((id) => id !== fileId)
       item.paymentProofFileIds = item.paymentProofFileIds?.filter((id) => id !== fileId)
+      item.hotelBillFileIds = item.hotelBillFileIds?.filter((id) => id !== fileId)
     }
     dismissedOcrFileIds.value = dismissedOcrFileIds.value.filter((id) => id !== fileId)
     if (items.value.length !== previousLength) {
@@ -641,8 +652,10 @@ export const useExpenseStore = defineStore('expense', () => {
     for (const item of items.value) {
       const itineraryIds = (item.itineraryFileIds ?? []).filter((id) => draftFiles.some((file) => file.id === id && isActiveProof(file, 'itinerary')))
       const paymentIds = (item.paymentProofFileIds ?? []).filter((id) => draftFiles.some((file) => file.id === id && isActiveProof(file, 'payment_proof')))
+      const hotelIds = (item.hotelBillFileIds ?? []).filter((id) => draftFiles.some((file) => file.id === id && isActiveProof(file, 'hotel_bill')))
       if (itineraryIds.length !== (item.itineraryFileIds?.length ?? 0)) item.itineraryFileIds = itineraryIds
       if (paymentIds.length !== (item.paymentProofFileIds?.length ?? 0)) item.paymentProofFileIds = paymentIds
+      if (hotelIds.length !== (item.hotelBillFileIds?.length ?? 0)) item.hotelBillFileIds = hotelIds
     }
   }
 
@@ -750,6 +763,7 @@ export const useExpenseStore = defineStore('expense', () => {
       itineraryFileIds: [...(item.itineraryFileIds ?? [])],
       itineraryAutoMatchDisabled: item.itineraryAutoMatchDisabled ?? false,
       paymentProofFileIds: [...(item.paymentProofFileIds ?? [])],
+      hotelBillFileIds: [...(item.hotelBillFileIds ?? [])],
       railType: item.railType ?? 'unknown',
       requiresItinerary: item.requiresItinerary ?? false,
       originalCurrency: item.originalCurrency,

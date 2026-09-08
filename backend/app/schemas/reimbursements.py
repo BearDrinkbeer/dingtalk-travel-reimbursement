@@ -33,6 +33,12 @@ class ReimbursementEditingTripInput(BaseModel):
     policy_confirmed: bool = Field(default=False, alias="policyConfirmed")
     confirmed_effective_days: str = Field(default="", alias="confirmedEffectiveDays", max_length=32)
     no_subsidy_exception: bool = Field(default=False, alias="noSubsidyException")
+    manual_subsidy_amount: str | None = Field(
+        default=None,
+        alias="manualSubsidyAmount",
+        max_length=32,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class ReimbursementEditingStateInput(BaseModel):
@@ -61,6 +67,9 @@ class ReimbursementDraftExpenseItemInput(BaseModel):
     )
     payment_proof_file_ids: list[str] = Field(
         default_factory=list, alias="paymentProofFileIds", max_length=100
+    )
+    hotel_bill_file_ids: list[str] = Field(
+        default_factory=list, alias="hotelBillFileIds", max_length=100
     )
     rail_type: RailType = Field(default="unknown", alias="railType")
     requires_itinerary: bool = Field(default=False, alias="requiresItinerary", strict=True)
@@ -104,7 +113,7 @@ class ReimbursementDraftExpenseItemInput(BaseModel):
             raise ValueError("subsidy is calculated by the server")
         return value
 
-    @field_validator("itinerary_file_ids", "payment_proof_file_ids")
+    @field_validator("itinerary_file_ids", "payment_proof_file_ids", "hotel_bill_file_ids")
     @classmethod
     def normalize_itinerary_ids(cls, values: list[str]) -> list[str]:
         result = [value.strip() for value in values]
@@ -144,6 +153,9 @@ class ReimbursementDraftInput(ExcelGenerateRequest):
         strict=True,
     )
     company_value: str = Field(default="", alias="companyValue", max_length=2048)
+    accounting_source_verified: bool = Field(
+        default=False, alias="accountingSourceVerified", strict=True
+    )
     budget_code_value: str = Field(default="", alias="budgetCodeValue", max_length=2048)
     project: (
         Annotated[SelectedProjectInput | BudgetProjectInput, Field(discriminator="mode")] | None

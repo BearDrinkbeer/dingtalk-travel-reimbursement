@@ -22,6 +22,8 @@ from app.services.travel_approvals import (
     requested_query_window,
     reverify_travel_approval_selection,
     runtime_options,
+    travel_accounting_options,
+    travel_source_component_id,
 )
 
 
@@ -38,6 +40,8 @@ def _profile(
         schema=SimpleNamespace(fingerprint=(key[0] * 64)),
         start_date_component_id="start-id",
         end_date_component_id="end-id",
+        company_component_id="source-company",
+        budget_code_component_id="source-budget",
         travel_type_option=FormOption(
             value=travel_type,
             label=travel_type,
@@ -80,7 +84,10 @@ def _instance(
     title: str = "测试员工提交的境内出差申请",
     business_id: str | None = None,
 ) -> WorkflowProcessInstance:
-    values = []
+    values = [
+        WorkflowFormValue("source-company", "所属公司", "DDSelectField", "北京公司", None, None),
+        WorkflowFormValue("source-budget", "预算代码", "DDSelectField", "26007 项目", None, None),
+    ]
     if start_date is not None:
         values.append(
             WorkflowFormValue(
@@ -124,6 +131,7 @@ def _itinerary_instance(
     return replace(
         _instance(instance_id, start_date=None, end_date=None),
         form_values=(
+            *_instance(instance_id, start_date=None, end_date=None).form_values,
             WorkflowFormValue(
                 component_id="itinerary-id",
                 name="行程",
@@ -199,6 +207,122 @@ def test_runtime_options_preserve_exact_oa_values_and_catalog_version() -> None:
     }
 
 
+def test_accounting_resolves_source_option_key_by_exact_label_across_forms() -> None:
+    source_option = FormOption("source-value", "北京公司", "source-key")
+    source_schema = SimpleNamespace(
+        components=(
+            SimpleNamespace(
+                component_id="source-company",
+                options=(source_option,),
+            ),
+        )
+    )
+    instance = _instance("trip")
+    instance = replace(
+        instance,
+        form_values=tuple(
+            replace(value, value="source-key") if value.component_id == "source-company" else value
+            for value in instance.form_values
+        ),
+    )
+    company, budget, reason = travel_accounting_options(
+        instance,
+        source_schema=source_schema,
+        company_component_id="source-company",
+        budget_code_component_id="source-budget",
+        company_options=_catalog().reimbursement.schema.components[0].options,
+        budget_options=_catalog().reimbursement.schema.components[1].options,
+    )
+    assert reason is None
+    assert company.value == "北京"
+    assert budget.value == "26007"
+
+
+def test_legacy_source_mapping_requires_one_exact_visible_field_label() -> None:
+    profile = _profile("domestic", "PROC-TRAVEL")
+    profile.company_component_id = None
+    component = SimpleNamespace(
+        component_id="real-company", label="所属公司", component_type="DDSelectField"
+    )
+    profile.schema = SimpleNamespace(components=(component,))
+    assert travel_source_component_id(profile, "company") == "real-company"
+    profile.schema.components = (
+        component,
+        SimpleNamespace(component_id="ambiguous", label="所属公司", component_type="DDSelectField"),
+    )
+    assert travel_source_component_id(profile, "company") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("problem", ["missing", "ambiguous_target", "unknown_target"])
+async def test_unavailable_accounting_is_visible_but_cannot_be_selected(problem) -> None:
+    profile = _profile("domestic", "PROC-A")
+    catalog = _catalog(profile)
+    instance = _instance("trip")
+    if problem == "missing":
+        instance = replace(
+            instance,
+            form_values=tuple(
+                value for value in instance.form_values if value.component_id != "source-company"
+            ),
+        )
+    elif problem == "ambiguous_target":
+        catalog.reimbursement.schema.components[0].options += (
+            FormOption("other-company", "北京公司", "ambiguous"),
+        )
+    else:
+        instance = replace(
+            instance,
+            form_values=tuple(
+                replace(value, value="unknown") if value.component_id == "source-company" else value
+                for value in instance.form_values
+            ),
+        )
+    workflow = FakeWorkflow(
+        {("PROC-A", 0): WorkflowInstanceIdPage(("trip",), None)}, {"trip": instance}
+    )
+    candidates = await list_current_user_travel_approvals(
+        workflow, catalog, current_user_id="employee-1", query_window=_window()
+    )
+    assert len(candidates) == 1
+    assert "所属公司" in candidates[0].as_dict()["unavailableReason"]
+    with pytest.raises(ApiError) as error:
+        await reverify_travel_approval_selection(
+            workflow,
+            catalog,
+            current_user_id="employee-1",
+            selections=(TravelApprovalSelection("domestic", "trip", _window()),),
+        )
+    assert error.value.code == "TRAVEL_APPROVAL_FIELDS_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_selection_rejects_different_companies_even_with_same_travel_type() -> None:
+    catalog = _catalog(_profile("domestic", "PROC-A"))
+    second = _instance("second")
+    second = replace(
+        second,
+        form_values=tuple(
+            replace(value, value="无锡公司") if value.component_id == "source-company" else value
+            for value in second.form_values
+        ),
+    )
+    workflow = FakeWorkflow(
+        {("PROC-A", 0): WorkflowInstanceIdPage(("first", "second"), None)},
+        {"first": _instance("first"), "second": second},
+    )
+    with pytest.raises(ApiError) as error:
+        await reverify_travel_approval_selection(
+            workflow,
+            catalog,
+            current_user_id="employee-1",
+            selections=tuple(
+                TravelApprovalSelection("domestic", key, _window()) for key in ("first", "second")
+            ),
+        )
+    assert error.value.code == "TRAVEL_APPROVAL_ACCOUNTING_MISMATCH"
+
+
 def test_query_window_defaults_to_120_calendar_days_and_rejects_a_larger_span() -> None:
     window = requested_query_window(None, None, today=date(2026, 9, 4))
 
@@ -247,6 +371,17 @@ async def test_listing_pages_each_profile_uses_only_current_identity_and_filters
 
     assert [item.instance.instance_id for item in candidates] == ["target-b"]
     assert candidates[0].listed.source_process_code == "PROC-B"
+    assert candidates[0].as_dict()["companyOption"] == {
+        "value": "北京",
+        "label": "北京公司",
+        "key": "company-1",
+    }
+    assert candidates[0].as_dict()["budgetCodeOption"] == {
+        "value": "26007",
+        "label": "26007 项目",
+        "key": "budget-1",
+    }
+    assert candidates[0].as_dict()["unavailableReason"] is None
     assert not hasattr(candidates[0].instance, "process_code")
     assert len(workflow.list_calls) == 3
     assert all(call["user_ids"] == ("employee-1",) for call in workflow.list_calls)

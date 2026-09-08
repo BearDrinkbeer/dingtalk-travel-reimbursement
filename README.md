@@ -1,4 +1,4 @@
-# 钉钉智能差旅报销与 OA 集成工具
+# 智能差旅费报销申请
 
 本仓库实现一个公司内部钉钉 H5 工具：员工免登后选择 OA 提供的所属公司和预算代码，按需申请出差补助，上传票据和行程单，在一个费用列表中预览、修改并关联材料，再选择本人已通过的出差审批。页面自动保存填写内容。员工最终确认后，服务器按锁定快照生成 `票据汇总.pdf` 和报销单 `.xlsx`，只上传这两份文件到审批附件空间，一次性创建钉钉 OA。
 
@@ -18,6 +18,7 @@
 - 国外票据保存原币信息，人民币报销金额由员工另行填写确认；币种不明确时仍需确认。
 - OCR 结果可编辑、删除，也可完全手工新增费用明细。
 - 管理员可在每日补助设置之前按费用类别维护关键词；所有关键词规则一致，均可直接新增、修改、移动类别或删除。
+- 页面默认标题为“智能差旅费报销申请”；配置文件中的初始管理员可在系统设置中修改标题，并维护其他管理员 userId。
 - 基于脱敏公司模板生成 Excel，预览前自动保存最新输入；正式提交还合并生成票据汇总 PDF，两份文件暂存到受控持久卷，上传并从 OA 回读确认后清理本地副本。
 - 未完成输入自动保存并恢复；结构化 OCR 候选、原始附件元数据和提交状态持久保存；票据字节保存在受控 staging 卷，预览通过鉴权接口读取。
 - 查询并复核当前员工已通过的出差审批，将选中实例写入 OA 的 `RelateField`。
@@ -91,8 +92,9 @@
 `DINGTALK_CORP_ID`；`DINGTALK_CLIENT_SECRET`、`DINGTALK_AGENT_ID` 与 `SESSION_SECRET`
 只存在后端环境变量中。
 钉钉应用需要具备免登码换用户、读取用户详情和读取部门详情的权限，并将部署使用的
-HTTPS 域名配置为应用可信域名。管理员使用 `ADMIN_USER_IDS` 配置钉钉 userId，多个值用
-英文逗号分隔。
+HTTPS 域名配置为应用可信域名。首次部署使用 `ADMIN_USER_IDS` 配置至少一个初始管理员
+钉钉 userId，多个值用英文逗号分隔。该列表始终生效且不能从页面移除；初始管理员登录后
+可在系统设置中新增或撤销其他管理员，避免因误操作失去管理入口。
 
 本地普通浏览器调试可以显式设置 `APP_ENV=development`、
 `AUTH_MOCK_ENABLED=true` 和固定的 `AUTH_MOCK_USER_ID`、
@@ -103,7 +105,7 @@ HTTPS 域名配置为应用可信域名。管理员使用 `ADMIN_USER_IDS` 配�
 
 当前免登 API：
 
-- `GET /api/config/public`：返回 CorpId、Client ID、开发 Mock 开关、上传/费用条数限制及布尔值 `oaSubmissionEnabled`；后者直接对应 OA worker 配置，不返回应用 Secret 或 AgentId。
+- `GET /api/config/public`：返回页面标题、CorpId、Client ID、开发 Mock 开关、上传/费用条数限制及布尔值 `oaSubmissionEnabled`；后者直接对应 OA worker 配置，不返回应用 Secret 或 AgentId。
 - `POST /api/auth/dingtalk`：接收一次性 `authCode` 并建立服务端 Session。
 - `GET /api/me`：读取当前身份并轮换仅保存在前端内存中的 CSRF token。
 - `POST /api/me/department`：多部门用户从服务端确认过的部门中选择当前部门。
@@ -134,6 +136,20 @@ cp .env.dingtalk-dev.example .env.dingtalk-dev
 ```bash
 make dev-dingtalk
 ```
+
+使用正式公司配置在本机联调（无需 Docker）：
+
+```bash
+make dev-dingtalk-prod
+```
+
+读取根目录现有 `.env`，以开发运行模式启动真实免登及 OCR：前端 5173，后端 8000。
+启动前先停止占用这些端口的开发服务或 Docker 服务。
+数据库使用 `backend/data/dev-dingtalk-prod.db`，附件使用
+`backend/data/reimbursement-staging-prod`，与测试公司及 Docker 数据隔离。
+OA 开关沿用 `.env`，开启后提交会创建正式公司的审批。
+新数据库仍需管理员确认模板目录；此命令不会自动导入待确认 JSON 或绕过关联验收。
+将来 Docker 部署仍使用其自身数据卷，不会自动迁移本地联调的配置和记录。
 
 需要把日志分开时，仍可在两个终端分别执行 `make dev-dingtalk-backend` 和
 `make dev-dingtalk-frontend`。

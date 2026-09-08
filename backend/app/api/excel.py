@@ -75,6 +75,7 @@ def generate_excel(
             policy_confirmed=body.trip.policy_confirmed,
             confirmed_effective_days=body.trip.confirmed_effective_days,
             no_subsidy_exception=body.trip.no_subsidy_exception,
+            manual_subsidy_amount=body.trip.manual_subsidy_amount,
         )
     totals = calculate_expense_totals(body.items, subsidy)
     result = generate_expense_workbook(

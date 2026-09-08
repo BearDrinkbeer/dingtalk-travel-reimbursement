@@ -77,13 +77,24 @@ class TravelTemplateContract:
     start_date_component_id: str
     end_date_component_id: str
     travel_type_option: FormOption
+    company_component_id: str | None = None
+    budget_code_component_id: str | None = None
+    travel_type_component_id: str | None = None
+    travel_type_mappings: dict[str, FormOption] | None = None
 
     @property
     def mappings(self) -> dict[str, str]:
-        return {
+        mappings = {
             "startDate": self.start_date_component_id,
             "endDate": self.end_date_component_id,
         }
+        if self.company_component_id:
+            mappings["company"] = self.company_component_id
+        if self.budget_code_component_id:
+            mappings["budgetCode"] = self.budget_code_component_id
+        if self.travel_type_component_id:
+            mappings["travelType"] = self.travel_type_component_id
+        return mappings
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,15 +133,16 @@ class TravelProfileConfirmation:
     schema_fingerprint: str
     mappings: dict[str, str]
     travel_type_option: FormOption
+    travel_type_mappings: dict[str, FormOption] | None = None
 
 
 REIMBURSEMENT_LOGICAL_FIELD_SPECS: Final[tuple[LogicalFieldSpec, ...]] = (
     LogicalFieldSpec("company", "所属公司", frozenset({"DDSelectField"})),
     LogicalFieldSpec("budgetCode", "预算代码", frozenset({"DDSelectField"})),
     LogicalFieldSpec("travelType", "出差类别", frozenset({"DDSelectField"})),
-    LogicalFieldSpec("startDate", "开始日期", frozenset({"DDDateField"})),
-    LogicalFieldSpec("endDate", "结束日期", frozenset({"DDDateField"})),
-    LogicalFieldSpec("durationDays", "时长（天）", frozenset({"NumberField"})),
+    LogicalFieldSpec("startDate", "开始日期", frozenset({"DDDateField", "DDDateRangeField"})),
+    LogicalFieldSpec("endDate", "结束日期", frozenset({"DDDateField", "DDDateRangeField"})),
+    LogicalFieldSpec("durationDays", "时长（天）", frozenset({"NumberField", "DDDateRangeField"})),
     LogicalFieldSpec(
         "description",
         "明细说明",
@@ -148,12 +160,17 @@ TRAVEL_LOGICAL_FIELD_SPECS: Final[tuple[LogicalFieldSpec, ...]] = (
     LogicalFieldSpec(
         "startDate",
         "出差开始日期",
-        frozenset({"DDDateField", *_TRAVEL_TABLE_COMPONENT_TYPES}),
+        frozenset({"DDDateField", "DDDateRangeField", *_TRAVEL_TABLE_COMPONENT_TYPES}),
     ),
     LogicalFieldSpec(
         "endDate",
         "出差结束日期",
-        frozenset({"DDDateField", *_TRAVEL_TABLE_COMPONENT_TYPES}),
+        frozenset({"DDDateField", "DDDateRangeField", *_TRAVEL_TABLE_COMPONENT_TYPES}),
+    ),
+    LogicalFieldSpec("company", "所属公司", frozenset({"DDSelectField", "TextField"})),
+    LogicalFieldSpec("budgetCode", "预算代码", frozenset({"DDSelectField", "TextField"})),
+    LogicalFieldSpec(
+        "travelType", "出差类别来源（按选项对应时使用）", frozenset({"DDSelectField"})
     ),
 )
 LOGICAL_FIELD_SPECS = REIMBURSEMENT_LOGICAL_FIELD_SPECS
@@ -257,6 +274,13 @@ async def inspect_template_catalog(
                     if stored is not None and stored.get("processCode") == requested.process_code
                     else None
                 ),
+                **(
+                    {"travelTypeMappings": stored["travelTypeMappings"]}
+                    if stored is not None
+                    and stored.get("processCode") == requested.process_code
+                    and "travelTypeMappings" in stored
+                    else {}
+                ),
                 "confirmedSchemaFingerprint": (
                     stored.get("confirmedSchemaFingerprint")
                     if stored is not None and stored.get("processCode") == requested.process_code
@@ -357,6 +381,16 @@ async def confirm_template_catalog(
                 start_date_component_id=mapping["startDate"],
                 end_date_component_id=mapping["endDate"],
                 travel_type_option=exact_option,
+                company_component_id=mapping.get("company"),
+                budget_code_component_id=mapping.get("budgetCode"),
+                travel_type_component_id=mapping.get("travelType"),
+                travel_type_mappings=validate_travel_type_mappings(
+                    schema,
+                    mapping,
+                    confirmation.travel_type_mappings,
+                    reimbursement_schema,
+                    normalized_reimbursement_mapping,
+                ),
             )
         )
 
@@ -379,7 +413,7 @@ async def confirm_template_catalog(
         "mapping_json": _serialize_mapping(normalized_reimbursement_mapping),
         "allowed_travel_process_codes_json": _serialize_process_codes(allowed_process_codes),
         "travel_profiles_json": _serialize_travel_profiles(contracts),
-        "related_approval_smoke_test_confirmed": True,
+        "related_approval_smoke_test_confirmed": related_approval_smoke_test_confirmed,
         "compatibility_status": COMPATIBLE,
         "confirmed_by_user_id": administrator_user_id,
         "last_checked_at": now,
@@ -540,32 +574,47 @@ async def load_fresh_submission_template(
 
 
 def validate_template_mapping(schema: FormSchema, mappings: dict[str, str]) -> dict[str, str]:
-    return _validate_mapping(
+    normalized = _validate_mapping(
         schema,
         mappings,
         specs=REIMBURSEMENT_LOGICAL_FIELD_SPECS,
         reject_unmapped_required=True,
+        reusable_component_types=frozenset({"DDDateRangeField"}),
     )
+    components = {component.component_id: component for component in schema.components}
+    date_ids = [normalized[key] for key in ("startDate", "endDate", "durationDays")]
+    if any(components[key].component_type == "DDDateRangeField" for key in date_ids):
+        if len(set(date_ids)) != 1:
+            raise _mapping_error("开始日期、结束日期和时长必须映射到同一个日期区间控件")
+    return normalized
 
 
 def validate_travel_template_mapping(
     schema: FormSchema,
     mappings: dict[str, str],
 ) -> dict[str, str]:
+    # Older confirmed catalogs remain readable. Missing new source mappings are
+    # unavailable on candidates until an administrator confirms them.
+    supplied_specs = tuple(
+        spec
+        for spec in TRAVEL_LOGICAL_FIELD_SPECS
+        if spec.key in {"startDate", "endDate"} or spec.key in mappings
+    )
     normalized = _validate_mapping(
         schema,
         mappings,
-        specs=TRAVEL_LOGICAL_FIELD_SPECS,
+        specs=supplied_specs,
         reject_unmapped_required=False,
-        reusable_component_types=_TRAVEL_TABLE_COMPONENT_TYPES,
+        reusable_component_types=_TRAVEL_TABLE_COMPONENT_TYPES | {"DDDateRangeField"},
     )
     component_by_id = {component.component_id: component for component in schema.components}
     uses_table = any(
-        component_by_id[component_id].component_type in _TRAVEL_TABLE_COMPONENT_TYPES
-        for component_id in normalized.values()
+        component_by_id[component_id].component_type
+        in _TRAVEL_TABLE_COMPONENT_TYPES | {"DDDateRangeField"}
+        for component_id in (normalized["startDate"], normalized["endDate"])
     )
-    if uses_table and len(set(normalized.values())) != 1:
-        raise _mapping_error("出差开始日期和结束日期必须映射到同一个表格控件")
+    if uses_table and normalized["startDate"] != normalized["endDate"]:
+        raise _mapping_error("出差开始日期和结束日期必须映射到同一个表格控件或同一个日期区间控件")
     return normalized
 
 
@@ -626,6 +675,46 @@ def _validate_mapping(
     return normalized
 
 
+def validate_travel_type_mappings(
+    schema: FormSchema,
+    mappings: dict[str, str],
+    options: dict[str, FormOption] | None,
+    reimbursement_schema: FormSchema,
+    reimbursement_mappings: dict[str, str],
+) -> dict[str, FormOption] | None:
+    component_id = mappings.get("travelType")
+    if component_id is None and options is None:
+        return None
+    component = next(
+        (item for item in schema.components if item.component_id == component_id), None
+    )
+    if component is None or not component.options or not isinstance(options, dict):
+        raise _mapping_error("按出差类别对应时，必须选择来源控件并配置每个选项")
+    source_values = [item.value for item in component.options]
+    if len(source_values) != len(set(source_values)) or set(options) != set(source_values):
+        raise _mapping_error("出差类别选项对应关系必须完整且唯一")
+    return {
+        key: validate_exact_travel_type_option(reimbursement_schema, reimbursement_mappings, option)
+        for key, option in options.items()
+    }
+
+
+def _stored_type_mappings(stored: dict[str, object]) -> dict[str, FormOption] | None:
+    raw = stored.get("travelTypeMappings")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise _configuration_error()
+    return {key: _option_from_value(value) for key, value in raw.items()}
+
+
+def _profile_keys_valid(stored: dict[str, object]) -> bool:
+    return set(stored) in (
+        _TRAVEL_PROFILE_JSON_KEYS,
+        _TRAVEL_PROFILE_JSON_KEYS | {"travelTypeMappings"},
+    )
+
+
 def validate_exact_travel_type_option(
     reimbursement_schema: FormSchema,
     reimbursement_mappings: dict[str, str],
@@ -658,8 +747,8 @@ def validate_related_approval_configuration(
     allowed_travel_process_codes: list[str],
     smoke_test_confirmed: bool,
 ) -> tuple[str, ...]:
-    if not smoke_test_confirmed:
-        raise _relationship_error("必须确认已经完成关联审批冒烟测试")
+    # Historical smoke-test evidence is informational, not a prerequisite for
+    # configuring the first real submission. Keep validating the actual policy.
     if not allowed_travel_process_codes:
         raise _relationship_error("至少配置一个允许关联的出差审批模板")
 
@@ -711,7 +800,7 @@ def _relationship_confirmation_matches_inspection(
             strict=True,
         ):
             if (
-                set(stored) != _TRAVEL_PROFILE_JSON_KEYS
+                not _profile_keys_valid(stored)
                 or stored.get("profileKey") != requested.profile_key
                 or stored.get("processCode") != requested.process_code
             ):
@@ -724,6 +813,13 @@ def _relationship_confirmation_matches_inspection(
                 reimbursement_schema,
                 reimbursement_mapping,
                 _option_from_value(stored.get("travelTypeOption")),
+            )
+            validate_travel_type_mappings(
+                schema,
+                _mapping_from_value(stored.get("mappings")),
+                _stored_type_mappings(stored),
+                reimbursement_schema,
+                reimbursement_mapping,
             )
             allowed_process_codes.append(requested.process_code)
         validate_related_approval_configuration(
@@ -790,6 +886,15 @@ def _travel_profile_api_data(profile: TravelTemplateContract) -> dict[str, objec
         "logicalFields": [item.as_dict() for item in TRAVEL_LOGICAL_FIELD_SPECS],
         "mappings": profile.mappings,
         "travelTypeOption": profile.travel_type_option.as_dict(),
+        **(
+            {
+                "travelTypeMappings": {
+                    key: value.as_dict() for key, value in profile.travel_type_mappings.items()
+                }
+            }
+            if profile.travel_type_mappings is not None
+            else {}
+        ),
     }
 
 
@@ -835,8 +940,8 @@ def _component_incompatibility(
     if component.component_type == "DDSelectField" and not component.options:
         return "对应的选择控件没有可用选项"
     if (
-        spec.key in {"startDate", "endDate"}
-        and component.component_type == "DDDateField"
+        spec.key in {"startDate", "endDate", "durationDays"}
+        and component.component_type in {"DDDateField", "DDDateRangeField"}
         and component.value_format != "yyyy-MM-dd"
     ):
         return "仅支持 yyyy-MM-dd 日期格式"
@@ -1011,6 +1116,15 @@ def _serialize_travel_profiles(profiles: list[TravelTemplateContract]) -> str:
             "schema": profile.schema.as_dict(),
             "mappings": profile.mappings,
             "travelTypeOption": profile.travel_type_option.as_dict(),
+            **(
+                {
+                    "travelTypeMappings": {
+                        key: value.as_dict() for key, value in profile.travel_type_mappings.items()
+                    }
+                }
+                if profile.travel_type_mappings is not None
+                else {}
+            ),
         }
         for profile in profiles
     ]
@@ -1037,7 +1151,7 @@ def _deserialize_travel_profiles(
     seen_keys: set[str] = set()
     seen_codes: set[str] = set()
     for raw_profile in value:
-        if not isinstance(raw_profile, dict) or set(raw_profile) != _TRAVEL_PROFILE_JSON_KEYS:
+        if not isinstance(raw_profile, dict) or not _profile_keys_valid(raw_profile):
             raise _configuration_error()
         try:
             profile_key = raw_profile["profileKey"]
@@ -1091,6 +1205,16 @@ def _deserialize_travel_profiles(
                 start_date_component_id=normalized_mapping["startDate"],
                 end_date_component_id=normalized_mapping["endDate"],
                 travel_type_option=exact_option,
+                company_component_id=normalized_mapping.get("company"),
+                budget_code_component_id=normalized_mapping.get("budgetCode"),
+                travel_type_component_id=normalized_mapping.get("travelType"),
+                travel_type_mappings=validate_travel_type_mappings(
+                    schema,
+                    normalized_mapping,
+                    _stored_type_mappings(raw_profile),
+                    reimbursement_schema,
+                    reimbursement_mapping,
+                ),
             )
         )
     return contracts

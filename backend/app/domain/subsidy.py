@@ -19,6 +19,7 @@ class TripType(StrEnum):
     LONG_TERM_PROJECT = "long_term_project"
     SAME_CITY_PROJECT = "same_city_project"
     INTERNAL = "internal"
+    OVERSEAS = "overseas"
 
     @property
     def requires_confirmation(self) -> bool:
@@ -79,9 +80,13 @@ def calculate_subsidy(
     policy_confirmed: bool = False,
     confirmed_effective_days: Decimal | None = None,
     no_subsidy_exception: bool = False,
+    manual_subsidy_amount: Decimal | None = None,
 ) -> SubsidyCalculation:
     calculated_days = automatic_effective_days(period)
     calendar_days = (period.end_date - period.start_date).days + 1
+
+    if manual_subsidy_amount is not None:
+        raise ApiError("UNEXPECTED_POLICY_OVERRIDE", "出差补助由管理员设置的每日标准计算", 422)
 
     if trip_type is TripType.SHORT_TERM_PROJECT and calendar_days > 30:
         raise ApiError(

@@ -31,6 +31,7 @@ class PdfInspection:
     render_height: int
     embedded_images: int
     embedded_pixels: int
+    page_count: int = 1
 
 
 def _resolved(value: Any) -> Any:
@@ -295,6 +296,7 @@ def inspect_single_page_pdf(
             render_height=render_height,
             embedded_images=resource_inspection.images,
             embedded_pixels=resource_inspection.pixels,
+            page_count=len(reader.pages),
         )
     except ApiError:
         raise

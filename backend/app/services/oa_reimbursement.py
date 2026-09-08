@@ -32,6 +32,7 @@ from app.integrations.dingtalk.workflow import (
     DingTalkProcessInstanceCreateOutcomeUnknown,
     DingTalkProcessInstanceCreateRejected,
     DingTalkWorkflowClient,
+    FormOption,
     WorkflowFormValue,
     WorkflowProcessInstance,
 )
@@ -108,7 +109,11 @@ from app.services.reimbursement_submissions import (
     renew_submission_lease,
     reset_rejected_upload_commit,
 )
-from app.services.travel_approvals import travel_approval_dates
+from app.services.travel_approvals import (
+    travel_accounting_options,
+    travel_approval_dates,
+    travel_instance_type_option,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -459,8 +464,8 @@ class SnapshotSubmissionMaterializer:
             if travel_schema is None:
                 travel_schema = await _call_with_heartbeat(
                     heartbeat,
-                    lambda process_code=profile.process_code: (
-                        self._workflow.get_form_schema(process_code)
+                    lambda process_code=profile.process_code: self._workflow.get_form_schema(
+                        process_code
                     ),
                 )
                 schema_by_process_code[profile.process_code] = travel_schema
@@ -506,8 +511,8 @@ class SnapshotSubmissionMaterializer:
         for related, profile in related_with_profiles:
             instance = await _call_with_heartbeat(
                 heartbeat,
-                lambda instance_id=related.process_instance_id: (
-                    self._workflow.get_process_instance(instance_id)
+                lambda instance_id=related.process_instance_id: self._workflow.get_process_instance(
+                    instance_id
                 ),
             )
             dates = travel_approval_dates(
@@ -527,6 +532,58 @@ class SnapshotSubmissionMaterializer:
                 raise ApiError(
                     "TRAVEL_APPROVAL_MEMBERSHIP_CHANGED",
                     "所选出差审批状态或日期已变化，请重新选择",
+                    409,
+                )
+            # Legacy immutable snapshots predate source accounting mappings.
+            # Resume them under their original contract, retaining all other checks.
+            if snapshot.snapshot_version < 4:
+                continue
+            if snapshot.snapshot_version >= 5:
+                option, source_value, type_reason = travel_instance_type_option(
+                    instance,
+                    source_schema=schema_by_process_code[profile.process_code],
+                    component_id=profile.travel_type_component_id,
+                    mappings=(
+                        {
+                            key: FormOption(**value.model_dump())
+                            for key, value in profile.travel_type_mappings.items()
+                        }
+                        if profile.travel_type_mappings is not None
+                        else None
+                    ),
+                    fixed_option=FormOption(**profile.travel_type_option.model_dump()),
+                )
+                if (
+                    type_reason
+                    or source_value != related.source_travel_type_value
+                    or option is None
+                    or option.as_dict() != snapshot.selections.travel_type.model_dump()
+                ):
+                    raise ApiError(
+                        "TRAVEL_APPROVAL_TYPE_CHANGED",
+                        type_reason or "出差审批类别已变化，请重新关联后提交",
+                        409,
+                    )
+            fields = {field.logical_key: field.component_id for field in snapshot.template.fields}
+            components = {component.component_id: component for component in schema.components}
+            company, budget, reason = travel_accounting_options(
+                instance,
+                source_schema=schema_by_process_code[profile.process_code],
+                company_component_id=profile.company_component_id,
+                budget_code_component_id=profile.budget_code_component_id,
+                company_options=components[fields["company"]].options,
+                budget_options=components[fields["budgetCode"]].options,
+            )
+            if (
+                reason
+                or company is None
+                or budget is None
+                or company.as_dict() != snapshot.selections.company.model_dump()
+                or budget.as_dict() != snapshot.selections.budget_code.model_dump()
+            ):
+                raise ApiError(
+                    "TRAVEL_APPROVAL_ACCOUNTING_CHANGED",
+                    reason or "出差审批的所属公司或预算代码已变化，请重新关联后提交",
                     409,
                 )
         _validate_original_manifest(snapshot, job.uploads)
@@ -932,11 +989,16 @@ class DatabaseSubmissionState:
         snapshot = parse_snapshot(snapshot_json, expected_sha256=snapshot_sha256)
         if snapshot.snapshot_version >= 2:
             self._ensure_generated_file(
-                lease, job, role=ReimbursementUploadRole.GENERATED_PDF, sort_order=0,
+                lease,
+                job,
+                role=ReimbursementUploadRole.GENERATED_PDF,
+                sort_order=0,
                 generate=self._materializer.generate_bundle,
             )
         self._ensure_generated_file(
-            lease, job, role=ReimbursementUploadRole.GENERATED_EXCEL,
+            lease,
+            job,
+            role=ReimbursementUploadRole.GENERATED_EXCEL,
             sort_order=(1 if snapshot.snapshot_version >= 2 else len(snapshot.original_files)),
             generate=self._materializer.generate_excel,
         )
@@ -998,8 +1060,7 @@ class DatabaseSubmissionState:
                 file_name=file_name,
                 role=role,
                 reserved_bytes=len(content),
-                expires_at=_utc_now()
-                + timedelta(seconds=self._generated_reservation_seconds),
+                expires_at=_utc_now() + timedelta(seconds=self._generated_reservation_seconds),
             )
             self._quota.mark_writing(quota_lease, reservation)
             staged = self._staging.write_bytes(
@@ -1206,17 +1267,25 @@ class DatabaseSubmissionState:
                     require_terminal_disposition=True,
                     require_submission_proofs=True,
                 )
-                sources = database.scalars(select(ReimbursementDraftFile).where(
-                    ReimbursementDraftFile.draft_id == submission.draft_id,
-                    ReimbursementDraftFile.file_status == ReimbursementDraftFileStatus.ACTIVE.value,
-                )).all()
+                sources = database.scalars(
+                    select(ReimbursementDraftFile).where(
+                        ReimbursementDraftFile.draft_id == submission.draft_id,
+                        ReimbursementDraftFile.file_status
+                        == ReimbursementDraftFileStatus.ACTIVE.value,
+                    )
+                ).all()
                 actual = {
                     (item.id, item.storage_key, item.size_bytes, item.sha256, item.processing_role)
                     for item in sources
                 }
                 expected = {
-                    (item.draft_file_id, item.storage_key, item.size_bytes, item.sha256,
-                     item.processing_role)
+                    (
+                        item.draft_file_id,
+                        item.storage_key,
+                        item.size_bytes,
+                        item.sha256,
+                        item.processing_role,
+                    )
                     for item in snapshot.original_files
                 }
                 if actual != expected:
@@ -1923,8 +1992,8 @@ class OAReimbursementProcessor:
                 seen.add(instance_id)
                 instance = await _call_with_heartbeat(
                     heartbeat,
-                    lambda candidate_id=instance_id: (
-                        self._workflow.get_process_instance(candidate_id)
+                    lambda candidate_id=instance_id: self._workflow.get_process_instance(
+                        candidate_id
                     ),
                 )
                 if self._materializer.matches_instance(command, instance):
@@ -2168,9 +2237,7 @@ class OAReimbursementProcessor:
             or job.oa_request_json
             or job.oa_request_hash
         )
-        if has_oa_checkpoint or any(
-            upload.status in uncertain_statuses for upload in job.uploads
-        ):
+        if has_oa_checkpoint or any(upload.status in uncertain_statuses for upload in job.uploads):
             await self._transition(
                 lease,
                 to_status=ReimbursementSubmissionStatus.MANUAL_REVIEW,
@@ -2303,9 +2370,7 @@ def _validate_committed_attachment(
 
     name = committed.file_name
     file_type = committed.file_type
-    normalized_type = (
-        file_type.strip().lower().lstrip(".") if isinstance(file_type, str) else ""
-    )
+    normalized_type = file_type.strip().lower().lstrip(".") if isinstance(file_type, str) else ""
     separator = name.rfind(".") if isinstance(name, str) else -1
     name_type = name[separator + 1 :].lower() if separator > 0 else ""
     source_type = source.file_type.lower()
@@ -2330,12 +2395,8 @@ def _validate_committed_attachment(
     ):
         raise DingTalkStorageCommitOutcomeUnknown(
             http_status=200,
-            possible_space_id=(
-                committed.space_id if isinstance(committed.space_id, str) else None
-            ),
-            possible_file_id=(
-                committed.file_id if isinstance(committed.file_id, str) else None
-            ),
+            possible_space_id=(committed.space_id if isinstance(committed.space_id, str) else None),
+            possible_file_id=(committed.file_id if isinstance(committed.file_id, str) else None),
         )
 
 
@@ -2368,10 +2429,7 @@ def strict_instance_matches_command(
             return False
         if actual.name != expected.name or not _form_value_matches(expected, actual):
             return False
-        if (
-            expected.component_type is not None
-            and actual.component_type != expected.component_type
-        ):
+        if expected.component_type is not None and actual.component_type != expected.component_type:
             return False
         if expected.biz_alias is not None and actual.biz_alias != expected.biz_alias:
             return False
@@ -2386,6 +2444,11 @@ def _form_value_matches(
 
     if expected.component_type == "RelateField":
         return _relate_field_matches(expected.value, actual)
+    if expected.component_type == "DDDateRangeField":
+        from app.services.oa_date_range import parse_date_range
+
+        dates = parse_date_range(expected.value)
+        return dates is not None and dates == parse_date_range(actual.value)
     if expected.component_type not in _JSON_FORM_COMPONENT_TYPES:
         return actual.value == expected.value
     if actual.value is None:

@@ -316,7 +316,7 @@ def test_snapshot_is_versioned_canonical_immutable_and_hash_verified() -> None:
 
     serialized = serialize_snapshot(first)
     assert serialized == serialize_snapshot(second)
-    assert json.loads(serialized)["snapshotVersion"] == 3
+    assert json.loads(serialized)["snapshotVersion"] == payloads.SNAPSHOT_VERSION
     assert parse_snapshot(serialized, expected_sha256=snapshot_sha256(first)) == first
     assert len(first.template.fields) == 10
     assert first.template.schema_fingerprint in first.template.schema_canonical_json
@@ -330,6 +330,43 @@ def test_snapshot_is_versioned_canonical_immutable_and_hash_verified() -> None:
     assert json.loads(serialized)["input"]["dismissedOcrFileIds"] == []
     with pytest.raises(ValidationError):
         first.identity.name = "篡改"
+
+
+def test_frozen_version_3_canonical_bytes_and_hash_survive_new_fields():
+    data = (Path(__file__).parent / "fixtures" / "reimbursement_snapshot_v3.json").read_bytes()
+    assert (
+        hashlib.sha256(data).hexdigest()
+        == "d414ff0d7bbc84e19b06851525a8e6ec8c2bbb3e0d96f88787b8e7b621b5cb5f"
+    )
+    raw = data.decode().rstrip("\n")
+    parsed = parse_snapshot(raw, expected_sha256=hashlib.sha256(raw.encode()).hexdigest())
+    assert parsed.snapshot_version == 3
+    assert serialize_snapshot(parsed) == raw
+    assert build_create_command(parsed, _attachments(parsed))
+
+
+@pytest.mark.parametrize("version", [1, 2, 3])
+@pytest.mark.parametrize(
+    "new_field",
+    ["hotel_ids", "hotel_kind", "manual_subsidy", "overseas", "company_mapping", "budget_mapping"],
+)
+def test_legacy_versions_reject_new_semantics_before_hash_omission(version, new_field):
+    snapshot = build_snapshot(_source())
+    value = snapshot.model_dump(mode="json", by_alias=True)
+    value["snapshotVersion"] = version
+    if new_field == "hotel_ids":
+        value["input"]["items"][0]["hotelBillFileIds"] = ["source-file-1"]
+    elif new_field == "hotel_kind":
+        value["originalFiles"][1]["attachmentKind"] = "hotel_bill"
+    elif new_field == "manual_subsidy":
+        value["input"]["trip"]["manualSubsidyAmount"] = "20.00"
+    elif new_field == "overseas":
+        value["input"]["trip"]["tripType"] = "overseas"
+    else:
+        key = "companyComponentId" if new_field == "company_mapping" else "budgetCodeComponentId"
+        value["template"]["travelProfiles"][0][key] = "some-component"
+    with pytest.raises(ValidationError, match="require snapshot version 4"):
+        payloads.ReimbursementSnapshot.model_validate(value)
 
 
 def test_snapshot_parser_rejects_noncanonical_unknown_version_and_wrong_hash() -> None:
@@ -349,6 +386,9 @@ def test_snapshot_parser_rejects_noncanonical_unknown_version_and_wrong_hash() -
 def test_v1_snapshot_canonical_bytes_and_legacy_attachments_remain_readable() -> None:
     value = json.loads(serialize_snapshot(build_snapshot(_source())))
     value["snapshotVersion"] = 1
+    for profile in value["template"]["travelProfiles"]:
+        profile.pop("companyComponentId", None)
+        profile.pop("budgetCodeComponentId", None)
     for item in value["input"]["items"]:
         for key in (
             "itineraryFileIds",
@@ -360,6 +400,7 @@ def test_v1_snapshot_canonical_bytes_and_legacy_attachments_remain_readable() ->
             "requiresCnyConfirmation",
             "paymentProofFileIds",
             "railType",
+            "hotelBillFileIds",
         ):
             item.pop(key)
     for file in value["originalFiles"]:
@@ -397,35 +438,50 @@ def test_old_large_receipt_snapshots_remain_readable_without_new_proof_fields(le
     source.draft_input.items[0].payment_proof_file_ids = ["source-file-1"]
     subsidy = calculate_subsidy(
         trip_type=source.draft_input.trip.subsidy_trip_type(),
-        period=source.draft_input.trip.as_period(), configured_daily_rate=Decimal("180.00"),
+        period=source.draft_input.trip.as_period(),
+        configured_daily_rate=Decimal("180.00"),
     )
     totals = calculate_expense_totals(source.draft_input.items, subsidy).as_api_dict()
     totals["subsidy"] = subsidy.as_api_dict()
     source = replace(
-        source, totals_data=totals,
-        original_files=(source.original_files[0], replace(
-            source.original_files[1], attachment_kind="payment_proof",
-        )),
+        source,
+        totals_data=totals,
+        original_files=(
+            source.original_files[0],
+            replace(
+                source.original_files[1],
+                attachment_kind="payment_proof",
+            ),
+        ),
     )
     current = build_snapshot(source)
     value = json.loads(serialize_snapshot(current))
     value["snapshotVersion"] = legacy_version
+    for profile in value["template"]["travelProfiles"]:
+        profile.pop("companyComponentId", None)
+        profile.pop("budgetCodeComponentId", None)
     value["input"]["items"][0]["receiptCount"] = 2
     value["totals"]["receiptCount"] += 1
     for item in value["input"]["items"]:
-        for field in ("paymentProofFileIds", "railType"):
+        for field in ("paymentProofFileIds", "railType", "hotelBillFileIds"):
             item.pop(field)
         if legacy_version == 1:
             for field in (
-                "itineraryFileIds", "requiresItinerary", "transportType", "originalCurrency",
-                "originalAmount", "cnyAmountConfirmed", "requiresCnyConfirmation",
+                "itineraryFileIds",
+                "requiresItinerary",
+                "transportType",
+                "originalCurrency",
+                "originalAmount",
+                "cnyAmountConfirmed",
+                "requiresCnyConfirmation",
             ):
                 item.pop(field)
     for file in value["originalFiles"]:
         file.pop("attachmentKind")
     historical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     restored = parse_snapshot(
-        historical, expected_sha256=hashlib.sha256(historical.encode()).hexdigest(),
+        historical,
+        expected_sha256=hashlib.sha256(historical.encode()).hexdigest(),
     )
     assert serialize_snapshot(restored) == historical
     assert restored.input.items[0].amount == Decimal("600.00")
@@ -713,7 +769,9 @@ def test_collect_snapshot_source_reads_review_ready_state_without_mutating(
     catalog = _catalog()
     monkeypatch.setattr(payloads, "require_submission_ready_catalog", lambda _db: catalog)
     now = utc_now()
-    draft_input = _draft_input(trip=False, source_file_id="snapshot-source-file")
+    draft_input = _draft_input(trip=False, source_file_id="snapshot-source-file").model_copy(
+        update={"accounting_source_verified": True}
+    )
     actor = DraftActor(
         corp_id="corp-fixed",
         user_id="employee-1",
@@ -801,7 +859,9 @@ def test_collect_snapshot_source_reads_review_ready_state_without_mutating(
         unlinked_calculation = validate_and_calculate_input(
             database,
             catalog=catalog,
-            draft_input=_draft_input(trip=False, source_file_id=None),
+            draft_input=_draft_input(trip=False, source_file_id=None).model_copy(
+                update={"accounting_source_verified": True}
+            ),
             max_items=100,
             validate_project=True,
         )

@@ -1,14 +1,27 @@
 <script setup lang="ts">
+import { computed } from 'vue'
+
 import { useExpenseStore } from '@/stores/expense'
 import type { TripType } from '@/types/expenses'
+import { TRIP_PERIOD_TIME, tripPeriodFromTime, type TripDayPeriod } from '@/utils/tripPeriod'
 
+const props = withDefaults(defineProps<{ readonly?: boolean }>(), { readonly: false })
 const expense = useExpenseStore()
+const departurePeriod = computed<TripDayPeriod | undefined>({
+  get: () => tripPeriodFromTime(expense.trip.startTime),
+  set: (period) => { if (period) expense.trip.startTime = TRIP_PERIOD_TIME[period] },
+})
+const returnPeriod = computed<TripDayPeriod | undefined>({
+  get: () => tripPeriodFromTime(expense.trip.endTime),
+  set: (period) => { if (period) expense.trip.endTime = TRIP_PERIOD_TIME[period] },
+})
 
 const tripTypes: Array<{ id: TripType; name: string }> = [
-  { id: 'business', name: '商务出差' },
-  { id: 'project', name: '市外项目' },
-  { id: 'same_city_project', name: '同市项目' },
+  { id: 'business', name: '境内商务出差' },
+  { id: 'project', name: '境内市外项目' },
+  { id: 'same_city_project', name: '境内同市项目' },
   { id: 'internal', name: '公司内部出差' },
+  { id: 'overseas', name: '境外出差' },
 ]
 </script>
 
@@ -20,7 +33,10 @@ const tripTypes: Array<{ id: TripType; name: string }> = [
     <template #header>
       <strong>出差补助（可选）</strong>
     </template>
-    <el-form label-position="top">
+    <el-form
+      label-position="top"
+      :disabled="props.readonly"
+    >
       <el-form-item label="是否申请出差补助">
         <el-switch
           :model-value="expense.includeSubsidy"
@@ -60,13 +76,18 @@ const tripTypes: Array<{ id: TripType; name: string }> = [
               class="full-width"
             />
           </el-form-item>
-          <el-form-item label="出发时间">
-            <el-time-picker
-              v-model="expense.trip.startTime"
-              format="HH:mm"
-              value-format="HH:mm"
-              class="full-width"
-            />
+          <el-form-item label="出发时段">
+            <el-radio-group
+              v-model="departurePeriod"
+              aria-label="出发时段"
+            >
+              <el-radio-button value="morning">
+                上午
+              </el-radio-button>
+              <el-radio-button value="afternoon">
+                下午
+              </el-radio-button>
+            </el-radio-group>
           </el-form-item>
           <el-form-item label="返回日期">
             <el-date-picker
@@ -76,13 +97,18 @@ const tripTypes: Array<{ id: TripType; name: string }> = [
               class="full-width"
             />
           </el-form-item>
-          <el-form-item label="返回时间">
-            <el-time-picker
-              v-model="expense.trip.endTime"
-              format="HH:mm"
-              value-format="HH:mm"
-              class="full-width"
-            />
+          <el-form-item label="返回时段">
+            <el-radio-group
+              v-model="returnPeriod"
+              aria-label="返回时段"
+            >
+              <el-radio-button value="morning">
+                上午
+              </el-radio-button>
+              <el-radio-button value="afternoon">
+                下午
+              </el-radio-button>
+            </el-radio-group>
           </el-form-item>
         </div>
         <el-alert
@@ -100,7 +126,7 @@ const tripTypes: Array<{ id: TripType; name: string }> = [
         <el-alert
           v-if="!expense.requiresPolicyConfirmation"
           title="自动计算规则"
-          description="出发日 12:00 前计 1 天、12:00（含）以后计 0.5 天；返回日 12:00 前计 0.5 天、12:00（含）以后计 1 天。同日从 12:00 前跨至 12:00（含）以后计 1 天，否则计 0.5 天。"
+          description="出发日：上午计 1 天，下午计 0.5 天；返回日：上午计 0.5 天，下午计 1 天。同一天上午出发、下午返回计 1 天，同一时段往返计 0.5 天。上午指 12:00 前，下午指 12:00 及以后。"
           type="info"
           :closable="false"
         />
@@ -150,7 +176,7 @@ const tripTypes: Array<{ id: TripType; name: string }> = [
         <span>自然日 {{ expense.totals.subsidy.calendarDays }} 天</span>
         <span>有效 {{ expense.totals.subsidy.effectiveDays }} 天</span>
         <span>¥{{ expense.totals.subsidy.dailyRate }} / 天</span>
-        <strong>补助 ¥{{ expense.totals.subsidy.total }}</strong>
+        <strong>补助 ¥{{ expense.displaySubsidyTotal }}</strong>
       </div>
     </el-form>
   </el-card>

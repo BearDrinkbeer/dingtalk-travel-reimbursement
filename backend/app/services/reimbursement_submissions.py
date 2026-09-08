@@ -81,6 +81,53 @@ class ReimbursementSubmissionConflict(RuntimeError):
     """A submission or upload changed since the caller's CAS snapshot."""
 
 
+def request_submission_recheck(
+    database: Session, *, actor: DraftActor, submission_id: str
+) -> ReimbursementSubmission:
+    """Resume only readback of an already-known OA; never enqueue creation."""
+    from app.services.oa_reimbursement_payload import parse_create_command
+
+    current = require_owned_submission(database, actor=actor, submission_id=submission_id)
+    if current.status in {"SUBMITTED", "VERIFYING"}:
+        return current
+    if current.status != "MANUAL_REVIEW" or not current.process_instance_id:
+        raise ApiError("OA_RECHECK_NOT_ALLOWED", "没有可重新核对的已创建审批，请联系管理员", 409)
+    if (
+        not current.oa_request_json
+        or not current.oa_request_hash
+        or not current.oa_create_started_at
+    ):
+        raise ApiError("OA_CREATE_CHECKPOINT_MISSING", "审批提交快照缺失，请联系管理员", 409)
+    parse_create_command(current.oa_request_json, expected_sha256=current.oa_request_hash)
+    now = utc_now()
+    changed = database.execute(
+        update(ReimbursementSubmission)
+        .where(
+            ReimbursementSubmission.id == current.id,
+            ReimbursementSubmission.status == "MANUAL_REVIEW",
+            ReimbursementSubmission.status_version == current.status_version,
+            ReimbursementSubmission.process_instance_id == current.process_instance_id,
+            ReimbursementSubmission.lease_token.is_(None),
+        )
+        .values(
+            status="VERIFYING",
+            resume_status=None,
+            status_version=current.status_version + 1,
+            next_attempt_at=now,
+            last_error_code=None,
+            last_error_message=None,
+            updated_at=now,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if changed.rowcount != 1:
+        database.rollback()
+        raise ApiError("OA_RECHECK_CONFLICT", "提交状态已变化，请刷新后重试", 409)
+    database.commit()
+    database.expire_all()
+    return require_owned_submission(database, actor=actor, submission_id=submission_id)
+
+
 @dataclass(frozen=True, slots=True)
 class SubmissionCreateResult:
     submission_id: str
@@ -216,8 +263,7 @@ def create_submission(
         select(ReimbursementDraftFile)
         .where(
             ReimbursementDraftFile.draft_id == draft.id,
-            ReimbursementDraftFile.file_status
-            == ReimbursementDraftFileStatus.ACTIVE.value,
+            ReimbursementDraftFile.file_status == ReimbursementDraftFileStatus.ACTIVE.value,
         )
         .order_by(ReimbursementDraftFile.sort_order, ReimbursementDraftFile.id)
     ).all()
@@ -348,9 +394,7 @@ def create_submission(
             draft_id=normalized_draft_id,
         )
         if existing is None:
-            raise ReimbursementSubmissionConflict(
-                "submission creation lost its draft CAS"
-            ) from exc
+            raise ReimbursementSubmissionConflict("submission creation lost its draft CAS") from exc
         return _create_result(existing, created=False, idempotency_hash=idempotency_hash)
     except Exception:
         database.rollback()
@@ -565,9 +609,7 @@ def release_submission_lease(
 ) -> int:
     normalized_worker = _required_text(worker_id, maximum=128)
     released_at = _naive_utc(now) if now is not None else utc_now()
-    next_attempt = (
-        _naive_utc(next_attempt_at) if next_attempt_at is not None else None
-    )
+    next_attempt = _naive_utc(next_attempt_at) if next_attempt_at is not None else None
     new_version = lease.expected_status_version + 1
     result = database.execute(
         update(ReimbursementSubmission)
@@ -666,9 +708,7 @@ def checkpoint_oa_create(
             "OA create requires an original/generated upload manifest"
         )
     _require_bundle_manifest(current, uploads)
-    if any(
-        item.upload_status != ReimbursementUploadStatus.COMMITTED.value for item in uploads
-    ):
+    if any(item.upload_status != ReimbursementUploadStatus.COMMITTED.value for item in uploads):
         raise ReimbursementSubmissionConflict("OA create requires every upload to be committed")
     return _leased_submission_update(
         database,
@@ -1059,9 +1099,7 @@ def begin_upload_put(
         ReimbursementUploadStatus.PUTTING.value,
         ReimbursementUploadStatus.PUT_DONE.value,
     }:
-        raise ValueError(
-            "upload PUT can only start from PENDING or restart PUTTING/PUT_DONE"
-        )
+        raise ValueError("upload PUT can only start from PENDING or restart PUTTING/PUT_DONE")
     return _upload_update(
         database,
         upload=upload,
@@ -1288,8 +1326,7 @@ def mark_upload_commit_uncertain(
                 ReimbursementUpload.id == upload.id,
                 ReimbursementUpload.submission_id == lease.submission_id,
                 ReimbursementUpload.status_version == expected_status_version,
-                ReimbursementUpload.upload_status
-                == ReimbursementUploadStatus.COMMITTING.value,
+                ReimbursementUpload.upload_status == ReimbursementUploadStatus.COMMITTING.value,
             )
             .values(
                 upload_status=ReimbursementUploadStatus.COMMIT_UNCERTAIN.value,
@@ -1435,7 +1472,8 @@ def remove_discarded_generated_upload(
         now=changed_at,
     )
     if (
-        upload.role not in {
+        upload.role
+        not in {
             ReimbursementUploadRole.GENERATED_EXCEL.value,
             ReimbursementUploadRole.GENERATED_PDF.value,
         }
@@ -1455,10 +1493,8 @@ def remove_discarded_generated_upload(
                 ReimbursementUpload.submission_id == lease.submission_id,
                 ReimbursementUpload.status_version == expected_status_version,
                 ReimbursementUpload.role == upload.role,
-                ReimbursementUpload.upload_status
-                == ReimbursementUploadStatus.DISCARDED.value,
-                ReimbursementUpload.local_status
-                == ReimbursementUploadLocalStatus.DELETED.value,
+                ReimbursementUpload.upload_status == ReimbursementUploadStatus.DISCARDED.value,
+                ReimbursementUpload.local_status == ReimbursementUploadLocalStatus.DELETED.value,
                 ReimbursementUpload.local_deleted_at.is_not(None),
                 ReimbursementUpload.space_id.is_(None),
                 ReimbursementUpload.file_id.is_(None),
@@ -1563,8 +1599,7 @@ def list_due_linked_local_release_candidates(
             or_(
                 and_(
                     ReimbursementSubmission.process_instance_id.is_not(None),
-                    ReimbursementUpload.upload_status
-                    == ReimbursementUploadStatus.LINKED.value,
+                    ReimbursementUpload.upload_status == ReimbursementUploadStatus.LINKED.value,
                 ),
                 and_(
                     ReimbursementSubmission.process_instance_id.is_(None),
@@ -1574,8 +1609,7 @@ def list_due_linked_local_release_candidates(
                             ReimbursementSubmissionStatus.FAILED_FINAL.value,
                         }
                     ),
-                    ReimbursementUpload.upload_status
-                    == ReimbursementUploadStatus.CLEANED.value,
+                    ReimbursementUpload.upload_status == ReimbursementUploadStatus.CLEANED.value,
                 ),
                 and_(
                     ReimbursementSubmission.process_instance_id.is_(None),
@@ -1585,9 +1619,7 @@ def list_due_linked_local_release_candidates(
                     ReimbursementDraft.status == ReimbursementDraftStatus.LOCKED.value,
                     ReimbursementDraft.locked_at.is_not(None),
                     ReimbursementDraft.expires_at <= release_at,
-                    ReimbursementUpload.upload_status.in_(
-                        _FAILED_FINAL_LOCAL_DISCARD_STATUSES
-                    ),
+                    ReimbursementUpload.upload_status.in_(_FAILED_FINAL_LOCAL_DISCARD_STATUSES),
                     ReimbursementUpload.space_id.is_(None),
                     ReimbursementUpload.file_id.is_(None),
                     ReimbursementUpload.commit_started_at.is_(None),
@@ -1664,8 +1696,7 @@ def finalize_local_upload_release(
             or_(
                 and_(
                     ReimbursementSubmission.process_instance_id.is_not(None),
-                    ReimbursementUpload.upload_status
-                    == ReimbursementUploadStatus.LINKED.value,
+                    ReimbursementUpload.upload_status == ReimbursementUploadStatus.LINKED.value,
                 ),
                 and_(
                     ReimbursementSubmission.process_instance_id.is_(None),
@@ -1675,8 +1706,7 @@ def finalize_local_upload_release(
                             ReimbursementSubmissionStatus.FAILED_FINAL.value,
                         }
                     ),
-                    ReimbursementUpload.upload_status
-                    == ReimbursementUploadStatus.CLEANED.value,
+                    ReimbursementUpload.upload_status == ReimbursementUploadStatus.CLEANED.value,
                 ),
                 and_(
                     ReimbursementSubmission.process_instance_id.is_(None),
@@ -1686,9 +1716,7 @@ def finalize_local_upload_release(
                     ReimbursementDraft.status == ReimbursementDraftStatus.LOCKED.value,
                     ReimbursementDraft.locked_at.is_not(None),
                     ReimbursementDraft.expires_at <= deleted_at,
-                    ReimbursementUpload.upload_status.in_(
-                        _FAILED_FINAL_LOCAL_DISCARD_STATUSES
-                    ),
+                    ReimbursementUpload.upload_status.in_(_FAILED_FINAL_LOCAL_DISCARD_STATUSES),
                     ReimbursementUpload.space_id.is_(None),
                     ReimbursementUpload.file_id.is_(None),
                     ReimbursementUpload.commit_started_at.is_(None),
@@ -1713,15 +1741,13 @@ def finalize_local_upload_release(
                 ReimbursementUpload.id == normalized_upload,
                 ReimbursementUpload.submission_id == normalized_submission,
                 ReimbursementUpload.status_version == expected_status_version + 1,
-                ReimbursementUpload.local_status
-                == ReimbursementUploadLocalStatus.DELETED.value,
+                ReimbursementUpload.local_status == ReimbursementUploadLocalStatus.DELETED.value,
                 ReimbursementSubmission.corp_id == normalized_corp,
                 ReimbursementSubmission.originator_user_id == normalized_user,
                 or_(
                     and_(
                         ReimbursementSubmission.process_instance_id.is_not(None),
-                        ReimbursementUpload.upload_status
-                        == ReimbursementUploadStatus.LINKED.value,
+                        ReimbursementUpload.upload_status == ReimbursementUploadStatus.LINKED.value,
                     ),
                     and_(
                         ReimbursementSubmission.process_instance_id.is_(None),
@@ -1739,8 +1765,7 @@ def finalize_local_upload_release(
                         ReimbursementSubmission.oa_create_started_at.is_(None),
                         ReimbursementSubmission.status
                         == ReimbursementSubmissionStatus.FAILED_FINAL.value,
-                        ReimbursementDraft.status
-                        == ReimbursementDraftStatus.LOCKED.value,
+                        ReimbursementDraft.status == ReimbursementDraftStatus.LOCKED.value,
                         ReimbursementDraft.locked_at.is_not(None),
                         ReimbursementDraft.expires_at <= deleted_at,
                         ReimbursementUpload.commit_started_at.is_(None),
@@ -1763,8 +1788,7 @@ def finalize_local_upload_release(
                     ReimbursementDraftFile.id == upload.source_draft_file_id,
                     ReimbursementDraftFile.draft_id == upload.draft_id,
                     ReimbursementDraftFile.storage_key == upload.local_storage_key,
-                    ReimbursementDraftFile.file_status
-                    == ReimbursementDraftFileStatus.ACTIVE.value,
+                    ReimbursementDraftFile.file_status == ReimbursementDraftFileStatus.ACTIVE.value,
                     ReimbursementDraftFile.size_bytes == upload.size_bytes,
                     ReimbursementDraftFile.sha256 == upload.sha256,
                 )
@@ -1809,8 +1833,7 @@ def finalize_local_upload_release(
                             ReimbursementSubmission.oa_create_started_at.is_(None),
                             ReimbursementSubmission.status
                             == ReimbursementSubmissionStatus.FAILED_FINAL.value,
-                            ReimbursementDraft.status
-                            == ReimbursementDraftStatus.LOCKED.value,
+                            ReimbursementDraft.status == ReimbursementDraftStatus.LOCKED.value,
                             ReimbursementDraft.locked_at.is_not(None),
                             ReimbursementDraft.expires_at <= deleted_at,
                         )
@@ -1856,20 +1879,26 @@ def _bundled_source_release_query():
             ReimbursementDraftFile.file_status == ReimbursementDraftFileStatus.ACTIVE.value,
             ReimbursementDraftFile.size_bytes.is_not(None),
             ReimbursementDraftFile.sha256.is_not(None),
-            ~exists(select(ReimbursementUpload.id).where(
-                ReimbursementUpload.submission_id == ReimbursementSubmission.id,
-                ReimbursementUpload.upload_status != ReimbursementUploadStatus.LINKED.value,
-            )),
-            exists(select(ReimbursementUpload.id).where(
-                ReimbursementUpload.submission_id == ReimbursementSubmission.id,
-                ReimbursementUpload.role == ReimbursementUploadRole.GENERATED_PDF.value,
-                ReimbursementUpload.upload_status == ReimbursementUploadStatus.LINKED.value,
-            )),
-            exists(select(ReimbursementUpload.id).where(
-                ReimbursementUpload.submission_id == ReimbursementSubmission.id,
-                ReimbursementUpload.role == ReimbursementUploadRole.GENERATED_EXCEL.value,
-                ReimbursementUpload.upload_status == ReimbursementUploadStatus.LINKED.value,
-            )),
+            ~exists(
+                select(ReimbursementUpload.id).where(
+                    ReimbursementUpload.submission_id == ReimbursementSubmission.id,
+                    ReimbursementUpload.upload_status != ReimbursementUploadStatus.LINKED.value,
+                )
+            ),
+            exists(
+                select(ReimbursementUpload.id).where(
+                    ReimbursementUpload.submission_id == ReimbursementSubmission.id,
+                    ReimbursementUpload.role == ReimbursementUploadRole.GENERATED_PDF.value,
+                    ReimbursementUpload.upload_status == ReimbursementUploadStatus.LINKED.value,
+                )
+            ),
+            exists(
+                select(ReimbursementUpload.id).where(
+                    ReimbursementUpload.submission_id == ReimbursementSubmission.id,
+                    ReimbursementUpload.role == ReimbursementUploadRole.GENERATED_EXCEL.value,
+                    ReimbursementUpload.upload_status == ReimbursementUploadStatus.LINKED.value,
+                )
+            ),
         )
     )
 
@@ -1895,9 +1924,15 @@ def list_due_bundled_source_release_candidates(
             for entry in snapshot_files
         ):
             continue
-        candidates.append(BundledSourceReleaseCandidate(
-            submission.id, source.id, source.storage_key, int(source.size_bytes), str(source.sha256)
-        ))
+        candidates.append(
+            BundledSourceReleaseCandidate(
+                submission.id,
+                source.id,
+                source.storage_key,
+                int(source.size_bytes),
+                str(source.sha256),
+            )
+        )
     database.rollback()
     return tuple(candidates)
 
@@ -1906,13 +1941,15 @@ def finalize_bundled_source_release(
     database: Session, *, candidate: BundledSourceReleaseCandidate, now: datetime | None = None
 ) -> None:
     changed_at = _naive_utc(now) if now is not None else utc_now()
-    row = database.execute(_bundled_source_release_query().where(
-        ReimbursementSubmission.id == candidate.submission_id,
-        ReimbursementDraftFile.id == candidate.file_id,
-        ReimbursementDraftFile.storage_key == candidate.storage_key,
-        ReimbursementDraftFile.size_bytes == candidate.size_bytes,
-        ReimbursementDraftFile.sha256 == candidate.sha256,
-    )).first()
+    row = database.execute(
+        _bundled_source_release_query().where(
+            ReimbursementSubmission.id == candidate.submission_id,
+            ReimbursementDraftFile.id == candidate.file_id,
+            ReimbursementDraftFile.storage_key == candidate.storage_key,
+            ReimbursementDraftFile.size_bytes == candidate.size_bytes,
+            ReimbursementDraftFile.sha256 == candidate.sha256,
+        )
+    ).first()
     if row is None:
         database.rollback()
         raise ReimbursementSubmissionConflict("bundled source release candidate changed")
@@ -1964,8 +2001,7 @@ def recover_expired_submission_leases(
                 select(ReimbursementUpload).where(
                     ReimbursementUpload.submission_id == candidate.id,
                     ReimbursementUpload.draft_id == candidate.draft_id,
-                    ReimbursementUpload.upload_status
-                    == ReimbursementUploadStatus.COMMITTING.value,
+                    ReimbursementUpload.upload_status == ReimbursementUploadStatus.COMMITTING.value,
                 )
             ).all()
             if not committing:
@@ -1975,10 +2011,8 @@ def recover_expired_submission_leases(
                 .where(
                     ReimbursementSubmission.id == candidate.id,
                     ReimbursementSubmission.corp_id == candidate.corp_id,
-                    ReimbursementSubmission.originator_user_id
-                    == candidate.originator_user_id,
-                    ReimbursementSubmission.status
-                    == ReimbursementSubmissionStatus.UPLOADING.value,
+                    ReimbursementSubmission.originator_user_id == candidate.originator_user_id,
+                    ReimbursementSubmission.status == ReimbursementSubmissionStatus.UPLOADING.value,
                     ReimbursementSubmission.status_version == candidate.status_version,
                     or_(
                         ReimbursementSubmission.lease_expires_at.is_(None),
@@ -2008,8 +2042,7 @@ def recover_expired_submission_leases(
                 .where(
                     ReimbursementUpload.submission_id == candidate.id,
                     ReimbursementUpload.draft_id == candidate.draft_id,
-                    ReimbursementUpload.upload_status
-                    == ReimbursementUploadStatus.COMMITTING.value,
+                    ReimbursementUpload.upload_status == ReimbursementUploadStatus.COMMITTING.value,
                 )
                 .values(
                     upload_status=ReimbursementUploadStatus.COMMIT_UNCERTAIN.value,
@@ -2032,8 +2065,7 @@ def recover_expired_submission_leases(
                 ReimbursementSubmission.id == candidate.id,
                 ReimbursementSubmission.corp_id == candidate.corp_id,
                 ReimbursementSubmission.originator_user_id == candidate.originator_user_id,
-                ReimbursementSubmission.status
-                == ReimbursementSubmissionStatus.OA_CREATING.value,
+                ReimbursementSubmission.status == ReimbursementSubmissionStatus.OA_CREATING.value,
                 ReimbursementSubmission.status_version == candidate.status_version,
                 or_(
                     ReimbursementSubmission.lease_expires_at.is_(None),
@@ -2317,12 +2349,10 @@ def _lease_conditions(
     return (
         ReimbursementSubmission.id == _required_text(lease.submission_id, maximum=36),
         ReimbursementSubmission.corp_id == _required_text(lease.corp_id, maximum=128),
-        ReimbursementSubmission.originator_user_id
-        == _required_text(lease.user_id, maximum=128),
+        ReimbursementSubmission.originator_user_id == _required_text(lease.user_id, maximum=128),
         ReimbursementSubmission.status_version == lease.expected_status_version,
         ReimbursementSubmission.lease_owner == _required_text(worker_id, maximum=128),
-        ReimbursementSubmission.lease_token
-        == _required_text(lease.lease_token, maximum=64),
+        ReimbursementSubmission.lease_token == _required_text(lease.lease_token, maximum=64),
         ReimbursementSubmission.lease_expires_at.is_not(None),
         ReimbursementSubmission.lease_expires_at > now,
     )
@@ -2388,10 +2418,7 @@ def _require_review_ready_draft(
             "草稿已在其他页面更新，请刷新后重试",
             409,
         )
-    if (
-        draft.status != ReimbursementDraftStatus.REVIEW_READY.value
-        or draft.locked_at is not None
-    ):
+    if draft.status != ReimbursementDraftStatus.REVIEW_READY.value or draft.locked_at is not None:
         raise ApiError(
             "REIMBURSEMENT_DRAFT_NOT_READY",
             "请先完成检查并确认报销内容",

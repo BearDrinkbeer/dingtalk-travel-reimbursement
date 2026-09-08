@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import re
+from contextlib import ExitStack
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -9,11 +11,20 @@ from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
 from app.core.errors import ApiError
-from app.ocr.engine import OcrRuntimeError, PaddleLocalOcrEngine
+from app.ocr.engine import OcrRuntimeError
+from app.ocr.extractors import normalized_lines
 from app.ocr.itinerary import ItineraryPage, parse_itinerary_pages
+from app.ocr.itinerary_pdf import positioned_itinerary_layout
 from app.ocr.pdf_inspection import PdfLimits, inspect_single_page_pdf
-from app.ocr.types import LocalOcrEngine, OcrLine
-from app.ocr.workers import WorkerOcrSettings, apply_worker_limits
+from app.ocr.qr import decode_invoice_qr
+from app.ocr.receipt_evidence import merge_pdf_ocr_lines, needs_pdf_ocr_fallback
+from app.ocr.types import LocalOcrEngine, OcrLine, ParseContext, ReceiptKeywordRule
+from app.ocr.workers import (
+    WorkerOcrSettings,
+    _append_passenger_fields,
+    apply_worker_limits,
+    cached_ocr_engine,
+)
 
 MAX_ITINERARY_PAGES = 30
 MAX_SCANNED_PAGES = 5
@@ -38,6 +49,8 @@ def recognize_itinerary_worker(
     raw_worker_limits: dict[str, int],
     reference_year: int | None,
     fake_engine: LocalOcrEngine | None = None,
+    classify: bool = False,
+    keyword_rules: tuple[ReceiptKeywordRule, ...] | None = None,
 ) -> dict[str, object]:
     """One bounded process for the entire document; raw text never leaves it."""
 
@@ -56,8 +69,66 @@ def recognize_itinerary_worker(
         scanned_count = 0
         characters = 0
         engine = fake_engine
+        receipt_context: ParseContext | None = None
+
+        def expense_context() -> ParseContext:
+            nonlocal receipt_context
+            if receipt_context is None:
+                receipt_context = ParseContext(
+                    reference_year=reference_year or date.today().year,
+                    invoice_qr=decode_invoice_qr(
+                        Path(path),
+                        extension,
+                        render_dpi=limits.render_dpi,
+                    )
+                    if page_count == 1
+                    else None,
+                )
+            return receipt_context
+
+        def scan_page(index: int) -> tuple[tuple[OcrLine, ...], str]:
+            nonlocal engine
+            if engine is None:
+                detection = raw_ocr_settings.get("ocr_detection_model_dir")
+                recognition = raw_ocr_settings.get("ocr_recognition_model_dir")
+                if not detection or not recognition:
+                    raise OcrRuntimeError("本地 OCR 模型未配置")
+                engine = cached_ocr_engine(
+                    WorkerOcrSettings(
+                        Path(detection),
+                        Path(recognition),
+                        str(raw_ocr_settings["ocr_engine"]),
+                        int(raw_ocr_settings["ocr_cpu_threads"]),
+                    )
+                )
+            if engine.is_fake:
+                found = tuple(engine.recognize(path))
+                return found, "\n".join(line.text for line in found)
+            if reader is None:
+                found, scanned_layout = engine.recognize_itinerary(path)
+                return tuple(found), scanned_layout
+            import numpy as np
+            import pypdfium2 as pdfium
+
+            document = pdfium.PdfDocument(path)
+            try:
+                page = document[index]
+                try:
+                    bitmap = page.render(scale=limits.render_dpi / 72)
+                    try:
+                        pixels = np.asarray(bitmap.to_pil().convert("RGB"))
+                        found, scanned_layout = engine.recognize_itinerary(pixels)
+                        return tuple(found), scanned_layout
+                    finally:
+                        bitmap.close()
+                finally:
+                    page.close()
+            finally:
+                document.close()
+
         for index in range(page_count):
             text, layout = "", ""
+            native_receipt_lines: list[OcrLine] = []
             if reader is not None:
                 pdf_logger = logging.getLogger("pypdf")
                 previous = pdf_logger.level
@@ -68,11 +139,47 @@ def recognize_itinerary_worker(
                         layout = reader.pages[index].extract_text(extraction_mode="layout") or ""
                     except (PdfReadError, OSError, ValueError, TypeError, KeyError, OverflowError):
                         text, layout = "", ""
+                        # Some electronic tickets declare the same font stream
+                        # twice. PDFium can read them without modifying the PDF.
+                        import pypdfium2 as pdfium
+
+                        with ExitStack() as resources:
+                            document = pdfium.PdfDocument(path)
+                            resources.callback(document.close)
+                            page = document[index]
+                            resources.callback(page.close)
+                            textpage = page.get_textpage()
+                            resources.callback(textpage.close)
+                            if textpage.count_chars() <= MAX_TEXT_CHARACTERS:
+                                text = textpage.get_text_range()
+                                layout = text
                 finally:
                     pdf_logger.setLevel(previous)
             source = "pdf_text"
             native_enough = _native_page_has_evidence(text)
-            if native_enough and reader is not None and inspection.embedded_images:
+            # Continuation tables often omit the title, year and total. Keep
+            # their native text when the preceding document supplies the range.
+            continuation = False
+            if pages and all(label in text for label in ("上车时间", "起点", "终点", "金额")):
+                candidate_page = ItineraryPage(
+                    index + 1,
+                    tuple(OcrLine(t.strip(), 1) for t in text.splitlines() if t.strip()),
+                    layout,
+                    "pdf_text",
+                )
+                continuation_result = parse_itinerary_pages(
+                    [*pages, candidate_page],
+                    page_count=index + 1,
+                    reference_year=reference_year,
+                )
+                continuation = (
+                    any(trip.page == index + 1 for trip in continuation_result.trips)
+                    and "ITINERARY_NOT_RECOGNIZED" not in continuation_result.warnings
+                    and "ITINERARY_ROWS_INCOMPLETE" not in continuation_result.warnings
+                )
+                native_enough = native_enough or continuation
+            candidate_kind = None
+            if native_enough and reader is not None and (classify or inspection.embedded_images):
                 candidate = ItineraryPage(
                     index + 1,
                     tuple(OcrLine(line.strip(), 1) for line in text.splitlines() if line.strip()),
@@ -81,11 +188,77 @@ def recognize_itinerary_worker(
                 )
                 # Native headings/totals over a scanned table do not mean that
                 # its rows have been read. Scan within the same five-page cap.
-                native_enough = bool(
-                    parse_itinerary_pages(
-                        [candidate], page_count=1, reference_year=reference_year
-                    ).trips
+                if classify:
+                    from app.ocr.materials import classify_material
+                    from app.ocr.parsers import ReceiptParserRegistry
+
+                    candidate_kind, _ = classify_material(
+                        [*pages, candidate] if continuation else [candidate], page_count=page_count
+                    )
+                    if candidate_kind == "expense":
+                        candidate_lines = [(line.text, line.confidence) for line in candidate.lines]
+                        _append_passenger_fields(candidate_lines, text, layout)
+                        native_receipt_lines = normalized_lines(
+                            [OcrLine(value, score) for value, score in candidate_lines]
+                        )
+                        parsed_candidate = ReceiptParserRegistry(keyword_rules=keyword_rules).parse(
+                            native_receipt_lines,
+                            expense_context(),
+                        )
+                        native_enough = not needs_pdf_ocr_fallback(
+                            parsed_candidate,
+                            native_receipt_lines,
+                        )
+                    elif candidate_kind == "unknown":
+                        native_enough = False
+                    elif candidate_kind == "itinerary":
+                        native_enough = bool(
+                            parse_itinerary_pages(
+                                [*pages, candidate] if continuation else [candidate],
+                                page_count=index + 1 if continuation else 1,
+                                reference_year=reference_year,
+                            ).trips
+                        )
+                else:
+                    native_enough = bool(
+                        parse_itinerary_pages(
+                            [*pages, candidate] if continuation else [candidate],
+                            page_count=index + 1 if continuation else 1,
+                            reference_year=reference_year,
+                        ).trips
+                    )
+            # A layout string can merge adjacent destination/mileage cells even
+            # when the PDF retains their exact positions. Try the bounded native
+            # table recovery before paying for a model pass.
+            if (
+                reader is not None
+                and (not classify or candidate_kind == "itinerary")
+                and _native_page_has_evidence(text)
+                and re.search(r"行程单|\bitinerary\b", text, re.I)
+                and re.search(r"里程|\bmileage\b", text, re.I)
+            ):
+                candidate_lines = tuple(
+                    OcrLine(line.strip(), 1) for line in text.splitlines() if line.strip()
                 )
+                native_parsed = parse_itinerary_pages(
+                    [ItineraryPage(index + 1, candidate_lines, layout, "pdf_text")],
+                    page_count=1,
+                    reference_year=reference_year,
+                )
+                if not native_parsed.trips or "ITINERARY_ROWS_INCOMPLETE" in native_parsed.warnings:
+                    positioned = positioned_itinerary_layout(
+                        path,
+                        index,
+                        max_characters=MAX_TEXT_CHARACTERS - characters,
+                    )
+                    if positioned:
+                        recovered = parse_itinerary_pages(
+                            [ItineraryPage(index + 1, candidate_lines, positioned, "pdf_text")],
+                            page_count=1,
+                            reference_year=reference_year,
+                        )
+                        if recovered.complete and recovered.trips:
+                            layout, native_enough = positioned, True
             if native_enough:
                 lines = tuple(
                     OcrLine(line.strip(), 1) for line in text.splitlines() if line.strip()
@@ -95,50 +268,65 @@ def recognize_itinerary_worker(
                     problems.append("ITINERARY_OCR_PAGE_LIMIT")
                     continue
                 scanned_count += 1
-                if engine is None:
-                    detection = raw_ocr_settings.get("ocr_detection_model_dir")
-                    recognition = raw_ocr_settings.get("ocr_recognition_model_dir")
-                    if not detection or not recognition:
-                        raise OcrRuntimeError("本地 OCR 模型未配置")
-                    engine = PaddleLocalOcrEngine(
-                        WorkerOcrSettings(
-                            Path(detection),
-                            Path(recognition),
-                            str(raw_ocr_settings["ocr_engine"]),
-                            int(raw_ocr_settings["ocr_cpu_threads"]),
-                        )
-                    )
                 source = "paddle"
-                if engine.is_fake:
-                    lines = tuple(engine.recognize(path))
-                    layout = "\n".join(line.text for line in lines)
-                elif reader is not None:
-                    import numpy as np
-                    import pypdfium2 as pdfium
-
-                    document = pdfium.PdfDocument(path)
-                    try:
-                        page = document[index]
-                        try:
-                            bitmap = page.render(scale=limits.render_dpi / 72)
-                            try:
-                                pixels = np.asarray(bitmap.to_pil().convert("RGB"))
-                                recognized_lines, layout = engine.recognize_itinerary(pixels)
-                                lines = tuple(recognized_lines)
-                            finally:
-                                bitmap.close()
-                        finally:
-                            page.close()
-                    finally:
-                        document.close()
-                else:
-                    recognized_lines, layout = engine.recognize_itinerary(path)
-                    lines = tuple(recognized_lines)
+                try:
+                    lines, layout = scan_page(index)
+                except (OcrRuntimeError, ApiError, OSError, ValueError):
+                    if not native_receipt_lines:
+                        raise
+                    # Keep the native candidate when the supplemental pass
+                    # fails, matching the regular receipt OCR endpoint.
+                    lines = tuple(native_receipt_lines)
+                    source = "pdf_text"
+                if native_receipt_lines:
+                    lines = tuple(merge_pdf_ocr_lines(native_receipt_lines, list(lines)))
             characters += sum(len(line.text) for line in lines) + len(layout)
             if characters > MAX_TEXT_CHARACTERS:
                 problems.append("ITINERARY_TEXT_LIMIT")
                 break
             pages.append(ItineraryPage(index + 1, lines, layout, source))
+        if classify:
+            from app.ocr.materials import classify_material
+            from app.ocr.parsers import ReceiptParserRegistry
+
+            kind, reason = classify_material(pages, page_count=page_count)
+            if problems or len(pages) != page_count:
+                kind, reason = "unknown", "材料未完整识别，请确认用途或拆分后重传"
+            result: dict[str, object] = {
+                "ok": True,
+                "materialKind": kind,
+                "reason": reason,
+                "pageCount": page_count,
+            }
+            if kind == "expense":
+                raw_lines = [(line.text, line.confidence) for line in pages[0].lines]
+                _append_passenger_fields(
+                    raw_lines,
+                    "\n".join(line.text for line in pages[0].lines),
+                    pages[0].layout_text,
+                )
+                result["expense"] = ReceiptParserRegistry(keyword_rules=keyword_rules).parse(
+                    normalized_lines([OcrLine(text, score) for text, score in raw_lines]),
+                    expense_context(),
+                )
+            elif kind == "itinerary":
+                result["parsed"] = parse_itinerary_pages(
+                    pages,
+                    page_count=page_count,
+                    reference_year=reference_year,
+                    warnings=problems,
+                )
+            elif kind == "payment_proof":
+                from app.ocr.payment_proofs import payment_proof_details
+
+                result["paymentDetails"] = payment_proof_details(
+                    pages, reference_year=reference_year or date.today().year
+                )
+            elif kind == "hotel_bill":
+                from app.ocr.hotel_bills import hotel_bill_details
+
+                result["hotelBillDetails"] = hotel_bill_details(pages)
+            return result
         return {
             "ok": True,
             "parsed": parse_itinerary_pages(

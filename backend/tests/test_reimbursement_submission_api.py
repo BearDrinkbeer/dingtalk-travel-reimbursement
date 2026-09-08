@@ -4,6 +4,7 @@ import hashlib
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
 from conftest import mock_login
 
 from app.api import reimbursement_submissions as api
@@ -19,6 +20,60 @@ from app.models.reimbursement import (
 from app.schemas.reimbursement_submissions import SubmitReimbursementRequest
 from app.services.reimbursement_drafts import DraftActor
 from app.services.reimbursement_submissions import create_submission
+
+
+@pytest.mark.parametrize("instance_id", [None, "existing-oa"])
+def test_recheck_only_resumes_known_instance_with_csrf_and_keeps_original_draft(
+    client_factory, instance_id
+):
+    from app.integrations.dingtalk.workflow import (
+        CreateProcessInstanceCommand,
+        CreateWorkflowFormValue,
+    )
+    from app.services.oa_reimbursement_payload import (
+        create_command_sha256,
+        serialize_create_command,
+    )
+
+    client = client_factory(
+        auth_mock_enabled=True,
+        auth_mock_user_id="owner-1",
+        auth_mock_departments="100:测试部门",
+        dingtalk_oa_worker_enabled=False,
+    )
+    login = mock_login(client)
+    draft_id, submission_id = _persist_submission_for_mock_user(client)
+    command = CreateProcessInstanceCommand(
+        "PROC-REIMBURSEMENT", "owner-1", 100, 123, (CreateWorkflowFormValue("金额", "199.00"),)
+    )
+    with client.app.state.database_session_factory() as db:
+        record = db.get(ReimbursementSubmission, submission_id)
+        record.status = "MANUAL_REVIEW"
+        record.process_instance_id = instance_id
+        record.oa_request_json = serialize_create_command(command)
+        record.oa_request_hash = create_command_sha256(command)
+        record.oa_create_started_at = utc_now()
+        db.commit()
+        locked = db.get(ReimbursementDraft, draft_id)
+        before = (locked.revision, locked.locked_at, locked.input_json)
+    url = f"/api/oa/reimbursements/submissions/{submission_id}/recheck"
+    assert client.post(url).status_code == 403
+    headers = {"X-CSRF-Token": login["csrfToken"]}
+    assert client.post(url, headers=headers).status_code == 503
+    # Enable only the endpoint gate, not a background worker in the isolated test.
+    client.app.state.settings.dingtalk_oa_worker_enabled = True
+    response = client.post(url, headers=headers)
+    if instance_id is None:
+        assert response.status_code == 409
+    else:
+        assert response.status_code == 200, response.text
+        assert response.json()["data"]["status"] == "VERIFYING"
+        assert response.json()["data"]["processInstanceId"] == instance_id
+        again = client.post(url, headers=headers)
+        assert again.json()["data"]["statusVersion"] == response.json()["data"]["statusVersion"]
+    with client.app.state.database_session_factory() as db:
+        locked = db.get(ReimbursementDraft, draft_id)
+        assert (locked.revision, locked.locked_at, locked.input_json) == before
 
 
 def test_submit_refresh_returns_existing_before_rebuilding_locked_snapshot(
@@ -213,10 +268,7 @@ def test_submission_recovery_is_authenticated_and_identity_scoped(client_factory
     draft_id, _ = _persist_submission_for_mock_user(owner)
 
     anonymous = client_factory(auth_mock_enabled=True)
-    assert (
-        anonymous.get(f"/api/oa/reimbursements/drafts/{draft_id}/submission").status_code
-        == 401
-    )
+    assert anonymous.get(f"/api/oa/reimbursements/drafts/{draft_id}/submission").status_code == 401
 
     stranger = client_factory(
         auth_mock_enabled=True,
@@ -247,10 +299,7 @@ def test_submission_recovery_is_authenticated_and_identity_scoped(client_factory
     assert switched.status_code == 200
     hidden_department = owner.get(f"/api/oa/reimbursements/drafts/{draft_id}/submission")
     assert hidden_department.status_code == 404
-    assert (
-        hidden_department.json()["error"]["code"]
-        == "REIMBURSEMENT_SUBMISSION_NOT_FOUND"
-    )
+    assert hidden_department.json()["error"]["code"] == "REIMBURSEMENT_SUBMISSION_NOT_FOUND"
 
 
 def test_submission_recovery_returns_stable_not_found_for_unsubmitted_draft(

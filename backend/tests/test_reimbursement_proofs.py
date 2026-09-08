@@ -6,17 +6,20 @@ import json
 import pytest
 from conftest import mock_login
 from openpyxl import load_workbook
-from test_reimbursement_drafts import _catalog, _input
-from test_reimbursement_files import _image_bytes, _insert_draft
+from test_reimbursement_drafts import _input
+from test_reimbursement_files import (
+    _image_bytes,
+    _insert_draft,
+    _insert_locked_snapshot_draft,
+)
 from test_reimbursement_intake import _proof_setup
 
 from app.core.errors import ApiError
 from app.excel.template_contract import EXCEL_TEMPLATE
-from app.models.reimbursement import ReimbursementDraft, ReimbursementDraftFile, utc_now
+from app.models.reimbursement import ReimbursementDraft, ReimbursementDraftFile
 from app.ocr.engine import FakeOcrEngine
 from app.ocr.types import OcrLine
 from app.schemas.reimbursements import ReimbursementDraftInput
-from app.services import reimbursement_files
 from app.services.reimbursement_drafts import apply_ocr_evidence, validate_draft_file_references
 
 
@@ -104,32 +107,23 @@ def test_new_draft_cannot_reference_payment_file_from_an_existing_draft(
     assert created.json()["error"]["code"] == "REIMBURSEMENT_DRAFT_FILE_REFERENCE_INVALID"
 
 
-def test_locked_historical_source_receipt_count_is_preserved_in_get_and_preview(
+def test_locked_snapshot_receipt_count_is_preserved_in_get_and_preview(
     client_factory, monkeypatch
 ):
-    client, headers, draft_id, source, _ = _proof_setup(client_factory, monkeypatch)
-    monkeypatch.setattr(
-        reimbursement_files, "require_submission_ready_catalog", lambda _: _catalog()
-    )
-    with client.app.state.database_session_factory() as database:
-        draft = database.get(ReimbursementDraft, draft_id)
-        value = json.loads(draft.input_json)
-        value["items"][0].update(sourceFileId=source, receiptCount=3)
-        draft.input_json = json.dumps(value)
-        draft.status = "LOCKED"
-        draft.locked_at = utc_now()
-        database.commit()
+    client = client_factory(auth_mock_enabled=True)
+    headers = {"X-CSRF-Token": mock_login(client)["csrfToken"]}
+    draft_id, _ = _insert_locked_snapshot_draft(client, first_receipt_count=3)
     loaded = client.get(f"/api/reimbursements/drafts/{draft_id}").json()["data"]
     assert loaded["input"]["items"][0]["receiptCount"] == 3
     preview = client.post(
         f"/api/reimbursements/drafts/{draft_id}/excel-preview",
         headers=headers,
-        json={"expectedRevision": 1},
+        json={"expectedRevision": loaded["revision"]},
     )
     assert preview.status_code == 200, preview.text
     workbook = load_workbook(io.BytesIO(preview.content), data_only=True)
     try:
-        assert workbook.active[EXCEL_TEMPLATE.total_receipt_count_cell].value == 3
+        assert workbook.active[EXCEL_TEMPLATE.total_receipt_count_cell].value == 4
     finally:
         workbook.close()
 
@@ -427,7 +421,10 @@ def test_itinerary_ocr_failure_keeps_itinerary_kind_and_can_be_read_back(client_
     assert restored["ocrResult"] == payload["ocrResult"]
 
 
-def test_review_submit_and_snapshot_order_enforce_new_payment_rule(client_factory, monkeypatch):
+@pytest.mark.parametrize("stay_details", [False, True])
+def test_review_submit_and_snapshot_order_enforce_new_payment_rule(
+    client_factory, monkeypatch, stay_details
+):
     from sqlalchemy import select
     from test_oa_reimbursement_integration import (
         LocalWorkflowBoundary,
@@ -455,6 +452,11 @@ def test_review_submit_and_snapshot_order_enforce_new_payment_rule(client_factor
         value = json.loads(draft.input_json)
         value["items"][0].update(amount="500.01", itineraryFileIds=[sources[1]])
         database.get(ReimbursementDraftFile, sources[1]).attachment_kind = "itinerary"
+        if stay_details:
+            value["items"][0].update(
+                category="lodging", itineraryFileIds=[], hotelBillFileIds=[sources[1]]
+            )
+            database.get(ReimbursementDraftFile, sources[1]).attachment_kind = "hotel_bill"
         draft.input_json = json.dumps(
             value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
@@ -510,7 +512,7 @@ def test_review_submit_and_snapshot_order_enforce_new_payment_rule(client_factor
     assert accepted.status_code == 202, accepted.text
     with client.app.state.database_session_factory() as database:
         snapshot = json.loads(database.scalar(select(ReimbursementSubmission)).form_snapshot_json)
-        assert snapshot["snapshotVersion"] == 3
+        assert snapshot["snapshotVersion"] == 5
         assert [file["draftFileId"] for file in snapshot["originalFiles"]] == [
             sources[0],
             sources[1],
@@ -518,6 +520,6 @@ def test_review_submit_and_snapshot_order_enforce_new_payment_rule(client_factor
         ]
         assert [file["attachmentKind"] for file in snapshot["originalFiles"]] == [
             "other",
-            "itinerary",
+            "hotel_bill" if stay_details else "itinerary",
             "payment_proof",
         ]

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import time
 from importlib import metadata
 from pathlib import Path
 from threading import Lock
@@ -49,6 +51,7 @@ class PaddleLocalOcrEngine:
         with self._lock:
             if self._pipeline is not None:
                 return
+            started = time.perf_counter()
             detection, recognition = self._validate_models()
             try:
                 if metadata.version("paddleocr") != "3.7.0":
@@ -80,6 +83,12 @@ class PaddleLocalOcrEngine:
                 )
             except Exception as exc:
                 raise OcrRuntimeError("本地 OCR 初始化失败") from exc
+            logging.getLogger(__name__).info(
+                "OCR model initialized",
+                extra={
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                },
+            )
 
     @staticmethod
     def _payload(result: Any) -> dict[str, Any]:
@@ -275,6 +284,7 @@ class PaddleLocalOcrEngine:
 
     def recognize(self, path: str) -> list[OcrLine]:
         self.ensure_ready()
+        started = time.perf_counter()
         assert self._pipeline is not None
         try:
             results = self._pipeline.predict(path)
@@ -290,6 +300,12 @@ class PaddleLocalOcrEngine:
                     route = None
                 if route is not None:
                     normalized.append(route)
+            logging.getLogger(__name__).info(
+                "OCR image inference completed",
+                extra={
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                },
+            )
             return normalized
         except OcrRuntimeError:
             raise
@@ -332,6 +348,7 @@ class PaddleLocalOcrEngine:
         """Keep table geometry from the same prediction, without a second OCR pass."""
         self.ensure_ready()
         assert self._pipeline is not None
+        started = time.perf_counter()
         try:
             lines: list[OcrLine] = []
             layouts: list[str] = []
@@ -339,6 +356,12 @@ class PaddleLocalOcrEngine:
                 payload = self._payload(result)
                 lines.extend(self._lines(payload))
                 layouts.append(self._itinerary_layout(payload))
+            logging.getLogger(__name__).info(
+                "OCR itinerary inference completed",
+                extra={
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                },
+            )
             return lines, "\n".join(layouts)
         except OcrRuntimeError:
             raise

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from typing import Protocol
 from zoneinfo import ZoneInfo
@@ -37,6 +37,8 @@ class TravelTemplateLike(Protocol):
     start_date_component_id: str
     end_date_component_id: str
     travel_type_option: FormOption
+    company_component_id: str | None
+    budget_code_component_id: str | None
 
 
 class OaTemplateCatalogLike(Protocol):
@@ -99,6 +101,12 @@ class ListedTravelApproval:
     start_date_component_id: str
     end_date_component_id: str
     query_window: TravelApprovalQueryWindow
+    source_schema: FormSchema | None = None
+    company_component_id: str | None = None
+    budget_code_component_id: str | None = None
+    travel_type_component_id: str | None = None
+    travel_type_mappings: dict[str, FormOption] | None = None
+    source_travel_type_value: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +115,9 @@ class TravelApprovalCandidate:
     instance: WorkflowProcessInstance
     start_date: date
     end_date: date
+    company_option: FormOption | None = None
+    budget_code_option: FormOption | None = None
+    unavailable_reason: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -121,6 +132,11 @@ class TravelApprovalCandidate:
             "endDate": self.end_date.isoformat(),
             "createdAt": self.instance.created_at,
             "finishedAt": self.instance.finished_at,
+            "companyOption": self.company_option.as_dict() if self.company_option else None,
+            "budgetCodeOption": self.budget_code_option.as_dict()
+            if self.budget_code_option
+            else None,
+            "unavailableReason": self.unavailable_reason,
         }
 
 
@@ -137,6 +153,8 @@ class VerifiedTravelSelection:
     travel_type_option: FormOption
     start_date: date
     end_date: date
+    company_option: FormOption
+    budget_code_option: FormOption
 
 
 def requested_query_window(
@@ -172,6 +190,16 @@ def runtime_options(catalog: OaTemplateCatalogLike) -> dict[str, object]:
                 "processCode": profile.process_code,
                 "schemaFingerprint": profile.schema.fingerprint,
                 "travelTypeOption": profile.travel_type_option.as_dict(),
+                **(
+                    {
+                        "travelTypeMappings": {
+                            key: value.as_dict()
+                            for key, value in profile.travel_type_mappings.items()
+                        }
+                    }
+                    if getattr(profile, "travel_type_mappings", None) is not None
+                    else {}
+                ),
             }
             for profile in catalog.travel_profiles
         ],
@@ -194,7 +222,7 @@ async def list_current_user_travel_approvals(
         current_user_id=user_id,
         query_window=query_window,
     )
-    resolved = await _resolve_details(workflow, tuple(listed.values()))
+    resolved = await _resolve_details(workflow, tuple(listed.values()), catalog)
     eligible = tuple(
         candidate
         for candidate in resolved
@@ -264,7 +292,7 @@ async def reverify_travel_approval_selection(
                 )
             proven.append(reference)
 
-    resolved = await _resolve_details(workflow, tuple(proven))
+    resolved = await _resolve_details(workflow, tuple(proven), catalog)
     if any(item is None for item in resolved):
         raise ApiError(
             "TRAVEL_APPROVAL_MEMBERSHIP_CHANGED",
@@ -279,11 +307,30 @@ async def reverify_travel_approval_selection(
             "所选出差审批的出差类别不同，不能放在同一张报销单中",
             422,
         )
+    for item in approvals:
+        if (
+            item.unavailable_reason
+            or item.company_option is None
+            or item.budget_code_option is None
+        ):
+            raise ApiError(
+                "TRAVEL_APPROVAL_FIELDS_UNAVAILABLE",
+                item.unavailable_reason or "出差审批缺少所属公司或预算代码，请联系管理员",
+                422,
+            )
+    if len({(item.company_option, item.budget_code_option) for item in approvals}) != 1:
+        raise ApiError(
+            "TRAVEL_APPROVAL_ACCOUNTING_MISMATCH",
+            "所选出差审批的所属公司或预算代码不同，不能放在同一张报销单中",
+            422,
+        )
     return VerifiedTravelSelection(
         approvals=approvals,
         travel_type_option=approvals[0].listed.travel_type_option,
         start_date=min(item.start_date for item in approvals),
         end_date=max(item.end_date for item in approvals),
+        company_option=approvals[0].company_option,
+        budget_code_option=approvals[0].budget_code_option,
     )
 
 
@@ -333,6 +380,11 @@ async def _list_approval_references(
                     start_date_component_id=profile.start_date_component_id,
                     end_date_component_id=profile.end_date_component_id,
                     query_window=query_window,
+                    source_schema=profile.schema,
+                    company_component_id=travel_source_component_id(profile, "company"),
+                    budget_code_component_id=travel_source_component_id(profile, "budgetCode"),
+                    travel_type_component_id=getattr(profile, "travel_type_component_id", None),
+                    travel_type_mappings=getattr(profile, "travel_type_mappings", None),
                 )
             if page.next_token is None:
                 break
@@ -345,6 +397,7 @@ async def _list_approval_references(
 async def _resolve_details(
     workflow: DingTalkWorkflowClient,
     listed: tuple[ListedTravelApproval, ...],
+    catalog: OaTemplateCatalogLike,
 ) -> tuple[TravelApprovalCandidate | None, ...]:
     if not listed:
         return ()
@@ -353,7 +406,35 @@ async def _resolve_details(
     async def resolve(reference: ListedTravelApproval) -> TravelApprovalCandidate | None:
         async with semaphore:
             instance = await workflow.get_process_instance(reference.instance_id)
-        return _eligible_candidate(reference, instance)
+        candidate = _eligible_candidate(reference, instance)
+        if candidate is None:
+            return None
+        company, budget, reason = travel_accounting_options(
+            instance,
+            source_schema=reference.source_schema,
+            company_component_id=reference.company_component_id,
+            budget_code_component_id=reference.budget_code_component_id,
+            company_options=_mapped_options(catalog.reimbursement, "company"),
+            budget_options=_mapped_options(catalog.reimbursement, "budgetCode"),
+        )
+        option, source_value, type_reason = travel_instance_type_option(
+            instance,
+            source_schema=reference.source_schema,
+            component_id=reference.travel_type_component_id,
+            mappings=reference.travel_type_mappings,
+            fixed_option=reference.travel_type_option,
+        )
+        return replace(
+            candidate,
+            listed=replace(
+                reference,
+                travel_type_option=option or reference.travel_type_option,
+                source_travel_type_value=source_value,
+            ),
+            company_option=company,
+            budget_code_option=budget,
+            unavailable_reason=reason or type_reason,
+        )
 
     tasks = [asyncio.create_task(resolve(reference)) for reference in listed]
     try:
@@ -403,6 +484,118 @@ def _eligible_candidate(
     )
 
 
+def travel_source_component_id(profile: TravelTemplateLike, logical_field: str) -> str | None:
+    attribute = "company_component_id" if logical_field == "company" else "budget_code_component_id"
+    configured = getattr(profile, attribute, None)
+    if configured:
+        return configured
+    label = "所属公司" if logical_field == "company" else "预算代码"
+    matches = [
+        component.component_id
+        for component in getattr(profile.schema, "components", ())
+        if component.label == label
+        and component.component_type in {"DDSelectField", "TextField"}
+        and not any(
+            getattr(component, flag, False)
+            for flag in (
+                "in_subtable",
+                "disabled",
+                "hidden",
+                "ancestor_disabled",
+                "ancestor_hidden",
+            )
+        )
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def travel_instance_type_option(
+    instance: WorkflowProcessInstance,
+    *,
+    source_schema: FormSchema | None,
+    component_id: str | None,
+    mappings: dict[str, FormOption] | None,
+    fixed_option: FormOption,
+) -> tuple[FormOption | None, str | None, str | None]:
+    if component_id is None and mappings is None:
+        return fixed_option, None, None
+    values = [value.value for value in instance.form_values if value.component_id == component_id]
+    source = next(
+        (
+            item
+            for item in getattr(source_schema, "components", ())
+            if item.component_id == component_id
+        ),
+        None,
+    )
+    if len(values) != 1 or not isinstance(values[0], str) or source is None or not mappings:
+        return None, None, "出差审批的出差类别缺失或尚未配置对应关系"
+    raw = values[0].strip()
+    matches = [
+        option for option in source.options if raw in {option.value, option.label, option.key}
+    ]
+    if len(matches) != 1 or matches[0].value not in mappings:
+        return None, None, "出差审批的出差类别无法唯一对应报销类别"
+    source_value = matches[0].value
+    return mappings[source_value], source_value, None
+
+
+def travel_accounting_options(
+    instance: WorkflowProcessInstance,
+    *,
+    source_schema: FormSchema | None,
+    company_component_id: str | None,
+    budget_code_component_id: str | None,
+    company_options: tuple[FormOption, ...],
+    budget_options: tuple[FormOption, ...],
+) -> tuple[FormOption | None, FormOption | None, str | None]:
+    """Resolve source selections to unique current OA options without fuzzy matching."""
+    resolved: list[FormOption] = []
+    for label, component_id, targets in (
+        ("所属公司", company_component_id, company_options),
+        ("预算代码", budget_code_component_id, budget_options),
+    ):
+        if not component_id:
+            return None, None, f"出差模板尚未配置{label}来源，请联系管理员"
+        values = [
+            value.value for value in instance.form_values if value.component_id == component_id
+        ]
+        if len(values) != 1 or not isinstance(values[0], str) or not values[0].strip():
+            return None, None, f"出差审批的{label}缺失或不唯一"
+        raw = values[0].strip()
+        tokens = {raw}
+        source = next(
+            (
+                item
+                for item in getattr(source_schema, "components", ())
+                if item.component_id == component_id
+            ),
+            None,
+        )
+        if source is not None and source.options:
+            options = [
+                option
+                for option in source.options
+                if raw in {option.value, option.label, option.key}
+            ]
+            if len(options) != 1:
+                return None, None, f"出差审批的{label}无法唯一对应来源模板选项"
+            # Option keys are scoped to their form; they are never reused across forms.
+            tokens = (
+                {options[0].label} if label == "预算代码" else {options[0].value, options[0].label}
+            )
+        if label == "预算代码":
+            # Compare the entire label; never infer a budget from its numeric prefix.
+            tokens = {"".join(token.split()) for token in tokens}
+            matches = [option for option in targets if "".join(option.label.split()) in tokens]
+        else:
+            matches = [option for option in targets if tokens & {option.value, option.label}]
+        if len(matches) != 1:
+            return None, None, f"出差审批的{label}无法唯一对应当前报销表单选项"
+        resolved.append(matches[0])
+    return resolved[0], resolved[1], None
+
+
 def travel_approval_dates(
     instance: WorkflowProcessInstance,
     *,
@@ -412,6 +605,11 @@ def travel_approval_dates(
     """Read one approved trip period from direct dates or a native itinerary table."""
 
     if start_date_component_id == end_date_component_id:
+        from app.services.oa_date_range import parse_date_range
+
+        values = [v for v in instance.form_values if v.component_id == start_date_component_id]
+        if len(values) == 1 and values[0].component_type == "DDDateRangeField":
+            return parse_date_range(values[0].value)
         return _itinerary_dates(instance, start_date_component_id)
     start_date = _component_date(instance, start_date_component_id)
     end_date = _component_date(instance, end_date_component_id)

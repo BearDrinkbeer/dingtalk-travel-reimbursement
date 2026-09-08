@@ -148,6 +148,7 @@ def inspect_pdf_worker(
             "renderHeight": inspection.render_height,
             "embeddedImages": inspection.embedded_images,
             "embeddedPixels": inspection.embedded_pixels,
+            "pageCount": inspection.page_count,
         }
     except MemoryError:
         return _resource_failure()
@@ -224,6 +225,21 @@ def extract_pdf_text_worker(
         return _safe_failure(exc)
 
 
+def cached_ocr_engine(settings: WorkerOcrSettings) -> PaddleLocalOcrEngine:
+    key = (
+        str(settings.ocr_detection_model_dir),
+        str(settings.ocr_recognition_model_dir),
+        settings.ocr_engine,
+        settings.ocr_cpu_threads,
+    )
+    engine = _ENGINES.get(key)
+    if engine is None:
+        _ENGINES.clear()
+        engine = PaddleLocalOcrEngine(settings)
+        _ENGINES[key] = engine
+    return engine
+
+
 def recognize_document_worker(
     path: str,
     extension: str,
@@ -266,16 +282,7 @@ def recognize_document_worker(
             ocr_engine=str(raw_ocr_settings["ocr_engine"]),
             ocr_cpu_threads=int(raw_ocr_settings["ocr_cpu_threads"]),
         )
-        key = (
-            str(settings.ocr_detection_model_dir),
-            str(settings.ocr_recognition_model_dir),
-            settings.ocr_engine,
-            settings.ocr_cpu_threads,
-        )
-        engine = _ENGINES.get(key)
-        if engine is None:
-            engine = PaddleLocalOcrEngine(settings)
-            _ENGINES[key] = engine
+        engine = cached_ocr_engine(settings)
         lines = engine.recognize(path)
         return {
             "ok": True,

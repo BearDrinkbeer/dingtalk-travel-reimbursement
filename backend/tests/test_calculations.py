@@ -36,6 +36,8 @@ def period(
         (period(date(2026, 6, 30), time(11, 59), date(2026, 7, 1), time(12)), "2.0"),
         (period(date(2026, 6, 30), time(9), date(2026, 6, 30), time(12)), "1.0"),
         (period(date(2026, 6, 30), time(12), date(2026, 6, 30), time(18)), "0.5"),
+        (period(date(2026, 6, 30), time(9), date(2026, 6, 30), time(9)), "0.5"),
+        (period(date(2026, 6, 30), time(18), date(2026, 6, 30), time(18)), "0.5"),
         (period(date(2026, 12, 31), time(13), date(2027, 1, 1), time(8)), "1.0"),
     ],
 )

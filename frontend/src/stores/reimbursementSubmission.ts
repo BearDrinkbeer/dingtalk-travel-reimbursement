@@ -6,6 +6,7 @@ import { apiErrorCode, apiErrorMessage } from '@/api/errors'
 import {
   getOaReimbursementSubmission,
   getOaReimbursementSubmissionForDraft,
+  recheckOaReimbursementSubmission,
   submitOaReimbursement,
 } from '@/api/reimbursements'
 import type {
@@ -488,6 +489,31 @@ export const useReimbursementSubmissionStore = defineStore(
       return promise
     }
 
+    async function recheck(): Promise<void> {
+      const current = submission.value
+      if (!current || current.status !== 'MANUAL_REVIEW' || !current.processInstanceId || submitting.value) return
+      const requestGeneration = generation
+      const record = recordForDraft(current.draftId)
+      if (!record) return
+      const controller = new AbortController()
+      activeController = controller
+      submitting.value = true
+      requestError.value = ''
+      try {
+        const value = await recheckOaReimbursementSubmission(current.submissionId, { signal: controller.signal })
+        adoptSubmission(value, record, requestGeneration)
+      } catch (error) {
+        if (accepts(requestGeneration, current.draftId) && !isCancellation(error)) {
+          requestError.value = apiErrorMessage(error, '重新核对失败，请稍后重试')
+        }
+      } finally {
+        if (requestGeneration === generation && activeController === controller) {
+          activeController = null
+          submitting.value = false
+        }
+      }
+    }
+
     function restore(
       draftId: string,
       options: RestoreReimbursementSubmissionOptions | number = {},
@@ -611,6 +637,7 @@ export const useReimbursementSubmissionStore = defineStore(
       submit,
       restore,
       pollNow,
+      recheck,
       startPolling,
       abort,
       reset,

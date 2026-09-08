@@ -19,20 +19,38 @@ describe('settings API', () => {
       long_term_project: '150',
       same_city_project: '50',
       internal: '100',
+      overseas: '0',
     } as const
     vi.mocked(http.put).mockResolvedValue({
-      data: { data: { subsidyRates: rates, calculationMode: 'half_day_12' } },
+      data: {
+        data: {
+          appTitle: '智能差旅费报销申请',
+          adminUserIds: ['admin-2'],
+          environmentAdminUserIds: ['admin-1'],
+          subsidyRates: rates,
+          calculationMode: 'half_day_12',
+        },
+      },
     })
 
-    await updateExpenseSettings({ subsidyRates: rates, calculationMode: 'half_day_12' })
+    await updateExpenseSettings({
+      appTitle: '智能差旅费报销申请',
+      adminUserIds: ['admin-2'],
+      environmentAdminUserIds: ['admin-1'],
+      subsidyRates: rates,
+      calculationMode: 'half_day_12',
+    })
 
     expect(http.put).toHaveBeenCalledWith('/admin/settings', {
+      appTitle: '智能差旅费报销申请',
+      adminUserIds: ['admin-2'],
       subsidyRates: {
         business: '88.50',
         short_term_project: '100.00',
         long_term_project: '150.00',
         same_city_project: '50.00',
         internal: '100.00',
+        overseas: '0.00',
       },
       calculationMode: 'half_day_12',
     })
@@ -43,17 +61,24 @@ describe('settings API', () => {
       expect(normalizeSubsidyRate(value)).toBeNull()
       await expect(
         updateExpenseSettings({
+          appTitle: '智能差旅费报销申请',
+          adminUserIds: [],
+          environmentAdminUserIds: ['admin-1'],
           subsidyRates: {
             business: value,
             short_term_project: '100.00',
             long_term_project: '150.00',
             same_city_project: '50.00',
             internal: '100.00',
+            overseas: '0.00',
           },
           calculationMode: 'half_day_12',
         }),
-      ).rejects.toThrow('各出差类型')
+      ).rejects.toThrow('其他类型必须大于 0')
     }
+    expect(normalizeSubsidyRate('0')).toBeNull()
+    expect(normalizeSubsidyRate('0', true)).toBe('0.00')
+    expect(normalizeSubsidyRate('-0.01', true)).toBeNull()
     expect(http.put).toHaveBeenCalledTimes(0)
   })
 })

@@ -41,9 +41,11 @@ _PASSENGER_TRANSPORT_KEYWORDS = (
 )
 _RIDE_HAILING_PROVIDERS = (
     "滴滴出行",
+    "滴滴科技",
     "滴滴快车",
     "滴滴专车",
     "曹操出行",
+    "吉利优行电子科技",
     "t3出行",
     "首汽约车",
     "花小猪",
@@ -54,7 +56,7 @@ _RIDE_HAILING_PROVIDERS = (
 def _with_transport_evidence(parsed: ParsedExpense, lines: list[OcrLine]) -> ParsedExpense:
     if parsed.transport_type is not None:
         return parsed
-    text = " ".join(line.text.casefold() for line in lines)
+    text = "".join("".join(line.text.casefold().split()) for line in lines)
     transport = extract_passenger_transport_type(lines)
     ride_hailing = (
         transport == "网约车"
@@ -85,7 +87,8 @@ def _with_transport_evidence(parsed: ParsedExpense, lines: list[OcrLine]) -> Par
 
 
 def is_passenger_transport_text(text: str) -> bool:
-    return any(keyword in text for keyword in _PASSENGER_TRANSPORT_KEYWORDS)
+    compact = "".join(text.split())
+    return any(keyword in compact for keyword in _PASSENGER_TRANSPORT_KEYWORDS)
 
 
 def _warnings(lines: list[OcrLine], *, amount: object, parsed_date: object) -> list[str]:
@@ -183,7 +186,7 @@ class GenericInvoiceParser:
             # when the structured transport-type cell is absent. Do not scan
             # route/company names: words such as "航空大酒店" are not transport proof.
             service_keywords = ("客运服务费", "公路客运", "道路旅客运输", "汽车客运")
-            normalized = text.casefold()
+            normalized = "".join(text.casefold().split())
             present_service_matches = {
                 rule.category
                 for rule in self._keyword_rules

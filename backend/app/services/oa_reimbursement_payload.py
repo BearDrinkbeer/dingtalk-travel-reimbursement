@@ -38,12 +38,14 @@ from app.integrations.dingtalk.workflow import (
     serialize_create_process_instance_command,
 )
 from app.models.reimbursement import (
+    ReimbursementDraft,
     ReimbursementDraftFile,
     ReimbursementDraftFileRole,
     ReimbursementDraftFileStatus,
     ReimbursementDraftRelatedApproval,
     ReimbursementDraftStatus,
     ReimbursementOcrStatus,
+    ReimbursementSubmission,
     utc_now,
 )
 from app.schemas.excel import ExcelExpenseItemInput
@@ -77,7 +79,7 @@ from app.services.reimbursement_staging import (
     ReimbursementStagingError,
 )
 
-SNAPSHOT_VERSION = 3
+SNAPSHOT_VERSION = 5
 _MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
 _SIGNED_INT64_MAX = 9_223_372_036_854_775_807
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -141,6 +143,14 @@ class SnapshotTravelProfile(_SnapshotModel):
     start_date_component_id: Annotated[str, StringConstraints(min_length=1, max_length=512)]
     end_date_component_id: Annotated[str, StringConstraints(min_length=1, max_length=512)]
     travel_type_option: SnapshotOption
+    company_component_id: str | None = None
+    budget_code_component_id: str | None = None
+    travel_type_component_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    travel_type_mappings: dict[str, SnapshotOption] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class SnapshotTemplate(_SnapshotModel):
@@ -181,6 +191,10 @@ class SnapshotTrip(_SnapshotModel):
     policy_confirmed: bool
     confirmed_effective_days: DecimalString | None = None
     no_subsidy_exception: bool
+    manual_subsidy_amount: DecimalString | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @field_serializer("start_time", "end_time", when_used="json")
     def serialize_minute_time(self, value: object) -> str:
@@ -200,6 +214,9 @@ class SnapshotExpenseItem(_SnapshotModel):
     ] = ()
     requires_itinerary: bool = False
     payment_proof_file_ids: tuple[
+        Annotated[str, StringConstraints(min_length=1, max_length=36)], ...
+    ] = ()
+    hotel_bill_file_ids: tuple[
         Annotated[str, StringConstraints(min_length=1, max_length=36)], ...
     ] = ()
     rail_type: Literal["high_speed", "emu", "regular", "unknown"] = "unknown"
@@ -265,13 +282,16 @@ class SnapshotRelatedApproval(_SnapshotModel):
     business_id: Annotated[str, StringConstraints(min_length=1, max_length=128)]
     instance_created_at: ShortText
     verified_at: ShortText
+    source_travel_type_value: LongText | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class SnapshotOriginalFile(_SnapshotModel):
     draft_file_id: Annotated[str, StringConstraints(min_length=1, max_length=36)]
     sort_order: NonNegativeInt
     processing_role: Literal["EXPENSE_SOURCE", "ATTACHMENT_ONLY"]
-    attachment_kind: Literal["itinerary", "payment_proof", "other"] = "other"
+    attachment_kind: Literal["itinerary", "payment_proof", "hotel_bill", "other"] = "other"
     storage_key: Annotated[str, StringConstraints(min_length=1, max_length=255)]
     file_name: ShortText
     file_type: Literal["jpg", "jpeg", "png", "pdf"]
@@ -308,7 +328,7 @@ class SnapshotFormValue(_SnapshotModel):
 
 
 class ReimbursementSnapshot(_SnapshotModel):
-    snapshot_version: Literal[1, 2, 3] = SNAPSHOT_VERSION
+    snapshot_version: Literal[1, 2, 3, 4, 5] = SNAPSHOT_VERSION
     draft_id: Annotated[str, StringConstraints(min_length=1, max_length=36)]
     draft_revision: PositiveInt
     identity: SnapshotIdentity
@@ -345,6 +365,7 @@ class RelatedApprovalSource:
     business_id: str
     instance_created_at: datetime
     verified_at: datetime
+    source_travel_type_value: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -444,6 +465,8 @@ def collect_snapshot_source(
         draft_input = ReimbursementDraftInput.model_validate_json(draft.input_json)
     except ValidationError:
         raise _snapshot_error("报销数据损坏，请重新填写") from None
+    if not draft_input.accounting_source_verified:
+        raise _snapshot_error("请重新确认关联出差审批，以核验所属公司和预算代码")
     draft_input = apply_ocr_evidence(database, draft_id=draft.id, draft_input=draft_input)
     calculation = validate_and_calculate_input(
         database,
@@ -500,6 +523,7 @@ def collect_snapshot_source(
             file_id
             for item in draft_input.items
             for file_id in ([item.source_file_id] if item.source_file_id else [])
+            + item.hotel_bill_file_ids
             + item.itinerary_file_ids
             + item.payment_proof_file_ids
         )
@@ -634,6 +658,20 @@ def build_snapshot(source: SnapshotSource) -> ReimbursementSnapshot:
 def serialize_snapshot(snapshot: ReimbursementSnapshot) -> str:
     snapshot = _require_snapshot(snapshot)
     value = snapshot.model_dump(mode="json", by_alias=True)
+    if snapshot.snapshot_version < 5:
+        for profile in value["template"]["travelProfiles"]:
+            profile.pop("travelTypeComponentId", None)
+            profile.pop("travelTypeMappings", None)
+        for related in value["relatedApprovals"]:
+            related.pop("sourceTravelTypeValue", None)
+    if snapshot.snapshot_version < 4:
+        for item in value["input"]["items"]:
+            item.pop("hotelBillFileIds", None)
+        if value["input"].get("trip"):
+            value["input"]["trip"].pop("manualSubsidyAmount", None)
+        for profile in value["template"]["travelProfiles"]:
+            profile.pop("companyComponentId", None)
+            profile.pop("budgetCodeComponentId", None)
     if snapshot.snapshot_version < 3:
         for item in value["input"]["items"]:
             item.pop("paymentProofFileIds", None)
@@ -674,6 +712,36 @@ def parse_snapshot(
         raise _snapshot_error("报销提交快照不是规范格式，请联系管理员")
     if expected_sha256 is not None:
         _verify_sha256(canonical, expected_sha256, "报销提交快照校验失败，请联系管理员")
+    return snapshot
+
+
+def parse_locked_submission_snapshot(
+    draft: ReimbursementDraft,
+    submission: ReimbursementSubmission,
+) -> ReimbursementSnapshot:
+    """Read and cross-check the immutable snapshot behind one locked draft."""
+
+    snapshot = parse_snapshot(
+        submission.form_snapshot_json,
+        expected_sha256=submission.snapshot_sha256,
+    )
+    if (
+        draft.status != ReimbursementDraftStatus.LOCKED.value
+        or draft.locked_at is None
+        or submission.draft_id != draft.id
+        or submission.corp_id != draft.corp_id
+        or submission.originator_user_id != draft.owner_user_id
+        or snapshot.draft_id != draft.id
+        or snapshot.draft_revision + 1 != draft.revision
+        or snapshot.identity.corp_id != draft.corp_id
+        or snapshot.identity.user_id != draft.owner_user_id
+        or snapshot.identity.department_id != draft.department_id
+        or snapshot.identity.department_name != draft.department_name
+        or snapshot.template.process_code != draft.template_process_code
+        or snapshot.template.config_version != draft.template_config_version
+        or snapshot.template.schema_fingerprint != draft.schema_fingerprint
+    ):
+        raise _snapshot_error("报销提交快照与锁定记录不一致，请联系管理员")
     return snapshot
 
 
@@ -738,6 +806,11 @@ def build_create_command(
         [item.as_oa_value() for item in normalized_attachments]
     )
     bindings = {item.logical_key: item for item in snapshot.template.fields}
+    has_range = bindings["startDate"].component_type == "DDDateRangeField"
+    if has_range:
+        values_by_key["startDate"] = _canonical_json(
+            [values_by_key["startDate"], values_by_key["endDate"]]
+        )
     form_values = tuple(
         CreateWorkflowFormValue(
             name=bindings[key].name,
@@ -747,6 +820,7 @@ def build_create_command(
             biz_alias=bindings[key].biz_alias,
         )
         for key in _OA_LOGICAL_KEYS
+        if not has_range or key not in {"endDate", "durationDays"}
     )
     try:
         department_id = int(snapshot.identity.department_id)
@@ -844,6 +918,7 @@ def _related_source(item: ReimbursementDraftRelatedApproval) -> RelatedApprovalS
         business_id=item.business_id,
         instance_created_at=item.instance_created_at,
         verified_at=item.verified_at,
+        source_travel_type_value=item.source_travel_type_value,
     )
 
 
@@ -901,7 +976,7 @@ def _validate_related_sources(
             or item.listed_to_ms < item.listed_from_ms
         ):
             raise _snapshot_error("关联审批或模板已经变化，请重新选择")
-        travel_types.add(profile.travel_type_option.value)
+        travel_types.add(_profile_selected_type(profile, item.source_travel_type_value).value)
     if len(travel_types) != 1:
         raise _snapshot_error("关联的出差审批类别不一致，请重新选择")
     if draft_input.trip is not None:
@@ -924,6 +999,8 @@ def _validate_related_sources(
 
 
 def _snapshot_template(catalog: OaTemplateCatalogContract) -> SnapshotTemplate:
+    from app.services.travel_approvals import travel_source_component_id
+
     reimbursement = catalog.reimbursement
     components = {item.component_id: item for item in reimbursement.schema.components}
     fields: list[SnapshotTemplateField] = []
@@ -958,6 +1035,17 @@ def _snapshot_template(catalog: OaTemplateCatalogContract) -> SnapshotTemplate:
                 start_date_component_id=item.start_date_component_id,
                 end_date_component_id=item.end_date_component_id,
                 travel_type_option=_snapshot_option(item.travel_type_option),
+                company_component_id=travel_source_component_id(item, "company"),
+                budget_code_component_id=travel_source_component_id(item, "budgetCode"),
+                travel_type_component_id=item.travel_type_component_id,
+                travel_type_mappings=(
+                    {
+                        key: _snapshot_option(option)
+                        for key, option in item.travel_type_mappings.items()
+                    }
+                    if item.travel_type_mappings is not None
+                    else None
+                ),
             )
             for item in catalog.travel_profiles
         ),
@@ -977,6 +1065,7 @@ def _snapshot_trip(draft_input: ReimbursementDraftInput) -> SnapshotTrip | None:
         policy_confirmed=trip.policy_confirmed,
         confirmed_effective_days=trip.confirmed_effective_days,
         no_subsidy_exception=trip.no_subsidy_exception,
+        manual_subsidy_amount=trip.manual_subsidy_amount,
     )
 
 
@@ -994,6 +1083,7 @@ def _snapshot_expense_item(
         itinerary_file_ids=tuple(item.itinerary_file_ids),
         requires_itinerary=item.requires_itinerary,
         payment_proof_file_ids=tuple(item.payment_proof_file_ids),
+        hotel_bill_file_ids=tuple(item.hotel_bill_file_ids),
         rail_type=item.rail_type,
         transport_type=item.transport_type,
         original_currency=item.original_currency,
@@ -1033,6 +1123,7 @@ def _snapshot_related(item: RelatedApprovalSource) -> SnapshotRelatedApproval:
         business_id=item.business_id,
         instance_created_at=_utc_timestamp(item.instance_created_at),
         verified_at=_utc_timestamp(item.verified_at),
+        source_travel_type_value=item.source_travel_type_value,
     )
 
 
@@ -1080,6 +1171,16 @@ def _mapped_option(
     return option
 
 
+def _profile_selected_type(profile, source_value: str | None):
+    if profile.travel_type_mappings is None:
+        if source_value is not None or profile.travel_type_component_id is not None:
+            raise ValueError("unexpected source travel category")
+        return profile.travel_type_option
+    if not profile.travel_type_component_id or source_value not in profile.travel_type_mappings:
+        raise ValueError("source travel category mapping missing")
+    return profile.travel_type_mappings[source_value]
+
+
 def _travel_type_option(
     catalog: OaTemplateCatalogContract,
     related: tuple[RelatedApprovalSource, ...],
@@ -1087,9 +1188,9 @@ def _travel_type_option(
     profiles = {item.profile_key: item for item in catalog.travel_profiles}
     options = {
         (
-            profiles[item.profile_key].travel_type_option.value,
-            profiles[item.profile_key].travel_type_option.label,
-            profiles[item.profile_key].travel_type_option.key,
+            _profile_selected_type(profiles[item.profile_key], item.source_travel_type_value).value,
+            _profile_selected_type(profiles[item.profile_key], item.source_travel_type_value).label,
+            _profile_selected_type(profiles[item.profile_key], item.source_travel_type_value).key,
         )
         for item in related
         if item.profile_key in profiles
@@ -1151,6 +1252,32 @@ def _description_v1(
 
 
 def _validate_snapshot_semantics(snapshot: ReimbursementSnapshot) -> None:
+    if snapshot.snapshot_version < 5 and (
+        any(
+            profile.travel_type_component_id is not None or profile.travel_type_mappings is not None
+            for profile in snapshot.template.travel_profiles
+        )
+        or any(item.source_travel_type_value is not None for item in snapshot.related_approvals)
+    ):
+        raise ValueError("legacy snapshots do not support source travel category mappings")
+    if snapshot.snapshot_version < 4 and (
+        any(item.hotel_bill_file_ids for item in snapshot.input.items)
+        or any(file.attachment_kind == "hotel_bill" for file in snapshot.original_files)
+        or (
+            snapshot.input.trip is not None
+            and (
+                snapshot.input.trip.trip_type == "overseas"
+                or snapshot.input.trip.manual_subsidy_amount is not None
+            )
+        )
+        or any(
+            profile.company_component_id is not None or profile.budget_code_component_id is not None
+            for profile in snapshot.template.travel_profiles
+        )
+    ):
+        raise ValueError(
+            "new hotel, overseas and approval mapping fields require snapshot version 4"
+        )
     if (
         not _POSITIVE_DECIMAL_IDENTIFIER.fullmatch(snapshot.identity.department_id)
         or int(snapshot.identity.department_id) > _SIGNED_INT64_MAX
@@ -1162,7 +1289,17 @@ def _validate_snapshot_semantics(snapshot: ReimbursementSnapshot) -> None:
         raise ValueError("template fields are incomplete or out of order")
     if tuple(item.logical_key for item in snapshot.form_values) != _OA_VALUE_KEYS:
         raise ValueError("form values are incomplete or out of order")
-    if len({item.component_id for item in snapshot.template.fields}) != len(_OA_LOGICAL_KEYS):
+    range_bindings = [
+        item for item in snapshot.template.fields if item.component_type == "DDDateRangeField"
+    ]
+    if range_bindings and (
+        snapshot.snapshot_version < 5
+        or {item.logical_key for item in range_bindings} != {"startDate", "endDate", "durationDays"}
+        or len({item.component_id for item in range_bindings}) != 1
+    ):
+        raise ValueError("date range requires version 5 and all three date bindings")
+    expected_ids = len(_OA_LOGICAL_KEYS) - (2 if range_bindings else 0)
+    if len({item.component_id for item in snapshot.template.fields}) != expected_ids:
         raise ValueError("template component ids must be unique")
     if not snapshot.related_approvals or not snapshot.original_files:
         raise ValueError("related approvals and original files are required")
@@ -1302,12 +1439,9 @@ def _validate_business_snapshot(snapshot: ReimbursementSnapshot) -> None:
             ) and not item.itinerary_file_ids:
                 raise ValueError("ride-hailing requires itinerary")
             if (
-                (
-                    item.requires_cny_confirmation
-                    or (item.original_currency and item.original_currency != "CNY")
-                )
-                and not item.cny_amount_confirmed
-            ):
+                item.requires_cny_confirmation
+                or (item.original_currency and item.original_currency != "CNY")
+            ) and not item.cny_amount_confirmed:
                 raise ValueError("foreign receipts require a confirmed CNY amount")
             if snapshot.snapshot_version >= 3:
                 if item.source_file_id is not None and item.receipt_count != 1:
@@ -1316,16 +1450,27 @@ def _validate_business_snapshot(snapshot: ReimbursementSnapshot) -> None:
                 for proof_ids, kind in (
                     (item.itinerary_file_ids, "itinerary"),
                     (item.payment_proof_file_ids, "payment_proof"),
+                    (item.hotel_bill_file_ids, "hotel_bill"),
                 ):
                     if len(proof_ids) != len(set(proof_ids)) or any(
                         file_id not in support_ids or by_id[file_id].attachment_kind != kind
                         for file_id in proof_ids
                     ):
                         raise ValueError("proof must reference support files of the correct kind")
-                if payment_proof_required(
-                    amount=item.amount, category=item.category, rail_type=item.rail_type,
-                ) and not item.payment_proof_file_ids:
+                if (
+                    payment_proof_required(
+                        amount=item.amount,
+                        category=item.category,
+                        rail_type=item.rail_type,
+                    )
+                    and not item.payment_proof_file_ids
+                ):
                     raise ValueError("payment proof is required for this receipt")
+                if snapshot.snapshot_version >= 4:
+                    if item.category is ExpenseCategory.LODGING and not item.hotel_bill_file_ids:
+                        raise ValueError("lodging requires hotel stay details")
+                elif item.hotel_bill_file_ids:
+                    raise ValueError("hotel bill references require snapshot version 4")
         if (
             snapshot.input.project.display_text != snapshot.selections.budget_code.label
             or snapshot.input.project.manual_text != snapshot.selections.budget_code.label
@@ -1345,9 +1490,12 @@ def _validate_business_snapshot(snapshot: ReimbursementSnapshot) -> None:
     if subsidy is not None:
         if request.trip is None:
             raise ValueError("subsidy requires trip input")
-        if subsidy.calendar_days != (
-            request.trip.end_date - request.trip.start_date
-        ).days + 1 or money_string(subsidy.effective_days * subsidy.daily_rate) != money_string(
+        if (
+            subsidy.trip_type != request.trip.subsidy_trip_type()
+            or subsidy.calendar_days != (request.trip.end_date - request.trip.start_date).days + 1
+        ):
+            raise ValueError("snapshot subsidy mismatch")
+        if money_string(subsidy.effective_days * subsidy.daily_rate) != money_string(
             subsidy.total
         ):
             raise ValueError("snapshot subsidy mismatch")
@@ -1388,7 +1536,7 @@ def _validate_business_snapshot(snapshot: ReimbursementSnapshot) -> None:
             or related.listed_to_ms < related.listed_from_ms
         ):
             raise ValueError("related approval source mismatch")
-        options.append(profile.travel_type_option)
+        options.append(_profile_selected_type(profile, related.source_travel_type_value))
     if any(item != snapshot.selections.travel_type for item in options):
         raise ValueError("travel type option mismatch")
     expected_values = _snapshot_form_values(

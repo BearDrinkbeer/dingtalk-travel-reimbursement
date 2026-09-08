@@ -24,6 +24,7 @@ export default defineConfig({
     },
   },
   server: {
+    strictPort: true,
     allowedHosts: process.env.DINGTALK_DEV_PUBLIC_HOST
       ? [process.env.DINGTALK_DEV_PUBLIC_HOST]
       : [],

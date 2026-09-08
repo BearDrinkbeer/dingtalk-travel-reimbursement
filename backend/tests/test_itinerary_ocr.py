@@ -259,6 +259,154 @@ def test_unknown_year_is_not_filled_with_current_year():
     assert parsed.summary.start_date is None
 
 
+def _parse_layout(text: str, layout: str | None = None):
+    return parse_itinerary_pages(
+        [
+            ItineraryPage(
+                1, tuple(OcrLine(line, 1) for line in text.splitlines()), layout or text, "pdf_text"
+            )
+        ],
+        page_count=1,
+        reference_year=2026,
+    )
+
+
+@pytest.mark.parametrize(
+    "amount_header", ["可开票金额", "可开票金额[元]", "实付金额", "金额（元）"]
+)
+def test_itinerary_amount_column_aliases_keep_the_actual_route(amount_header):
+    text = (
+        "打车行程单 人民币\n共1笔行程，合计18.39元\n"
+        f"序号  用车时间  起点  终点  {amount_header}\n"
+        "1  2026-07-02 22:07:47  测试起点  测试终点  ￥18.39"
+    )
+    result = _parse_layout(text)
+    assert result.complete
+    assert result.trips[0].amount == Decimal("18.39")
+    assert (result.trips[0].origin, result.trips[0].destination) == ("测试起点", "测试终点")
+
+
+def test_month_day_uses_explicit_trip_range_not_application_date_or_current_year():
+    text = (
+        "打车行程单 人民币\n申请日期：2026-07-08 · 行程起止日期：2025-07-03至2025-07-03\n"
+        "合计7.10元\n"
+        "序号  上车时间              城市      起点                终点         金额[元]  备注\n"
+        "1     07-03 08:58 周五      测试市  起点酒店完整名称        测试终点      7.10"
+    )
+    result = _parse_layout(text)
+    assert result.complete
+    assert result.trips[0].date == date(2025, 7, 3)
+    assert result.trips[0].amount == Decimal("7.10")
+    assert result.trips[0].origin == "起点酒店完整名称"
+    assert result.trips[0].destination == "测试终点"
+
+
+@pytest.mark.parametrize("range_text", ["", "行程起止日期：2025-12-31至2026-01-01"])
+def test_partial_trip_date_stays_incomplete_without_an_unambiguous_document_year(range_text):
+    text = (
+        f"打车行程单 人民币\n{range_text}\n合计7.10元\n"
+        "序号  上车时间  起点  终点  金额\n"
+        "1  07-03 08:58  测试起点  测试终点  7.10"
+    )
+    assert not _parse_layout(text).complete
+    assert not _parse_layout(text).trips
+
+
+def test_combined_route_header_and_wrapped_text_above_row_preserve_both_endpoints():
+    def row(*entries):
+        line = ""
+        for position, value in entries:
+            line += " " * max(2 if line else 0, position - len(line)) + value
+        return line
+
+    text = "\n".join(
+        [
+            "享道出行一行程单",
+            "行程时间：2026-07-01至2026-07-01",
+            "行程总计：共1笔行程，总计可开票金额16.61元",
+            row((323, "可开票金额")),
+            row(
+                (63, "序号"),
+                (87, "订单类型"),
+                (134, "上车时间"),
+                (178, "所在城市"),
+                (250, "起点/终点"),
+                (332, "(元)"),
+            ),
+            row((206, "测试机场酒店/测试技术")),
+            row(
+                (68, "1"),
+                (92, "舒享"),
+                (123, "2026-07-0108:34:53"),
+                (180, "测试市"),
+                (242, "有限公司-东大门"),
+                (333, "16.61"),
+            ),
+        ]
+    )
+    result = _parse_layout(text)
+    assert result.complete
+    assert result.summary.amount == Decimal("16.61")
+    assert result.trips[0].date == date(2026, 7, 1)
+    assert result.trips[0].origin == "测试机场酒店"
+    assert result.trips[0].destination == "测试技术有限公司-东大门"
+
+
+def test_column_headers_are_never_used_as_single_trip_addresses():
+    result = _parse_layout(
+        "打车行程单 人民币\n行程日期：2026-07-02\n合计19.98元\n"
+        "序号\n上车时间\n起点\n终点\n里程[公里]可开票金额[元]"
+    )
+    assert not result.complete
+    assert not result.trips
+    assert "ITINERARY_ROWS_INCOMPLETE" in result.warnings
+
+
+def test_table_total_without_readable_rows_is_not_complete():
+    result = _parse_layout(
+        "打车行程单 人民币\n行程日期：2026-07-02\n合计19.98元\n"
+        "序号  上车时间  起点  终点  金额\n无法读取的表格"
+    )
+    assert result.summary.amount == Decimal("19.98")
+    assert not result.complete
+
+
+def test_joined_destination_and_mileage_stays_incomplete_instead_of_becoming_an_address():
+    result = _parse_layout(
+        "打车行程单 人民币\n合计19.98元\n"
+        "序号  上车时间  起点  终点  里程[公里]  可开票金额[元]\n"
+        "1  2026-07-02  测试起点  测试终点7.4  7.4  19.98"
+    )
+    assert not result.complete
+    assert not result.trips
+
+
+def test_yen_symbol_on_baidu_itinerary_does_not_force_currency_or_create_an_expense():
+    result = _parse_layout(
+        "百度地图打车行程单\n共1笔行程\n"
+        "序号  用车时间  服务方  起点  终点  实付金额\n"
+        "1  2026-06-30  哈啰出行  测试起点  测试终点  ￥14.97"
+    )
+    assert result.summary.amount == Decimal("14.97")
+    assert result.summary.currency is None
+    assert not result.complete
+    assert result.warnings == ("ITINERARY_CURRENCY_UNKNOWN",)
+
+
+@pytest.mark.parametrize("currency", ["", "JPY", "USD", "港元"])
+def test_recognized_baidu_domestic_template_resolves_yuan_but_never_overrides_foreign_currency(
+    currency,
+):
+    result = _parse_layout(
+        f"百度地图打车行程单\nBAIDU MAP ITINERARY\n{currency}\n共1笔行程\n"
+        "序号  用车时间  服务方  车型  城市  起点  终点  实付金额\n"
+        "1  2026-06-30  哈啰出行  快车  合肥  测试起点  测试终点  ￥14.97"
+    )
+    assert result.complete
+    assert result.summary.currency == ("HKD" if currency == "港元" else currency or "CNY")
+    assert result.summary.amount == Decimal("14.97")
+
+
 def test_partial_table_and_total_mismatch_are_not_auto_matchable():
     text = (
         "行程单 人民币\n日期  起点  终点  金额\n2026-09-03  测试甲  测试乙  12.30\n"
@@ -496,3 +644,98 @@ def test_labelled_table_identifier_columns_are_retained_per_trip():
     assert parsed.trips[0].order_numbers == ("ORDER-0012",)
     assert parsed.trips[1].invoice_numbers == ("000012345679",)
     assert parsed.summary.order_numbers == ("ORDER-0012", "ORDER-0034")
+
+
+def test_continuation_rows_inherit_explicit_document_date_range():
+    from app.ocr.itinerary import ItineraryPage, parse_itinerary_pages
+    from app.ocr.types import OcrLine
+
+    header = "序号  上车时间  起点  终点  金额"
+    pages = [
+        ItineraryPage(
+            1,
+            (
+                OcrLine("滴滴出行-行程单", 1),
+                OcrLine("申请日期：2026-09-07 · 行程起止日期：2026-08-25 至 2026-09-04", 1),
+                OcrLine("合计199.00元", 1),
+            ),
+            header + "\n1  08-25 08:15  酒店  公司  130.40",
+            "pdf_text",
+        ),
+        ItineraryPage(
+            2, (OcrLine(header, 1),), header + "\n11  09-04 08:28  公司  酒店  68.60", "pdf_text"
+        ),
+    ]
+    result = parse_itinerary_pages(pages, page_count=2, reference_year=2026)
+    assert len(result.trips) == 2
+    assert result.complete
+    assert str(result.summary.amount) == "199.00"
+    assert str(result.trips[1].date) == "2026-09-04"
+
+
+@pytest.mark.parametrize(
+    "range_text",
+    [
+        "申请日期：2026-09-07",
+        "行程起止日期：2025-12-25 至 2026-01-04",
+        "行程起止日期：2026-09-04 至 2026-08-25",
+    ],
+)
+def test_continuation_never_guesses_year_from_unusable_range(range_text):
+    header = "序号  上车时间  起点  终点  金额"
+    pages = [
+        ItineraryPage(
+            1, (OcrLine("行程单 合计199.00元", 1), OcrLine(range_text, 1)), "", "pdf_text"
+        ),
+        ItineraryPage(
+            2, (OcrLine(header, 1),), header + "\n11  09-04 08:28  公司  酒店  199.00", "pdf_text"
+        ),
+    ]
+    result = parse_itinerary_pages(pages, page_count=2, reference_year=2026)
+    assert not result.trips
+    assert not result.complete
+
+
+def test_worker_keeps_titleless_continuation_native(settings_factory, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import app.ocr.itinerary_worker as worker
+
+    path = tmp_path / "continuation.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=640, height=842)
+    writer.add_blank_page(width=640, height=842)
+    with path.open("wb") as output:
+        writer.write(output)
+    header = "序号  上车时间  起点  终点  金额"
+    texts = [
+        "滴滴出行-行程单\n申请日期：2026-09-07 行程起止日期：2026-08-25 至 2026-09-04\n"
+        "合计199.00元\n" + header + "\n1  08-25 08:15  酒店  公司  130.40",
+        header + "\n11  09-04 08:28  公司  酒店  68.60",
+    ]
+    monkeypatch.setattr(
+        worker,
+        "PdfReader",
+        lambda *a, **kw: SimpleNamespace(
+            pages=[SimpleNamespace(extract_text=lambda *a, text=t, **kw: text) for t in texts]
+        ),
+    )
+
+    class NoScan(FakeOcrEngine):
+        def recognize(self, path):
+            raise AssertionError("A native continuation must not invoke image OCR")
+
+    settings = settings_factory()
+    result = recognize_itinerary_worker(
+        str(path),
+        "pdf",
+        {},
+        settings.pdf_limits,
+        settings.ocr_worker_limits,
+        2026,
+        NoScan(),
+        classify=True,
+    )
+    assert result["parsed"].complete
+    assert len(result["parsed"].trips) == 2
+    assert result["parsed"].source == "pdf_text"

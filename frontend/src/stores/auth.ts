@@ -30,6 +30,7 @@ export const useAuthStore = defineStore('auth', () => {
   const status = ref<AuthStatus>('idle')
   const session = ref<AuthSession | null>(null)
   const errorMessage = ref('')
+  const appTitle = ref('智能差旅费报销申请')
   let bootstrapPromise: Promise<void> | null = null
 
   const initialized = computed(() => status.value !== 'idle' && status.value !== 'loading')
@@ -71,6 +72,8 @@ export const useAuthStore = defineStore('auth', () => {
 
   async function refreshPublicConfig() {
     const config = await getPublicConfig()
+    appTitle.value = config.appTitle?.trim() || '智能差旅费报销申请'
+    document.title = appTitle.value
     useExpenseStore().setReceiptUploadLimits(config.uploadLimits)
     useExpenseStore().setExpenseItemLimit(config.expenseLimits.maxItems)
     useReimbursementSubmissionStore().oaSubmissionEnabled = config.oaSubmissionEnabled === true
@@ -153,6 +156,7 @@ export const useAuthStore = defineStore('auth', () => {
     errorMessage,
     initialized,
     isAdmin,
+    appTitle,
     bootstrap,
     refreshMe,
     refreshPublicConfig,

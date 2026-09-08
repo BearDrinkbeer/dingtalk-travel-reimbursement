@@ -11,6 +11,7 @@ from app.core.config import Settings
 from app.core.errors import ApiError
 from app.database.session import get_db
 from app.schemas.common import success
+from app.services.application_settings import get_app_title
 from app.services.dingtalk import DepartmentIdentity, DingTalkIdentity, DingTalkService
 from app.services.file_coordination import (
     FileOperationBusy,
@@ -78,7 +79,10 @@ def _login_response(
 
 
 @router.get("/config/public")
-def public_config(request: Request) -> dict[str, object]:
+def public_config(
+    request: Request,
+    database: Annotated[Session, Depends(get_db)],
+) -> dict[str, object]:
     settings: Settings = request.app.state.settings
     return success(
         {
@@ -87,6 +91,7 @@ def public_config(request: Request) -> dict[str, object]:
             "authMockEnabled": settings.app_env in {"development", "test"}
             and settings.auth_mock_enabled,
             "oaSubmissionEnabled": settings.dingtalk_oa_worker_enabled,
+            "appTitle": get_app_title(database),
             "uploadLimits": {
                 "maxFiles": settings.session_max_files,
                 "maxFileBytes": settings.upload_max_file_bytes,

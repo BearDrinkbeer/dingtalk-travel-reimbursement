@@ -99,12 +99,12 @@ GET /api/travel-approvals?type=domestic&from=2026-05-01&to=2026-09-01
 {
   "processInstanceId": "RgJJ1veyQl2A...",
   "businessId": "审批页展示的业务编号",
-  "title": "王广硕提交的境内出差申请",
+  "title": "测试员工提交的境内出差申请",
   "status": "COMPLETED",
   "result": "agree",
   "startTime": "2026-06-30",
   "endTime": "2026-07-07",
-  "project": "26007 合肥长鑫前道MES项目"
+  "project": "26007 合肥示例前道MES项目"
 }
 ```
 
@@ -152,7 +152,7 @@ GET /api/travel-approvals?type=domestic&from=2026-05-01&to=2026-09-01
   "formComponentValues": [
     {
       "name": "预算代码",
-      "value": "26007 合肥长鑫前道MES项目"
+      "value": "26007 合肥示例前道MES项目"
     },
     {
       "name": "关联审批单",
@@ -192,9 +192,9 @@ GET /api/travel-approvals?type=domestic&from=2026-05-01&to=2026-09-01
 [境内出差] [境外出差]
 [仅显示审批通过]  [最近120天]
 
-□ 王广硕提交的境内出差申请
+□ 测试员工提交的境内出差申请
   2026-06-30 至 2026-07-07
-  26007 合肥长鑫前道MES项目
+  26007 合肥示例前道MES项目
   审批通过
 
 [确定]

@@ -50,6 +50,15 @@ def test_purpose_migration_preserves_linked_itineraries_and_locked_snapshots(tmp
             before = connection.execute(
                 "SELECT form_snapshot_json, snapshot_sha256 FROM reimbursement_submissions"
             ).fetchall()
+            connection.execute(
+                "UPDATE reimbursement_drafts SET status='LOCKED', locked_at='2026-09-06' "
+                "WHERE id=?",
+                (draft_id,),
+            )
+            before_triggers = connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'trg_reimbursement_%' ORDER BY name"
+            ).fetchall()
         command.upgrade(config, "head")
         with sqlite3.connect(path) as connection:
             assert connection.execute(
@@ -62,6 +71,27 @@ def test_purpose_migration_preserves_linked_itineraries_and_locked_snapshots(tmp
                 == before
             )
             assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+            assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+            assert (
+                connection.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+                    "AND name LIKE 'trg_reimbursement_%' ORDER BY name"
+                ).fetchall()
+                == before_triggers
+            )
+            # Hotel purpose works on the recreated table; downgrade refuses to
+            # discard this evidence while preserving the locked snapshot bytes.
+            connection.execute(
+                "UPDATE reimbursement_draft_files SET attachment_kind='hotel_bill' "
+                "WHERE id='unclassified-old'"
+            )
+        with pytest.raises(RuntimeError, match="hotel stay evidence"):
+            command.downgrade(config, "20260907_0014")
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                "UPDATE reimbursement_draft_files SET attachment_kind='other' "
+                "WHERE id='unclassified-old'"
+            )
         with pytest.raises(RuntimeError, match="purpose"):
             command.downgrade(config, "20260906_0012")
     finally:

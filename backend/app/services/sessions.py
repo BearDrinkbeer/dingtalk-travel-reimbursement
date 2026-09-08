@@ -17,6 +17,7 @@ from app.core.errors import ApiError
 from app.core.security import random_token, token_hash, tokens_match
 from app.database.session import get_db
 from app.models.session import UserSession, utc_now
+from app.services.application_settings import get_additional_admin_ids
 from app.services.dingtalk import DepartmentIdentity, DingTalkIdentity
 
 
@@ -139,7 +140,7 @@ def create_session(
         current_department_id=selected.id if selected else None,
         current_department_name=selected.name if selected else None,
         csrf_token_hash=token_hash(csrf_token, settings.session_secret),
-        is_admin=identity.user_id in settings.admin_ids,
+        is_admin=identity.user_id in (settings.admin_ids | get_additional_admin_ids(database)),
         created_at=now,
         expires_at=now + timedelta(minutes=settings.session_ttl_minutes),
         last_seen_at=now,
@@ -205,7 +206,9 @@ def get_current_session(
         database.commit()
         raise ApiError("UNAUTHORIZED", "登录身份数据已更新，请重新进入", 401)
     changed = False
-    current_admin = record.dingtalk_user_id in settings.admin_ids
+    current_admin = record.dingtalk_user_id in (
+        settings.admin_ids | get_additional_admin_ids(database)
+    )
     if record.is_admin != current_admin:
         # The database column is only a cache for inspection. Authorization is
         # always re-derived from current configuration on every session load.

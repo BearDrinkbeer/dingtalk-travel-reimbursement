@@ -18,6 +18,9 @@ const candidate: OaTravelApproval = {
   profileDisplayName: '境内出差',
   sourceProcessCode: 'PROC-TRAVEL',
   travelTypeOption: { value: 'business', label: '境内出差', key: null },
+  companyOption: { value: 'company-1', label: '北京公司', key: null },
+  budgetCodeOption: { value: 'budget-1', label: '预算1', key: null },
+  unavailableReason: null,
   title: '合肥出差申请',
   businessId: 'TRAVEL-1',
   startDate: '2026-09-01',
@@ -92,6 +95,30 @@ describe('TravelApprovalSelector', () => {
     wrapper.unmount()
   })
 
+  it('disables mismatched and unavailable approvals with reasons and keeps selections removable', () => {
+    const drafts = useReimbursementDraftStore()
+    drafts.travelApprovals = [candidate,
+      { ...candidate, processInstanceId: 'other-company', companyOption: { value: 'other', label: '另一公司', key: null } },
+      { ...candidate, processInstanceId: 'other-budget', budgetCodeOption: { value: 'other', label: '另一预算', key: null } },
+      { ...candidate, processInstanceId: 'other-type', travelTypeOption: { value: 'other', label: '另一类别', key: null } },
+      { ...candidate, processInstanceId: 'missing', companyOption: null, unavailableReason: '出差审批的所属公司缺失' },
+    ]
+    const wrapper = mount(TravelApprovalSelector, {
+      props: { modelValue: [selection] }, global: { plugins: [ElementPlus] },
+    })
+    expect(wrapper.findAllComponents({ name: 'ElCheckbox' }).map((item) => item.props('disabled')))
+      .toEqual([false, true, true, true, true])
+    expect(wrapper.text()).toContain('所属公司与已选审批不同')
+    expect(wrapper.text()).toContain('预算代码与已选审批不同')
+    expect(wrapper.text()).toContain('出差类别与已选审批不同')
+    expect(wrapper.text()).toContain('出差审批的所属公司缺失')
+    wrapper.findAllComponents({ name: 'ElCheckbox' })[1]!.vm.$emit('change', true)
+    expect(wrapper.emitted('update:modelValue')).toBeUndefined()
+    wrapper.findAllComponents({ name: 'ElCheckbox' })[0]!.vm.$emit('change', false)
+    expect(wrapper.emitted('update:modelValue')?.[0]).toEqual([[]])
+    wrapper.unmount()
+  })
+
   it('loads candidates by an explicit date range and keyword', async () => {
     const drafts = useReimbursementDraftStore()
     drafts.travelApprovals = [candidate]
@@ -119,6 +146,35 @@ describe('TravelApprovalSelector', () => {
       to: '2026-09-04',
       query: '合肥',
     })
+    wrapper.unmount()
+  })
+
+  it.each([true, false])('restores dynamic source type without falling back to a fixed option (%s)', (hasSource) => {
+    const drafts = useReimbursementDraftStore()
+    drafts.travelApprovals = [{ ...candidate, processInstanceId: 'new-travel' }]
+    drafts.reimbursementOptions = {
+      templateConfigVersion: 1, reimbursementProcessCode: 'PROC-R', companyOptions: [], budgetCodeOptions: [],
+      travelProfiles: [{ profileKey: 'business', displayName: '境内', processCode: 'PROC-TRAVEL',
+        schemaFingerprint: 'a'.repeat(64), travelTypeOption: { value: 'wrong-fixed', label: '固定', key: null },
+        travelTypeMappings: { source: candidate.travelTypeOption } }],
+    }
+    drafts.currentDraft = {
+      id: 'draft', status: 'DRAFT', revision: 1, department: { id: '1', name: '部门' },
+      templateConfigVersion: 1, relatedApprovalCount: 1, expiresAt: '', createdAt: '', updatedAt: '', lockedAt: null,
+      template: { processCode: 'PROC-R', configVersion: 1, schemaFingerprint: 'a'.repeat(64) },
+      input: { companyValue: 'company-1', budgetCodeValue: 'budget-1', trip: null, items: [],
+        ocrDispositionVersion: 1, dismissedOcrFileIds: [] },
+      totals: { expenseTotal: '0.00', subsidyTotal: '0.00', totalAmount: '0.00', receiptCount: 0, uppercaseAmount: '零元整', subsidy: null },
+      relatedApprovals: [], relatedApprovalSummary: null,
+    }
+    const wrapper = mount(TravelApprovalSelector, {
+      props: { modelValue: [selection], linkedApprovals: [{ ...linked, sourceTravelTypeValue: hasSource ? 'source' : undefined }] },
+      global: { plugins: [ElementPlus] },
+    })
+    const options = wrapper.findAllComponents({ name: 'ElCheckbox' })
+    expect(options[0]?.props('disabled')).toBe(!hasSource)
+    if (!hasSource) expect(wrapper.text()).toContain('出差类别来源失效')
+    else expect(wrapper.text()).not.toContain('出差类别与已选审批不同')
     wrapper.unmount()
   })
 })

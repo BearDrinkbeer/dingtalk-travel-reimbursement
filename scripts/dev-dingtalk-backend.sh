@@ -4,6 +4,13 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 PROJECT_DIR=$(dirname "$SCRIPT_DIR")
 CONFIG_FILE=${DINGTALK_DEV_ENV_FILE:-"$PROJECT_DIR/.env.dingtalk-dev"}
+if [ "${1:-}" = prod ]; then
+    CONFIG_FILE="$PROJECT_DIR/.env"
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "正式公司联调需要项目根目录 .env。" >&2
+        exit 2
+    fi
+fi
 DETECTION_MODEL_DIR="$PROJECT_DIR/backend/models/PP-OCRv6_small_det"
 RECOGNITION_MODEL_DIR="$PROJECT_DIR/backend/models/PP-OCRv6_small_rec"
 
@@ -67,6 +74,13 @@ export DATABASE_URL=sqlite:///./data/dev-dingtalk.db
 export TEMP_DIR=/tmp/dingtalk-expense-dingtalk-dev
 REIMBURSEMENT_STAGING_DIR=${REIMBURSEMENT_STAGING_DIR:-"$PROJECT_DIR/backend/data/reimbursement-staging"}
 export REIMBURSEMENT_STAGING_DIR
+if [ "${1:-}" = prod ]; then
+    export DATABASE_URL=sqlite:///./data/dev-dingtalk-prod.db
+    export TEMP_DIR=/tmp/dingtalk-expense-dingtalk-prod
+    export REIMBURSEMENT_STAGING_DIR="$PROJECT_DIR/backend/data/reimbursement-staging-prod"
+    export SESSION_COOKIE_NAME=expense_dingtalk_prod_session
+    echo "正式公司本地联调：使用独立数据；提交会进入真实 OA。模板目录需在本环境确认。"
+fi
 export REIMBURSEMENT_STAGING_MAX_BYTES=${REIMBURSEMENT_STAGING_MAX_BYTES:-4294967296}
 export EXCEL_TEMPLATE_PATH=app/templates/expense_template.xlsx
 export OCR_ENABLED=true

@@ -22,6 +22,7 @@ export interface ReimbursementDraftExpenseItemInput extends Omit<ExcelExpenseIte
   itineraryFileIds?: string[]
   itineraryAutoMatchDisabled?: boolean
   paymentProofFileIds?: string[]
+  hotelBillFileIds?: string[]
   railType?: ExpenseItem['railType']
   requiresItinerary?: boolean
   transportType?: ExpenseItem['transportType']
@@ -36,6 +37,7 @@ export interface ReimbursementDraftInput extends Omit<ExcelGeneratePayload, 'ite
   editingState?: { includeSubsidy: boolean; trip: TripInput }
   ocrDispositionVersion: 0 | 1
   companyValue: string
+  accountingSourceVerified?: boolean
   budgetCodeValue: string
   items: ReimbursementDraftExpenseItemInput[]
   dismissedOcrFileIds: string[]
@@ -71,6 +73,7 @@ export interface ReimbursementRelatedApprovalQueryWindow {
 }
 
 export interface ReimbursementRelatedApproval {
+  sourceTravelTypeValue?: string
   processInstanceId: string
   profileKey: string
   sourceProcessCode: string
@@ -104,6 +107,7 @@ export interface ReimbursementDraftList {
 }
 
 export interface OaReimbursementTravelProfile {
+  travelTypeMappings?: Record<string, OaFormOption>
   profileKey: string
   displayName: string
   processCode: string
@@ -130,6 +134,9 @@ export interface OaTravelApproval {
   profileDisplayName: string
   sourceProcessCode: string
   travelTypeOption: OaFormOption
+  companyOption?: OaFormOption | null
+  budgetCodeOption?: OaFormOption | null
+  unavailableReason?: string | null
   title: string
   businessId: string
   startDate: string
@@ -157,7 +164,7 @@ export type ReimbursementDraftFileRole =
   | 'EXPENSE_SOURCE'
   | 'ATTACHMENT_ONLY'
 
-export type ReimbursementAttachmentKind = 'itinerary' | 'payment_proof' | 'other'
+export type ReimbursementAttachmentKind = 'itinerary' | 'payment_proof' | 'hotel_bill' | 'other'
 
 export type ReimbursementDraftFileStatus =
   | 'RESERVED'
@@ -184,6 +191,28 @@ export interface ReimbursementDraftFile {
   sizeBytes: number
   ocrStatus: ReimbursementDraftFileOcrStatus
   ocrResult: OcrReceiptCandidate | ItineraryOcrResult | null
+  paymentDetails?: {
+    amount: string | null
+    date: string | null
+    description: string | null
+    categoryId: string | null
+  } | null
+  hotelBillDetails?: {
+    guest?: string | null
+    checkIn?: string | null
+    checkOut?: string | null
+    nights?: number | null
+    nightlyRate?: string | null
+    total?: string | null
+    currency?: string | null
+    warnings: string[]
+  } | null
+  materialClassification?: {
+    status: 'pending' | 'classified' | 'needs_confirmation' | 'confirmed'
+    kind: 'expense' | 'itinerary' | 'payment_proof' | 'hotel_bill' | 'other' | 'unknown'
+    reason: string | null
+    pageCount: number | null
+  } | null
 }
 
 export function receiptOcrResult(file: ReimbursementDraftFile | undefined): OcrReceiptCandidate | null {
@@ -223,6 +252,7 @@ export interface ReimbursementDraftFileUpdate {
 export interface ReimbursementDraftOcrInput {
   expectedRevision: number
   tripYear?: number
+  allowUploadOverlap?: boolean
 }
 
 export interface ReimbursementExcelPreview {

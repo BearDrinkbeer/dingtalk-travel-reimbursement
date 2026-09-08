@@ -118,17 +118,29 @@ class TemplateMappingsWrite(StrictRequest):
 class TravelMappingsWrite(StrictRequest):
     start_date: str = Field(alias="startDate", min_length=1, max_length=128)
     end_date: str = Field(alias="endDate", min_length=1, max_length=128)
+    company: str | None = Field(default=None, min_length=1, max_length=128)
+    budget_code: str | None = Field(default=None, alias="budgetCode", min_length=1, max_length=128)
+    travel_type: str | None = Field(default=None, alias="travelType", min_length=1, max_length=128)
 
     @field_validator("*")
     @classmethod
-    def normalize_component_id(cls, value: str) -> str:
+    def normalize_component_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         normalized = value.strip()
         if not normalized:
             raise ValueError("component id must not be blank")
         return normalized
 
     def as_mapping(self) -> dict[str, str]:
-        return {"startDate": self.start_date, "endDate": self.end_date}
+        mappings = {"startDate": self.start_date, "endDate": self.end_date}
+        if self.company is not None:
+            mappings["company"] = self.company
+        if self.budget_code is not None:
+            mappings["budgetCode"] = self.budget_code
+        if self.travel_type is not None:
+            mappings["travelType"] = self.travel_type
+        return mappings
 
 
 class FormOptionWrite(StrictRequest):
@@ -164,6 +176,9 @@ class TravelCatalogConfirmation(TravelProfileHeader):
     )
     mappings: TravelMappingsWrite
     travel_type_option: FormOptionWrite = Field(alias="travelTypeOption")
+    travel_type_mappings: dict[str, FormOptionWrite] | None = Field(
+        default=None, alias="travelTypeMappings"
+    )
 
     def as_confirmation(self) -> TravelProfileConfirmation:
         return TravelProfileConfirmation(
@@ -173,6 +188,11 @@ class TravelCatalogConfirmation(TravelProfileHeader):
             schema_fingerprint=self.schema_fingerprint,
             mappings=self.mappings.as_mapping(),
             travel_type_option=self.travel_type_option.as_option(),
+            travel_type_mappings=(
+                {key: value.as_option() for key, value in self.travel_type_mappings.items()}
+                if self.travel_type_mappings is not None
+                else None
+            ),
         )
 
 

@@ -72,6 +72,7 @@ export interface OaTravelTemplateInspection {
   logicalFields: OaLogicalField[]
   mappings: OaFieldMappings | null
   travelTypeOption: OaFormOption | null
+  travelTypeMappings?: Record<string, OaFormOption>
   confirmedSchemaFingerprint: string | null
 }
 
@@ -148,6 +149,7 @@ export interface ConfirmOaTravelTemplateInput extends OaTravelProfileHeader {
   schemaFingerprint: string
   mappings: OaFieldMappings
   travelTypeOption: OaFormOption
+  travelTypeMappings?: Record<string, OaFormOption>
 }
 
 export interface ConfirmOaTemplateCatalogInput {

@@ -182,6 +182,7 @@ class ReimbursementQuotaCoordinator:
         reserved_bytes: int,
         expires_at: datetime,
         attachment_kind: str = "other",
+        ocr_result_json: str | None = None,
     ) -> QuotaReservation:
         _require_positive_size(reserved_bytes)
         _require_sort_order(sort_order)
@@ -240,6 +241,7 @@ class ReimbursementQuotaCoordinator:
                         media_type=_required_text(media_type, maximum=128),
                         size_bytes=None,
                         sha256=None,
+                        ocr_result_json=ocr_result_json,
                     )
                 )
         except IntegrityError as exc:

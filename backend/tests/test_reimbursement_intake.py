@@ -8,7 +8,7 @@ import pytest
 from conftest import mock_login
 from openpyxl import load_workbook
 from pypdf import PdfWriter
-from test_reimbursement_drafts import _add_active_file, _catalog, _create, _input, _install_catalog
+from test_reimbursement_drafts import _add_active_file, _create, _input, _install_catalog
 from test_reimbursement_files import _image_bytes, _insert_draft, _upload
 
 from app.core.errors import ApiError
@@ -68,10 +68,19 @@ def test_partial_input_autosaves_and_incomplete_values_never_enter_totals(
 def test_budget_option_overrides_obsolete_project_and_full_label_reaches_excel(
     client_factory, monkeypatch
 ):
+    from dataclasses import replace
+
+    from test_reimbursement_drafts import (
+        FakeTravelWorkflow,
+        _catalog_with_travel,
+        _selection,
+        _travel_instance,
+    )
+
     from app.integrations.dingtalk.workflow import FormOption
     from app.services import reimbursement_drafts
 
-    catalog = _catalog()
+    catalog = _catalog_with_travel()
     label = "26007 " + "国际项目预算明细" * 50
     catalog.reimbursement.schema.components[1].options = (
         FormOption(value="26007", label=label, key=None),
@@ -83,11 +92,34 @@ def test_budget_option_overrides_obsolete_project_and_full_label_reaches_excel(
     response = _create(client, headers, {**_input(), "project": {"mode": "selected", "id": 999999}})
     assert response.status_code == 201, response.text
     data = response.json()["data"]
+    assert data["input"]["project"] is None
+
+    class BudgetWorkflow(FakeTravelWorkflow):
+        async def get_process_instance(self, instance_id):
+            instance = _travel_instance(instance_id)
+            return replace(
+                instance,
+                form_values=tuple(
+                    replace(value, value=label)
+                    if value.component_id == "source-budget"
+                    else value
+                    for value in instance.form_values
+                ),
+            )
+
+    client.app.state.dingtalk_workflow = BudgetWorkflow()
+    linked = client.put(
+        f"/api/reimbursements/drafts/{data['id']}/related-approvals",
+        headers=headers,
+        json={"expectedRevision": 1, "selections": [_selection()]},
+    )
+    assert linked.status_code == 200, linked.text
+    data = linked.json()["data"]
     assert data["input"]["project"] == {"mode": "manual", "text": label}
     preview = client.post(
         f"/api/reimbursements/drafts/{data['id']}/excel-preview",
         headers=headers,
-        json={"expectedRevision": 1},
+        json={"expectedRevision": 2},
     )
     assert preview.status_code == 200, preview.text
     workbook = load_workbook(io.BytesIO(preview.content))
@@ -157,9 +189,14 @@ def test_authoritative_ride_hailing_evidence_cannot_be_cleared_by_client(
 
 
 @pytest.mark.parametrize("bad_link", ["unknown", "invoice", "other_record", "deleted"])
-@pytest.mark.parametrize("proof_field", ["itineraryFileIds", "paymentProofFileIds"])
+@pytest.mark.parametrize(
+    "proof_field", ["itineraryFileIds", "paymentProofFileIds", "hotelBillFileIds"]
+)
 def test_proof_must_be_active_support_from_same_application(
-    client_factory, monkeypatch, bad_link, proof_field,
+    client_factory,
+    monkeypatch,
+    bad_link,
+    proof_field,
 ):
     client, headers, draft_id, source, support = _proof_setup(client_factory, monkeypatch)
     link = support
@@ -179,9 +216,11 @@ def test_proof_must_be_active_support_from_same_application(
     with client.app.state.database_session_factory() as database:
         linked_file = database.get(ReimbursementDraftFile, link)
         if linked_file is not None:
-            linked_file.attachment_kind = (
-                "payment_proof" if proof_field == "paymentProofFileIds" else "itinerary"
-            )
+            linked_file.attachment_kind = {
+                "paymentProofFileIds": "payment_proof",
+                "hotelBillFileIds": "hotel_bill",
+                "itineraryFileIds": "itinerary",
+            }[proof_field]
         if bad_link == "deleted":
             database.get(ReimbursementDraftFile, support).file_status = "PURGED"
             database.get(ReimbursementDraftFile, support).purged_at = utc_now()

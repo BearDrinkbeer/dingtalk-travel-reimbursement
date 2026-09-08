@@ -77,6 +77,8 @@ def _catalog_with_travel(*, travel_type: str = "市外项目出差（短期）")
             schema=SimpleNamespace(fingerprint="d" * 64),
             start_date_component_id="travel-start",
             end_date_component_id="travel-end",
+            company_component_id="source-company",
+            budget_code_component_id="source-budget",
             travel_type_option=FormOption(
                 value=travel_type,
                 label=travel_type,
@@ -111,6 +113,7 @@ def _input() -> dict[str, object]:
                 "itineraryFileIds": [],
                 "itineraryAutoMatchDisabled": False,
                 "paymentProofFileIds": [],
+                "hotelBillFileIds": [],
                 "railType": "unknown",
                 "requiresItinerary": False,
                 "cnyAmountConfirmed": False,
@@ -118,6 +121,16 @@ def _input() -> dict[str, object]:
             }
         ],
         "dismissedOcrFileIds": [],
+    }
+
+
+def _without_accounting(value):
+    return {
+        **value,
+        "companyValue": "",
+        "budgetCodeValue": "",
+        "project": None,
+        "accountingSourceVerified": False,
     }
 
 
@@ -174,6 +187,10 @@ def _travel_instance(
         created_at="2026-08-01T08:00:00+08:00",
         finished_at="2026-08-02T08:00:00+08:00",
         form_values=(
+            WorkflowFormValue(
+                "source-company", "所属公司", "DDSelectField", "北京公司", None, None
+            ),
+            WorkflowFormValue("source-budget", "预算代码", "DDSelectField", "MES 项目", None, None),
             WorkflowFormValue(
                 component_id="travel-start",
                 name="开始日期",
@@ -339,7 +356,7 @@ def test_create_list_read_and_update_draft_are_persistent_and_canonical(
         "configVersion": 12,
         "schemaFingerprint": "a" * 64,
     }
-    assert draft["input"] == _input()
+    assert draft["input"] == _without_accounting(_input())
     assert draft["totals"] == {
         "expenseTotal": "44.89",
         "subsidyTotal": "200.00",
@@ -361,7 +378,7 @@ def test_create_list_read_and_update_draft_are_persistent_and_canonical(
     assert listed.status_code == 200
     assert [item["id"] for item in listed.json()["data"]["items"]] == [draft_id]
     assert detail.status_code == 200
-    assert detail.json()["data"]["input"] == _input()
+    assert detail.json()["data"]["input"] == _without_accounting(_input())
 
     changed = _input()
     changed["items"][0]["amount"] = "50.00"
@@ -379,7 +396,7 @@ def test_create_list_read_and_update_draft_are_persistent_and_canonical(
         assert stored is not None
         assert stored.revision == 2
         assert stored.input_json == json.dumps(
-            changed,
+            _without_accounting(changed),
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
@@ -850,19 +867,21 @@ def test_stale_revision_and_invalid_oa_options_leave_the_draft_unchanged(
     assert delete_conflict.status_code == 409
     assert delete_conflict.json()["error"]["code"] == "REIMBURSEMENT_DRAFT_REVISION_CONFLICT"
 
-    invalid = _input()
+    invalid = dict(first)
     invalid["companyValue"] = "客户端伪造公司"
+    invalid["accountingSourceVerified"] = True
     rejected = client.put(
         f"/api/reimbursements/drafts/{draft_id}",
         json={"expectedRevision": 2, "input": invalid},
         headers=headers,
     )
-    assert rejected.status_code == 422
-    assert rejected.json()["error"]["code"] == "REIMBURSEMENT_COMPANY_OPTION_INVALID"
+    assert rejected.status_code == 200
+    assert rejected.json()["data"]["input"]["companyValue"] == ""
+    assert rejected.json()["data"]["input"]["accountingSourceVerified"] is False
 
     unchanged = client.get(f"/api/reimbursements/drafts/{draft_id}").json()["data"]
-    assert unchanged["revision"] == 2
-    assert unchanged["input"] == first
+    assert unchanged["revision"] == 3
+    assert unchanged["input"] == _without_accounting(first)
 
 
 def test_create_rejects_client_totals_identity_and_nonzero_initial_revision(
@@ -915,7 +934,14 @@ def test_expired_and_locked_drafts_are_visible_but_cannot_be_changed(
         expired.expires_at = utc_now() - timedelta(seconds=1)
         locked.status = ReimbursementDraftStatus.LOCKED.value
         locked.locked_at = utc_now()
+        locked.expires_at = utc_now() - timedelta(seconds=1)
         database.commit()
+
+    listed = client.get("/api/reimbursements/drafts")
+    assert listed.status_code == 200, listed.text
+    listed_by_id = {item["id"]: item for item in listed.json()["data"]["items"]}
+    assert listed_by_id[expired_id]["status"] == "EXPIRED"
+    assert listed_by_id[locked_id]["status"] == "LOCKED"
 
     expired_detail = client.get(f"/api/reimbursements/drafts/{expired_id}")
     assert expired_detail.status_code == 200
@@ -989,7 +1015,7 @@ def test_draft_can_be_read_after_application_restart(client_factory, monkeypatch
     response = restarted.get(f"/api/reimbursements/drafts/{draft_id}")
 
     assert response.status_code == 200
-    assert response.json()["data"]["input"] == _input()
+    assert response.json()["data"]["input"] == _without_accounting(_input())
     assert response.json()["data"]["revision"] == 1
 
 
@@ -1048,6 +1074,54 @@ def test_related_approvals_are_reverified_and_atomically_replace_the_snapshot(
         assert stored.related_instance_ids_json == '["travel-1"]'
         assert len(rows) == 1
         assert rows[0].travel_schema_fingerprint == "d" * 64
+
+
+def test_related_accounting_cannot_be_overridden_and_clear_preserves_work(
+    client_factory,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        reimbursement_drafts,
+        "require_submission_ready_catalog",
+        lambda _database: _catalog_with_travel(),
+    )
+    client = client_factory(auth_mock_enabled=True)
+    headers = {"X-CSRF-Token": mock_login(client)["csrfToken"]}
+    initial = _create(client, headers, {**_input(), "accountingSourceVerified": True}).json()[
+        "data"
+    ]
+    assert initial["input"]["companyValue"] == ""
+    assert initial["input"]["accountingSourceVerified"] is False
+    draft_id = initial["id"]
+    file_id = _add_active_file(client, draft_id)
+    client.app.state.dingtalk_workflow = FakeTravelWorkflow()
+    related = client.put(
+        f"/api/reimbursements/drafts/{draft_id}/related-approvals",
+        json={"expectedRevision": 1, "selections": [_selection()]},
+        headers=headers,
+    )
+    assert related.status_code == 200, related.text
+    derived = related.json()["data"]["input"]
+    assert (derived["companyValue"], derived["budgetCodeValue"]) == ("北京", "26007")
+    assert derived["project"] == {"mode": "manual", "text": "MES 项目"}
+    assert derived["accountingSourceVerified"] is True
+    spoofed = {**derived, "companyValue": "fake", "budgetCodeValue": "fake", "project": None}
+    saved = client.put(
+        f"/api/reimbursements/drafts/{draft_id}",
+        json={"expectedRevision": 2, "input": spoofed},
+        headers=headers,
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["data"]["input"] == derived
+    cleared = client.put(
+        f"/api/reimbursements/drafts/{draft_id}/related-approvals",
+        json={"expectedRevision": 3, "selections": []},
+        headers=headers,
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["data"]["input"] == _without_accounting(derived)
+    with client.app.state.database_session_factory() as database:
+        assert database.get(ReimbursementDraftFile, file_id) is not None
 
 
 def test_related_request_rejects_duplicate_or_claimed_source_fields_before_network(

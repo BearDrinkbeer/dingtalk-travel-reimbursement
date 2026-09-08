@@ -192,12 +192,15 @@ async def run_in_fresh_process(
 
 
 class KillableProcessRunner:
-    """Admit one local job and execute it in a fresh, killable process.
+    """Admit one local job per runner in a fresh, killable process.
 
     There is no business queue in V1. Callers get a short bounded admission
     wait. Every admitted job receives a new process, preventing the 5 GiB OCR
     profile (and its retained model state) from crossing into the 512 MiB
     image/PDF validation profile.
+
+    The application may give upload validation its own one-slot runner, so
+    lightweight bounded checks can overlap OCR without adding an OCR slot.
     """
 
     def __init__(

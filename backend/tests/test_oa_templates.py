@@ -332,6 +332,49 @@ def confirm(
     )
 
 
+def test_travel_accounting_mappings_survive_catalog_api_confirmation(client_factory) -> None:
+    def travel_response(process_code: str, _request: httpx.Request) -> httpx.Response:
+        payload = travel_schema_payload(process_code)
+        payload["result"]["schemaContent"]["items"].extend([
+            component("TextField", f"{process_code}-company", "所属公司"),
+            component("TextField", f"{process_code}-budget", "预算代码"),
+        ])
+        return httpx.Response(200, json=payload)
+
+    transport, _calls = transport_for_schema(
+        lambda _number, _request: httpx.Response(200, json=schema_payload()),
+        travel_response_factory=travel_response,
+    )
+    client, headers = admin_client(client_factory, transport)
+    response = inspect(client, headers)
+    assert response.status_code == 200, response.text
+    inspection = response.json()["data"]
+    mappings = {
+        code: {
+            "startDate": "travel-start-id",
+            "endDate": "travel-end-id",
+            "company": f"{code}-company",
+            "budgetCode": f"{code}-budget",
+        }
+        for code in TRAVEL_PROCESS_CODES
+    }
+    confirmed = confirm(
+        client,
+        headers,
+        inspection["reimbursement"]["schema"]["schemaFingerprint"],
+        travel_schema_fingerprints={
+            item["processCode"]: item["schema"]["schemaFingerprint"]
+            for item in inspection["travelProfiles"]
+        },
+        travel_mappings=mappings,
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    current = client.get("/api/admin/oa/templates/catalog")
+    assert current.status_code == 200, current.text
+    for profile in current.json()["data"]["catalog"]["travelProfiles"]:
+        assert profile["mappings"] == mappings[profile["processCode"]]
+
+
 def test_inspect_uses_official_signature_and_normalizes_safe_schema(client_factory) -> None:
     payload = schema_payload()
     payload["result"]["schemaContent"]["items"][0]["props"]["uploadUrl"] = (
@@ -974,7 +1017,7 @@ def test_unknown_business_suite_container_blocks_descendant_mapping(client_facto
 @pytest.mark.parametrize(
     ("allowed_process_codes", "smoke_test_confirmed", "status_code", "message"),
     [
-        (TRAVEL_PROCESS_CODES, False, 400, "冒烟测试"),
+        (TRAVEL_PROCESS_CODES, False, 200, '"relatedApprovalSmokeTestConfirmed":false'),
         ([TRAVEL_PROCESS_CODES[0], TRAVEL_PROCESS_CODES[0]], True, 400, "不能重复"),
         ([PROCESS_CODE], True, 400, "不能同时作为"),
         (["invalid process code"], True, 422, "请求参数不正确"),
@@ -1266,7 +1309,7 @@ def test_declared_relationship_policy_restricts_the_local_allowlist(client_facto
     assert accepted.json()["data"]["isSubmissionReady"] is True
 
 
-def test_submission_readiness_fails_closed_if_relationship_confirmation_is_lost(
+def test_submission_readiness_does_not_require_previous_smoke_test(
     client_factory,
 ) -> None:
     transport, _calls = transport_for_schema(
@@ -1287,8 +1330,8 @@ def test_submission_readiness_fails_closed_if_relationship_confirmation_is_lost(
 
     assert current.status_code == 200
     assert current.json()["data"]["compatibilityStatus"] == "COMPATIBLE"
-    assert current.json()["data"]["isSubmissionReady"] is False
-    assert current.json()["data"]["catalog"]["isSubmissionReady"] is False
+    assert current.json()["data"]["isSubmissionReady"] is True
+    assert current.json()["data"]["catalog"]["isSubmissionReady"] is True
     assert current.json()["data"]["catalog"]["relatedApprovalSmokeTestConfirmed"] is False
 
 

@@ -23,6 +23,7 @@ from app.services.reimbursement_drafts import draft_actor
 from app.services.reimbursement_submissions import (
     create_or_get_submission,
     find_owned_submission_for_draft,
+    request_submission_recheck,
     require_owned_submission,
 )
 from app.services.sessions import CurrentSession, get_current_session, require_csrf
@@ -122,6 +123,30 @@ def get_reimbursement_submission(
         submission_id=submission_id,
     )
     return success(_submission_data(submission))
+
+
+@router.post("/oa/reimbursements/submissions/{submission_id}/recheck")
+def recheck_reimbursement_submission(
+    submission_id: str,
+    request: Request,
+    database: Annotated[Session, Depends(get_db)],
+    current: Annotated[CurrentSession, Depends(require_csrf)],
+) -> dict[str, object]:
+    actor = draft_actor(current)
+    existing = require_owned_submission(database, actor=actor, submission_id=submission_id)
+    if existing.status == ReimbursementSubmissionStatus.SUBMITTED.value:
+        return success(_submission_data(existing))
+    if not request.app.state.settings.dingtalk_oa_worker_enabled:
+        raise ApiError("OA_SUBMISSION_DISABLED", "审批核对服务尚未启用，请联系管理员", 503)
+    return success(
+        _submission_data(
+            request_submission_recheck(
+                database,
+                actor=actor,
+                submission_id=submission_id,
+            )
+        )
+    )
 
 
 @router.get("/oa/reimbursements/drafts/{draft_id}/submission")

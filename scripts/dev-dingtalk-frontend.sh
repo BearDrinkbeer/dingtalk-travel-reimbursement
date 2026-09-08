@@ -4,6 +4,13 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 PROJECT_DIR=$(dirname "$SCRIPT_DIR")
 CONFIG_FILE=${DINGTALK_DEV_ENV_FILE:-"$PROJECT_DIR/.env.dingtalk-dev"}
+if [ "${1:-}" = prod ]; then
+    CONFIG_FILE="$PROJECT_DIR/.env"
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "正式公司联调需要项目根目录 .env。" >&2
+        exit 2
+    fi
+fi
 
 if [ -f "$CONFIG_FILE" ]; then
     set -a
@@ -20,6 +27,9 @@ fi
 # credentials in the Vite process environment even though Vite only exposes
 # variables with its public prefix.
 unset DINGTALK_CLIENT_SECRET DINGTALK_AGENT_ID SESSION_SECRET ADMIN_USER_IDS
+if [ "${1:-}" = prod ]; then
+    export DINGTALK_DEV_FRONTEND_PORT=5173
+fi
 
 DINGTALK_DEV_BIND_ADDRESS=${DINGTALK_DEV_BIND_ADDRESS:-127.0.0.1}
 DINGTALK_DEV_FRONTEND_PORT=${DINGTALK_DEV_FRONTEND_PORT:-5173}

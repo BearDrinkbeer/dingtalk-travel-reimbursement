@@ -1,5 +1,6 @@
 import ElementPlus from 'element-plus'
 import { ElMessageBox } from 'element-plus'
+import { createPinia } from 'pinia'
 import { flushPromises, mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -9,7 +10,7 @@ import {
   createReceiptKeyword,
   listReceiptKeywords,
 } from '@/api/receiptKeywords'
-import { getExpenseSettings } from '@/api/settings'
+import { getAdminExpenseSettings } from '@/api/settings'
 import SettingsAdminView from './SettingsAdminView.vue'
 
 vi.mock('@/api/expenses', () => ({ getExpenseCategories: vi.fn() }))
@@ -28,7 +29,7 @@ vi.mock('@/api/settings', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/api/settings')>()
   return {
     ...actual,
-    getExpenseSettings: vi.fn(),
+    getAdminExpenseSettings: vi.fn(),
     updateExpenseSettings: vi.fn(),
   }
 })
@@ -41,13 +42,17 @@ describe('SettingsAdminView receipt keywords', () => {
       unobserve(): void {}
       disconnect(): void {}
     }
-    vi.mocked(getExpenseSettings).mockResolvedValue({
+    vi.mocked(getAdminExpenseSettings).mockResolvedValue({
+      appTitle: '智能差旅费报销申请',
+      adminUserIds: [],
+      environmentAdminUserIds: ['admin-1'],
       subsidyRates: {
         business: '100.00',
         short_term_project: '100.00',
         long_term_project: '150.00',
         same_city_project: '50.00',
         internal: '100.00',
+        overseas: '0.00',
       },
       calculationMode: 'half_day_12',
     })
@@ -92,7 +97,7 @@ describe('SettingsAdminView receipt keywords', () => {
   it('lets an administrator add a fallback classification keyword', async () => {
     const wrapper = mount(SettingsAdminView, {
       global: {
-        plugins: [ElementPlus],
+        plugins: [createPinia(), ElementPlus],
         stubs: { RouterLink: { template: '<a><slot /></a>' } },
       },
     })
@@ -132,7 +137,7 @@ describe('SettingsAdminView receipt keywords', () => {
   it('shows an inline explanation when a one-character keyword is rejected', async () => {
     const wrapper = mount(SettingsAdminView, {
       global: {
-        plugins: [ElementPlus],
+        plugins: [createPinia(), ElementPlus],
         stubs: { RouterLink: { template: '<a><slot /></a>' } },
       },
     })
@@ -160,7 +165,7 @@ describe('SettingsAdminView receipt keywords', () => {
     const confirm = vi.spyOn(ElMessageBox, 'confirm').mockRejectedValue('cancel')
     const wrapper = mount(SettingsAdminView, {
       global: {
-        plugins: [ElementPlus],
+        plugins: [createPinia(), ElementPlus],
         stubs: { RouterLink: { template: '<a><slot /></a>' } },
       },
     })

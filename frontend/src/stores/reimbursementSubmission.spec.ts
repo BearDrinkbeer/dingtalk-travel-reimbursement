@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   getOaReimbursementSubmission,
   getOaReimbursementSubmissionForDraft,
+  recheckOaReimbursementSubmission,
   submitOaReimbursement,
 } from '@/api/reimbursements'
 import {
@@ -18,6 +19,7 @@ import type {
 vi.mock('@/api/reimbursements', () => ({
   getOaReimbursementSubmission: vi.fn(),
   getOaReimbursementSubmissionForDraft: vi.fn(),
+  recheckOaReimbursementSubmission: vi.fn(),
   submitOaReimbursement: vi.fn(),
 }))
 
@@ -55,6 +57,24 @@ function task(
 }
 
 describe('reimbursement submission store', () => {
+  it('rechecks an existing manual-review OA then polls without creating another approval', async () => {
+    const store = useReimbursementSubmissionStore()
+    vi.mocked(getOaReimbursementSubmissionForDraft).mockResolvedValue(task('MANUAL_REVIEW', 4, { processInstanceId: 'existing-oa' }))
+    await store.restore('draft-1', { discoverByDraft: true })
+    const pending = deferred<ReimbursementSubmission>()
+    vi.mocked(recheckOaReimbursementSubmission).mockReturnValue(pending.promise)
+    const first = store.recheck()
+    await store.recheck()
+    expect(recheckOaReimbursementSubmission).toHaveBeenCalledOnce()
+    pending.resolve(task('VERIFYING', 5, { processInstanceId: 'existing-oa' }))
+    await first
+    expect(store.status).toBe('VERIFYING')
+    vi.mocked(getOaReimbursementSubmission).mockResolvedValue(task('SUBMITTED', 6, { processInstanceId: 'existing-oa' }))
+    await store.pollNow()
+    expect(store.status).toBe('SUBMITTED')
+    expect(submitOaReimbursement).not.toHaveBeenCalled()
+    store.abort()
+  })
   beforeEach(() => {
     vi.useFakeTimers()
     setActivePinia(createPinia())

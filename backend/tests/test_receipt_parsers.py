@@ -43,48 +43,48 @@ def test_amount_date_route_helpers_are_strict_and_contextual() -> None:
     ("layout_text", "expected_date", "expected_route"),
     [
         (
-            "王  广 硕        证件号        2026-07-06      "
+            "测  试  员        证件号        2026-07-06      "
             "泊  寓 · 新  桥 产 业  园 店 东  侧      "
-            "长 鑫 存 储 公 司 东 一 门        惠选        出 租 车",
+            "示 例 存 储 公 司 东 一 门        惠选        出 租 车",
             date(2026, 7, 6),
-            "泊寓·新桥产业园店东侧-长鑫存储公司东一门",
+            "泊寓·新桥产业园店东侧-示例存储公司东一门",
         ),
         (
-            "姓名        证件号        2026-07-01        长鑫存储技术有限公司(东        "
+            "姓名        证件号        2026-07-01        示例存储技术有限公司(东        "
             "全季酒店(合肥新桥国际机        无        出租车\n"
             "大门)        场店)",
             date(2026, 7, 1),
-            "长鑫存储技术有限公司(东大门)-全季酒店(合肥新桥国际机场店)",
+            "示例存储技术有限公司(东大门)-全季酒店(合肥新桥国际机场店)",
         ),
         (
-            "姓名        证件号        2026-07-06  长鑫存储技术有限公司(东        "
+            "姓名        证件号        2026-07-06  示例存储技术有限公司(东        "
             "泊寓·新桥产业园店        出租车\n"
             "门)",
             date(2026, 7, 6),
-            "长鑫存储技术有限公司(东门)-泊寓·新桥产业园店",
+            "示例存储技术有限公司(东门)-泊寓·新桥产业园店",
         ),
         (
-            "  孙增增        411481********4516  2026-07-02    "
-            "蔚来交付中心-西5门        长鑫存储技术有限公司-东            无         出租车\n"
+            "  测试员        000000********0000  2026-07-02    "
+            "蔚来交付中心-西5门        示例存储技术有限公司-东            无         出租车\n"
             "                                                                         大门",
             date(2026, 7, 2),
-            "蔚来交付中心-西5门-长鑫存储技术有限公司-东大门",
+            "蔚来交付中心-西5门-示例存储技术有限公司-东大门",
         ),
         (
-            "    孙增增               411481********4516               2026-07-03          "
-            "全季酒店(合肥新桥国际                      蜀山区|长鑫存储技术有          "
+            "    测试员               000000********0000               2026-07-03          "
+            "全季酒店(合肥新桥国际                      蜀山区|示例存储技术有          "
             "                                出租车\n"
             "                                                                                    "
             "机场店)                          限公司-东1门",
             date(2026, 7, 3),
-            "全季酒店(合肥新桥国际机场店)-蜀山区长鑫存储技术有限公司-东1门",
+            "全季酒店(合肥新桥国际机场店)-蜀山区示例存储技术有限公司-东1门",
         ),
         (
-            "  孙增增     411************5162026-07-01全季酒店(合肥新桥国际     "
-            "长鑫存储技术有限公司-东大        其他       其他\n"
+            "  测试员     000************0002026-07-01全季酒店(合肥新桥国际     "
+            "示例存储技术有限公司-东大        其他       其他\n"
             "                                            机场店)               门",
             date(2026, 7, 1),
-            "全季酒店(合肥新桥国际机场店)-长鑫存储技术有限公司-东大门",
+            "全季酒店(合肥新桥国际机场店)-示例存储技术有限公司-东大门",
         ),
     ],
 )
@@ -298,7 +298,7 @@ def test_taxi_invoice_uses_unlabeled_occurrence_date_before_invoice_date() -> No
             "电子发票 旅客运输服务",
             "开票日期 2026年07月08日",
             "出行人 出行日期 出发地 到达地 等级 交通工具类型",
-            "王广硕 2026-07-01 项目地 全季酒店 无 出租车",
+            "测试员工 2026-07-01 项目地 全季酒店 无 出租车",
             "价税合计 ￥16.90",
         ),
         ParseContext(2026),
@@ -314,66 +314,66 @@ def test_taxi_invoice_uses_unlabeled_occurrence_date_before_invoice_date() -> No
             (
                 "2026-07-06",
                 "泊寓·新桥产业园店东侧",
-                "长鑫存储公司东一门",
+                "示例存储公司东一门",
                 "惠选",
                 "出租车",
             ),
-            "泊寓·新桥产业园店东侧-长鑫存储公司东一门",
+            "泊寓·新桥产业园店东侧-示例存储公司东一门",
         ),
         (
             (
                 "2026-07-06",
-                "长鑫存储技术有限公司(东",
+                "示例存储技术有限公司(东",
                 "泊寓·新桥产业园店",
                 "其他",
                 "出租车",
                 "门)",
             ),
-            "长鑫存储技术有限公司(东门)-泊寓·新桥产业园店",
+            "示例存储技术有限公司(东门)-泊寓·新桥产业园店",
         ),
         (
             (
                 "2026-07-02",
                 "蔚来交付中心-西5门",
-                "长鑫存储技术有限公司-东",
+                "示例存储技术有限公司-东",
                 "无",
                 "出租车",
                 "大门",
             ),
-            "蔚来交付中心-西5门-长鑫存储技术有限公司-东大门",
+            "蔚来交付中心-西5门-示例存储技术有限公司-东大门",
         ),
         (
             (
                 "2026-06-30",
                 "合肥北城站-进站口",
-                "长鑫存储技术有限公司-东大",
+                "示例存储技术有限公司-东大",
                 "其他",
                 "其他",
                 "门",
             ),
-            "合肥北城站-进站口-长鑫存储技术有限公司-东大门",
+            "合肥北城站-进站口-示例存储技术有限公司-东大门",
         ),
         (
             (
                 "2026-07-03",
                 "全季酒店(合肥新桥国际",
-                "蜀山区长鑫存储技术有",
+                "蜀山区示例存储技术有",
                 "出租车",
                 "机场店)",
                 "限公司-东1门",
             ),
-            "全季酒店(合肥新桥国际机场店)-蜀山区长鑫存储技术有限公司-东1门",
+            "全季酒店(合肥新桥国际机场店)-蜀山区示例存储技术有限公司-东1门",
         ),
         (
             (
                 "2026-07-07",
-                "长鑫存储技术有限公司(东1",
+                "示例存储技术有限公司(东1",
                 "门)",
                 "合肥南站(东进站口)",
                 "无",
                 "出租车",
             ),
-            "长鑫存储技术有限公司(东1门)-合肥南站(东进站口)",
+            "示例存储技术有限公司(东1门)-合肥南站(东进站口)",
         ),
     ],
 )
@@ -637,6 +637,87 @@ def test_itinerary_requirement_uses_transport_evidence_not_category_alone(
     assert parsed.requires_itinerary is required
     if required:
         assert parsed.category is ExpenseCategory.LOCAL_TRANSPORT
+
+
+@pytest.mark.parametrize("provider", ["合肥滴滴科技有限公司", "苏州市吉利优行电子科技有限公司"])
+def test_passenger_invoice_recognizes_operator_company_names_and_wrapped_service(provider):
+    parsed = ReceiptParserRegistry().parse(
+        lines(
+            "电子发票（普通发票）",
+            "旅客运输服务",
+            "开票日期 2026-09-01",
+            provider,
+            "*交通运输服务*客运服",
+            "务费",
+            "出行日期 出发地 到达地 交通工具类型",
+            "价税合计（小写） ¥24.90",
+        ),
+        ParseContext(2026),
+    )
+    assert parsed.category is ExpenseCategory.LOCAL_TRANSPORT
+    assert parsed.transport_type == "ride_hailing" and parsed.requires_itinerary
+    assert parsed.amount == Decimal("24.90")
+    assert parsed.description is None
+    assert "INVOICE_DATE_USED_AS_OCCURRENCE" in parsed.warnings
+
+
+def test_wrapped_passenger_service_without_provider_does_not_assume_ride_hailing():
+    parsed = ReceiptParserRegistry().parse(
+        lines("电子发票", "旅客运输服务", "*交通运输服务*客运服", "务费", "价税合计 ¥24.90"),
+        ParseContext(2026),
+    )
+    assert parsed.category is ExpenseCategory.LOCAL_TRANSPORT
+    assert parsed.transport_type is None and not parsed.requires_itinerary
+
+
+def test_separated_invoice_date_is_flagged_when_passenger_table_is_blank():
+    parsed = ReceiptParserRegistry().parse(
+        lines(
+            "电子发票（普通发票）旅客运输服务",
+            "开票日期：",
+            "出行日期 出发地 到达地 交通工具类型",
+            "价税合计（小写） ¥37.35",
+            "2026年09月01日",
+            "苏州市吉利优行电子科技有限公司",
+            "客运服务费",
+        ),
+        ParseContext(2026),
+    )
+    assert parsed.date == date(2026, 9, 1)
+    assert parsed.description is None
+    assert "INVOICE_DATE_USED_AS_OCCURRENCE" in parsed.warnings
+
+
+@pytest.mark.parametrize(
+    "amount_lines,expected",
+    [
+        (("等候", "00:00.07", "128.60元", "金额"), Decimal("128.60")),
+        (("等候", "00:00.07", "金额", "128.60元"), Decimal("128.60")),
+        (("单价", "3.00元", "金额"), None),
+        (("附加费", "5.00元", "金额"), None),
+        (("附插费", "0.00元", "金额", "59.00元"), Decimal("59.00")),
+        (("附插费", "5.00元", "金额"), None),
+        (("等候", "00:00.07", "123456", "金额"), None),
+        (("等候", "00:00.07", "128.60元", "金额", "118.60元"), None),
+    ],
+)
+def test_taxi_total_label_can_follow_value_but_never_uses_unrelated_or_ambiguous_numbers(
+    amount_lines, expected
+):
+    parsed = ReceiptParserRegistry().parse(
+        lines(
+            "通用发票",
+            "车号 A12345",
+            "工号 123456",
+            "里程 45.1km",
+            "日期 2026-07-05",
+            *amount_lines,
+        ),
+        ParseContext(2026),
+    )
+    assert parsed.amount == expected
+    if expected is None:
+        assert "MISSING_AMOUNT" in parsed.warnings
 
 
 @pytest.mark.parametrize(

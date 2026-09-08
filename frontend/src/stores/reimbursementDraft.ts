@@ -7,6 +7,7 @@ import {
   createReimbursementDraft,
   deleteReimbursementDraft,
   deleteReimbursementDraftFile,
+  clearReimbursementDraftFiles,
   getReimbursementDraft,
   getReimbursementDraftExcelPreview,
   getOaReimbursementOptions,
@@ -62,6 +63,23 @@ interface RevisionedResult {
 
 interface MutationOptions {
   reloadAfterFailure?: boolean
+  pipeline?: FilePipeline
+}
+
+interface FilePipeline {
+  id: number
+  draftId: string
+  departmentId: string
+  epoch: number
+  intentVersion: number
+  inputSignature: string
+  controllers: Set<AbortController>
+  uploadedIds: Set<string>
+  recognizedIds: Set<string>
+  fileRevisions: Map<string, number>
+  uploading: boolean
+  recognizing: boolean
+  needsRefresh: boolean
 }
 
 const CONSISTENT_READ_ATTEMPTS = 2
@@ -85,6 +103,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
   const downloadingPreview = ref(false)
   const uploading = ref(false)
   const processingFiles = ref(false)
+  const filePipelineActive = ref(false)
   const uploadProgress = ref<number | null>(null)
   const listError = ref('')
   const loadError = ref('')
@@ -95,6 +114,8 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
 
   let lifecycleEpoch = 0
   let mutationQueue: Promise<unknown> | null = null
+  let filePipeline: FilePipeline | null = null
+  let filePipelineSequence = 0
   let currentIntentVersion = 0
   let draftCollectionVersion = 0
   let listRequestVersion = 0
@@ -118,9 +139,116 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
     || loadingTravelApprovals.value
     || pendingMutations.value > 0
     || processingFiles.value
+    || filePipelineActive.value
     || downloadingPreview.value,
   )
   const currentRevision = computed(() => currentDraft.value?.revision ?? null)
+
+  function isFilePipelineActive(id: number): boolean {
+    return filePipeline?.id === id && filePipeline.epoch === lifecycleEpoch
+      && filePipeline.intentVersion === currentIntentVersion
+      && currentDraft.value?.id === filePipeline.draftId
+      && currentDraft.value.department.id === filePipeline.departmentId
+      && ['DRAFT', 'REVIEW_READY'].includes(currentDraft.value.status)
+  }
+
+  function beginFilePipeline(): number {
+    const target = requireCurrentDraft()
+    if (filePipeline || mutationQueue || pendingMutations.value || loadingCurrentDraft.value
+      || !['DRAFT', 'REVIEW_READY'].includes(target.status)) {
+      throw new Error('请等待当前文件操作完成后再上传')
+    }
+    filePipeline = {
+      id: ++filePipelineSequence, draftId: target.id, departmentId: target.department.id,
+      epoch: lifecycleEpoch, intentVersion: currentIntentVersion, inputSignature: JSON.stringify(target.input),
+      controllers: new Set(), uploadedIds: new Set(), recognizedIds: new Set(), fileRevisions: new Map(),
+      uploading: false, recognizing: false, needsRefresh: false,
+    }
+    filePipelineActive.value = true
+    return filePipeline.id
+  }
+
+  function cancelFilePipeline(id: number): void {
+    if (filePipeline?.id !== id) return
+    for (const controller of filePipeline.controllers) controller.abort()
+    filePipeline = null
+    filePipelineActive.value = false
+    uploadRequestVersion += 1
+    uploading.value = false
+    uploadProgress.value = null
+  }
+
+  function requireFilePipeline(id: number): FilePipeline {
+    if (!isFilePipelineActive(id)) throw new Error('本批文件处理已取消，请重新操作')
+    return filePipeline!
+  }
+
+  function applyPipelineFileMutation(
+    result: ReimbursementDraftFileMutation, draftId: string, context: RequestContext, pipeline: FilePipeline,
+  ): void {
+    if (!isFilePipelineActive(pipeline.id) || !accepts(context) || result.draftId !== draftId) return
+    // Whole-draft revisions can arrive out of order across the two lanes.
+    // Preserve the newer draft revision, but do not drop a different file's OCR.
+    adoptFileRevision(draftId, Math.max(currentDraft.value!.revision, result.revision), context)
+    if (result.revision < (pipeline.fileRevisions.get(result.file.id) ?? -1)) return
+    pipeline.fileRevisions.set(result.file.id, result.revision)
+    upsertFile(result.file)
+  }
+
+  async function refreshPipelineRevision(pipeline: FilePipeline): Promise<void> {
+    const context = requestContext()
+    pipeline.controllers.add(context.controller)
+    try {
+      // A failed upload may already have reserved a revision. Read only the
+      // draft here; an in-flight OCR must not be replaced by a file-list read.
+      const result = await getReimbursementDraft(pipeline.draftId, { signal: context.controller.signal })
+      if (!isFilePipelineActive(pipeline.id) || !accepts(context)) return
+      if (result.id !== pipeline.draftId || !['DRAFT', 'REVIEW_READY'].includes(result.status)
+        || JSON.stringify(result.input) !== pipeline.inputSignature) {
+        throw new Error('报销内容已发生变化，请刷新检查后继续')
+      }
+      adoptFileRevision(result.id, Math.max(currentDraft.value!.revision, result.revision), context)
+    } catch (error) {
+      if (isFilePipelineActive(pipeline.id)) {
+        mutationError.value = apiErrorMessage(error, '文件状态同步失败，请刷新后继续')
+        cancelFilePipeline(pipeline.id)
+      }
+      throw error
+    } finally {
+      pipeline.controllers.delete(context.controller)
+      releaseRequest(context)
+    }
+  }
+
+  async function finishFilePipeline(id: number): Promise<boolean> {
+    if (!isFilePipelineActive(id)) return false
+    const pipeline = filePipeline!
+    if (pipeline.uploading || pipeline.recognizing) throw new Error('本批文件尚未处理完成')
+    const context = requestContext()
+    pipeline.controllers.add(context.controller)
+    try {
+      if (pipeline.needsRefresh) {
+        const result = await readConsistentDraft(pipeline.draftId, context.controller.signal)
+        if (!isFilePipelineActive(id) || !accepts(context)) return false
+        if (result.draft.id !== pipeline.draftId || !['DRAFT', 'REVIEW_READY'].includes(result.draft.status)
+          || JSON.stringify(result.draft.input) !== pipeline.inputSignature) {
+          throw new Error('报销内容已发生变化，请刷新检查后继续')
+        }
+        if (adoptDraft(result.draft, context, pipeline.draftId)) files.value = result.files
+      }
+      return true
+    } catch (error) {
+      if (isFilePipelineActive(id)) mutationError.value = apiErrorMessage(error, '文件状态同步失败，请刷新后继续')
+      return false
+    } finally {
+      pipeline.controllers.delete(context.controller)
+      releaseRequest(context)
+      if (filePipeline?.id === id) {
+        filePipeline = null
+        filePipelineActive.value = false
+      }
+    }
+  }
 
   function requestContext(): RequestContext {
     const controller = new AbortController()
@@ -436,6 +564,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
   }
 
   async function loadDraft(draftId: string): Promise<void> {
+    if (filePipeline) cancelFilePipeline(filePipeline.id)
     const previousDraftId = currentDraft.value?.id
     const intentVersion = previousDraftId === draftId
       ? currentIntentVersion
@@ -609,6 +738,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
     advanceDraftState(draftId)
     const refreshGuard = draftReadGuard(draftId, intentVersion)
     const context = requestContext()
+    options.pipeline?.controllers.add(context.controller)
     pendingMutations.value += 1
     mutationError.value = ''
     revisionConflict.value = false
@@ -625,7 +755,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
     } catch (error) {
       const cancelled = isCancellation(error)
       const conflict = apiErrorCode(error) === 'REIMBURSEMENT_DRAFT_REVISION_CONFLICT'
-      const shouldReload = conflict || options.reloadAfterFailure === true
+      const shouldReload = !options.pipeline && (conflict || options.reloadAfterFailure === true)
       const refreshed = accepts(context) && !cancelled && shouldReload
         ? await reloadAuthoritativeDraft(
           context,
@@ -654,6 +784,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
       }
       throw error
     } finally {
+      options.pipeline?.controllers.delete(context.controller)
       releaseRequest(context)
       if (context.epoch === lifecycleEpoch) {
         advanceDraftState(draftId)
@@ -668,6 +799,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
     fallbackMessage: string,
     options: MutationOptions = {},
   ): Promise<T> {
+    if (filePipeline) return Promise.reject(new Error('请等待本批文件处理完成'))
     const draftId = requireCurrentDraft().id
     const epoch = lifecycleEpoch
     const run = () => {
@@ -807,13 +939,18 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
     file: File,
     role: ReimbursementDraftFileRole = 'EXPENSE_SOURCE',
     attachmentKind: ReimbursementDraftFile['attachmentKind'] = 'other',
+    autoClassify = false,
+    pipelineId?: number,
   ): Promise<ReimbursementDraftFileMutation> {
     if (uploading.value) throw new Error('已有文件正在上传，请稍后再试')
+    const pipeline = pipelineId === undefined ? null : requireFilePipeline(pipelineId)
+    if (pipeline && !autoClassify) throw new Error('并行上传只支持本批自动分类材料')
+    if (pipeline) pipeline.uploading = true
     const requestVersion = ++uploadRequestVersion
     uploading.value = true
     uploadProgress.value = 0
     try {
-      return await mutateCurrent(
+      const result = await (pipeline ? performMutation : mutateCurrent)(
         (draftId, revision, signal) => uploadReimbursementDraftFile(
           draftId,
           revision,
@@ -821,6 +958,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
           {
             role,
             attachmentKind,
+            ...(autoClassify ? { autoClassify: true } : {}),
             signal,
             onProgress: (percent) => {
               if (
@@ -830,11 +968,20 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
             },
           },
         ),
-        applyFileMutation,
+        pipeline ? (result, draftId, context) => applyPipelineFileMutation(result, draftId, context, pipeline) : applyFileMutation,
         '文件上传失败，请检查格式后重试',
-        { reloadAfterFailure: true },
+        pipeline ? { pipeline } : { reloadAfterFailure: true },
       )
+      if (pipeline && isFilePipelineActive(pipeline.id)) pipeline.uploadedIds.add(result.file.id)
+      return result
+    } catch (error) {
+      if (pipeline && isFilePipelineActive(pipeline.id)) {
+        pipeline.needsRefresh = true
+        await refreshPipelineRevision(pipeline).catch(() => undefined)
+      }
+      throw error
     } finally {
+      if (pipeline) pipeline.uploading = false
       if (requestVersion === uploadRequestVersion) {
         uploading.value = false
         uploadProgress.value = null
@@ -877,24 +1024,56 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
     )
   }
 
+  async function clearFiles(): Promise<Awaited<ReturnType<typeof clearReimbursementDraftFiles>>> {
+    return mutateCurrent(
+      (draftId, revision, signal) => clearReimbursementDraftFiles(draftId, revision, { signal }),
+      (result, draftId, context) => {
+        if (result.draftId !== draftId) return
+        if (adoptFileRevision(draftId, result.revision, context)) {
+          const removed = new Set(result.deletedFileIds)
+          files.value = files.value.filter((file) => !removed.has(file.id))
+        }
+      },
+      '清空文件失败，请重试',
+      { reloadAfterFailure: true },
+    )
+  }
+
   async function recognizeFile(
     fileId: string,
     tripYear?: number,
+    pipelineId?: number,
   ): Promise<ReimbursementDraftFileMutation> {
-    return mutateCurrent(
-      (draftId, revision, signal) => recognizeReimbursementDraftFile(
-        draftId,
-        fileId,
-        {
-          expectedRevision: revision,
-          ...(tripYear === undefined ? {} : { tripYear }),
-        },
-        { signal },
-      ),
-      applyFileMutation,
-      '票据识别失败，请重试或手工填写',
-      { reloadAfterFailure: true },
-    )
+    const pipeline = pipelineId === undefined ? null : requireFilePipeline(pipelineId)
+    if (pipeline) {
+      if (pipeline.recognizing || !pipeline.uploadedIds.has(fileId) || pipeline.recognizedIds.has(fileId)) {
+        throw new Error('本批仅可逐份识别已上传的新文件')
+      }
+      pipeline.recognizing = true
+      pipeline.recognizedIds.add(fileId)
+    }
+    try {
+      return await (pipeline ? performMutation : mutateCurrent)(
+        (draftId, revision, signal) => recognizeReimbursementDraftFile(
+          draftId,
+          fileId,
+          {
+            expectedRevision: revision,
+            ...(tripYear === undefined ? {} : { tripYear }),
+            ...(pipeline ? { allowUploadOverlap: true } : {}),
+          },
+          { signal },
+        ),
+        pipeline ? (result, draftId, context) => applyPipelineFileMutation(result, draftId, context, pipeline) : applyFileMutation,
+        '票据识别失败，请重试或手工填写',
+        pipeline ? { pipeline } : { reloadAfterFailure: true },
+      )
+    } catch (error) {
+      if (pipeline) pipeline.needsRefresh = true
+      throw error
+    } finally {
+      if (pipeline) pipeline.recognizing = false
+    }
   }
 
   async function downloadExcelPreview(): Promise<void> {
@@ -966,6 +1145,7 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
   }
 
   function reset(): void {
+    if (filePipeline) cancelFilePipeline(filePipeline.id)
     lifecycleEpoch += 1
     mutationQueue = null
     currentIntentVersion += 1
@@ -1048,8 +1228,13 @@ export const useReimbursementDraftStore = defineStore('reimbursementDraft', () =
     saveRelatedApprovals,
     markReviewReady,
     uploadFile,
+    beginFilePipeline,
+    isFilePipelineActive,
+    cancelFilePipeline,
+    finishFilePipeline,
     updateFile,
     removeFile,
+    clearFiles,
     recognizeFile,
     downloadExcelPreview,
     reset,

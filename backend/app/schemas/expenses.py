@@ -26,6 +26,7 @@ class TripPurpose(StrEnum):
     PROJECT = "project"
     SAME_CITY_PROJECT = "same_city_project"
     INTERNAL = "internal"
+    OVERSEAS = "overseas"
 
 
 class TripInput(BaseModel):
@@ -44,6 +45,25 @@ class TripInput(BaseModel):
         le=MAX_CONFIRMED_EFFECTIVE_DAYS,
     )
     no_subsidy_exception: bool = Field(default=False, alias="noSubsidyException")
+    manual_subsidy_amount: DecimalString | None = Field(
+        default=None, alias="manualSubsidyAmount", ge=0, le=MAX_REIMBURSEMENT_AMOUNT,
+        exclude_if=lambda value: value is None,
+    )
+
+    @field_validator("manual_subsidy_amount")
+    @classmethod
+    def normalize_manual_subsidy(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None:
+            if value.as_tuple().exponent < -2:
+                raise ValueError("amount supports at most two decimal places")
+            return quantize_money(value)
+        return value
+
+    @model_validator(mode="after")
+    def validate_manual_subsidy_type(self) -> TripInput:
+        if self.manual_subsidy_amount is not None:
+            raise ValueError("manual subsidy total is no longer supported")
+        return self
 
     def as_period(self) -> TripPeriod:
         return TripPeriod(

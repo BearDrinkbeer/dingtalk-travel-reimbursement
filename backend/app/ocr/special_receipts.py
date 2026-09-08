@@ -12,6 +12,8 @@ from app.ocr.types import OcrLine, ParseContext, ParsedExpense
 
 _TAXI_LABELS = ("实收金额", "应付金额", "合计金额", "金额", "实收")
 _TAXI_VALUE = re.compile(r"[：:¥￥\s]*(\d{1,6}(?:\.\d{1,2})?)[元圆¥￥\s]*$")
+# A blurred middle character in 附加费 must not turn the surcharge into a total.
+_TAXI_OTHER_CHARGES = re.compile(r"单价|附.{0,2}费|燃油费|原额|余额|找零")
 _CURRENCY_CODES = re.compile(
     r"(?<![A-Z])(?:USD|EUR|GBP|JPY|VND|HKD|MOP|TWD|KRW|SGD|MYR|THB|IDR|PHP|"
     r"INR|AUD|NZD|CAD|CHF|AED|SAR|QAR|TRY|BRL|MXN|ZAR|RUB|SEK|NOK|DKK|PLN|"
@@ -209,11 +211,26 @@ class PhysicalTaxiReceiptParser:
                 if label not in text:
                     continue
                 suffix = text.split(label, 1)[1]
-                if not suffix.strip("：:") and index + 1 < len(texts):
-                    suffix = texts[index + 1]
-                match = _TAXI_VALUE.fullmatch(suffix)
-                if match:
-                    candidates.add(Decimal(match.group(1)).quantize(Decimal("0.01")))
+                values = [suffix]
+                if not suffix.strip("：:"):
+                    if index + 1 < len(texts):
+                        values.append(texts[index + 1])
+                    # Tilted photos can emit the total immediately before its
+                    # label. Require currency and reject a previous field's
+                    # unit price/surcharge. Conflicting neighbours stay blank.
+                    if (
+                        index > 0
+                        and re.search(r"[元圆¥￥]", texts[index - 1])
+                        and not (
+                            index > 1
+                            and _TAXI_OTHER_CHARGES.search(texts[index - 2])
+                        )
+                    ):
+                        values.append(texts[index - 1])
+                for value in values:
+                    match = _TAXI_VALUE.fullmatch(value)
+                    if match:
+                        candidates.add(Decimal(match.group(1)).quantize(Decimal("0.01")))
             if candidates:
                 amount = next(iter(candidates)) if len(candidates) == 1 else None
                 break

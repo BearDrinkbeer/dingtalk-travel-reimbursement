@@ -17,6 +17,7 @@ export interface AuthSession {
 }
 
 export interface PublicConfig {
+  appTitle?: string
   corpId: string
   clientId: string
   authMockEnabled: boolean

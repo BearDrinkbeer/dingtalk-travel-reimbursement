@@ -170,7 +170,7 @@ async def validate_new_file(
     process_runner: KillableProcessRunner,
     *,
     supporting_pdf: bool = False,
-) -> None:
+) -> int:
     """Perform expensive image/PDF validation away from the event loop."""
 
     try:
@@ -207,6 +207,7 @@ async def validate_new_file(
         if error.code in {"WORKER_LIMIT_SETUP_FAILED", "WORKER_RESOURCE_LIMIT"}:
             raise ApiError("PROCESS_RESOURCE_LIMIT", "票据文件处理资源不可用", 422)
         raise error
+    return int(result.get("pageCount", 1))
 
 
 def _directory_usage(directory: Path) -> RetainedUsage:

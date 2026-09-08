@@ -28,6 +28,8 @@ data/
 tmp/
 .tmp/
 outputs/
+config/*.private.json
+config/production-oa-*.json
 backend/models/*
 !backend/models/README.md
 *.db

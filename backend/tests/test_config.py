@@ -164,6 +164,22 @@ def test_agent_id_is_wired_through_deployment_and_development_entrypoints() -> N
     assert "DINGTALK_AGENT_ID" in unset_line
 
 
+def test_formal_company_local_entrypoint_is_isolated_from_test_data() -> None:
+    makefile = (REPOSITORY_ROOT / "Makefile").read_text()
+    assert "dev-dingtalk-prod:" in makefile
+    assert "sh scripts/dev-dingtalk-backend.sh prod" in makefile
+    assert "sh scripts/dev-dingtalk-frontend.sh prod" in makefile
+    backend = (REPOSITORY_ROOT / "scripts/dev-dingtalk-backend.sh").read_text()
+    assert 'CONFIG_FILE="$PROJECT_DIR/.env"' in backend
+    assert "DATABASE_URL=sqlite:///./data/dev-dingtalk-prod.db" in backend
+    assert "reimbursement-staging-prod" in backend
+    assert "SESSION_COOKIE_NAME=expense_dingtalk_prod_session" in backend
+    assert "export APP_ENV=development" in backend
+    frontend = (REPOSITORY_ROOT / "scripts/dev-dingtalk-frontend.sh").read_text()
+    assert 'CONFIG_FILE="$PROJECT_DIR/.env"' in frontend
+    assert "export DINGTALK_DEV_FRONTEND_PORT=5173" in frontend
+
+
 def test_storage_upload_boundary_settings_are_normalized_and_bounded() -> None:
     settings = Settings(
         dingtalk_storage_upload_timeout_seconds=5,

@@ -224,6 +224,15 @@ def uses_invoice_date_as_occurrence(
         if dates:
             invoice_date = dates[0]
             break
+    if invoice_date is None and any("开票日期" in line.text for line in lines):
+        # Some PDF text layers emit all labels first, then their values. With
+        # only one date and no explicit travel evidence below, provenance is
+        # uncertain: flag it for review instead of treating it as confirmed travel.
+        candidates = {
+            value for line in lines for value in _dates_in_text(line.text, reference_year)
+        }
+        if len(candidates) == 1:
+            invoice_date = next(iter(candidates))
     if invoice_date != parsed_date:
         return False
     for line in lines:

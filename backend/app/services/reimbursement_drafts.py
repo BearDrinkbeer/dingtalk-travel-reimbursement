@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.core.errors import ApiError
 from app.domain.categories import ExpenseCategory
 from app.domain.expenses import calculate_expense_totals
+from app.domain.material_classification import material_classification
 from app.domain.reimbursement_proofs import payment_proof_required
 from app.domain.subsidy import calculate_subsidy
 from app.integrations.dingtalk.workflow import DingTalkWorkflowClient, FormOption
@@ -21,6 +22,7 @@ from app.models.reimbursement import (
     ReimbursementDraftRelatedApproval,
     ReimbursementDraftStatus,
     ReimbursementOcrStatus,
+    ReimbursementSubmission,
     utc_now,
 )
 from app.schemas.excel import ExcelExpenseItemInput
@@ -195,11 +197,18 @@ def create_reimbursement_draft(
 ) -> dict[str, object]:
     created_at = now or utc_now()
     if _draft_file_reference_ids(draft_input) or any(
-        item.itinerary_file_ids or item.payment_proof_file_ids for item in draft_input.items
+        item.itinerary_file_ids or item.payment_proof_file_ids or item.hotel_bill_file_ids
+        for item in draft_input.items
     ):
         raise _invalid_file_reference_error()
     draft_input = draft_input.model_copy(
-        update={"ocr_disposition_version": CURRENT_OCR_DISPOSITION_VERSION}
+        update={
+            "ocr_disposition_version": CURRENT_OCR_DISPOSITION_VERSION,
+            "company_value": "",
+            "accounting_source_verified": False,
+            "budget_code_value": "",
+            "project": None,
+        }
     )
     catalog = require_submission_ready_catalog(database)
     calculation = validate_and_calculate_input(
@@ -300,6 +309,20 @@ def update_reimbursement_draft(
     )
     catalog = require_submission_ready_catalog(database)
     _require_catalog_binding(draft, CatalogBinding.from_catalog(catalog))
+    # Accounting values belong to the verified approval selection. An ordinary
+    # autosave can carry a stale client snapshot, but cannot replace these values.
+    stored_input = _stored_input(draft)
+    has_related = bool(json.loads(draft.related_instance_ids_json))
+    draft_input = draft_input.model_copy(
+        update={
+            "company_value": stored_input.company_value if has_related else "",
+            "accounting_source_verified": stored_input.accounting_source_verified
+            if has_related
+            else False,
+            "budget_code_value": stored_input.budget_code_value if has_related else "",
+            "project": stored_input.project if has_related else None,
+        }
+    )
     draft_input = _normalize_legacy_ocr_dispositions(
         database,
         draft_id=draft.id,
@@ -370,7 +393,11 @@ def mark_reimbursement_draft_review_ready(
     catalog = require_submission_ready_catalog(database)
     binding = CatalogBinding.from_catalog(catalog)
     _require_catalog_binding(draft, binding)
+    if not json.loads(draft.related_instance_ids_json):
+        raise _not_ready_error("请先关联至少一张已通过的出差审批单")
     draft_input = _stored_input(draft)
+    if not draft_input.accounting_source_verified:
+        raise _not_ready_error("请重新确认关联出差审批，以核验所属公司和预算代码")
     draft_input = _normalize_legacy_ocr_dispositions(
         database,
         draft_id=draft.id,
@@ -585,6 +612,14 @@ def validate_draft_file_references(
         )
     ).all()
     files_by_id = {item.id: item for item in files}
+    if require_submission_proofs or require_terminal_disposition:
+        for file in files:
+            classification = material_classification(file.ocr_result_json)
+            if classification and (
+                classification.get("status") not in {"classified", "confirmed"}
+                or file.ocr_status == ReimbursementOcrStatus.RUNNING.value
+            ):
+                raise _not_ready_error("请等待材料识别完成，并确认所有待确认材料的用途")
     if any(
         file_id not in files_by_id
         or files_by_id[file_id].processing_role != ReimbursementDraftFileRole.EXPENSE_SOURCE.value
@@ -596,6 +631,7 @@ def validate_draft_file_references(
         for proof_ids, kind in (
             (item.itinerary_file_ids, "itinerary"),
             (item.payment_proof_file_ids, "payment_proof"),
+            (item.hotel_bill_file_ids, "hotel_bill"),
         ):
             if any(
                 file_id not in files_by_id
@@ -630,10 +666,16 @@ def validate_submission_evidence(
 ) -> None:
     for item in draft_input.items:
         evidence = file_ocr_evidence(files_by_id.get(item.source_file_id or ""))
-        if payment_proof_required(
-            amount=item.amount, category=item.category,
-            rail_type=_authoritative_rail_type(item, evidence),
-        ) and not item.payment_proof_file_ids:
+        if item.category is ExpenseCategory.LODGING and not item.hotel_bill_file_ids:
+            raise _not_ready_error("住宿费用必须上传并关联住宿明细")
+        if (
+            payment_proof_required(
+                amount=item.amount,
+                category=item.category,
+                rail_type=_authoritative_rail_type(item, evidence),
+            )
+            and not item.payment_proof_file_ids
+        ):
             raise _not_ready_error("单张票据金额超过500元，请上传并关联付款凭证")
         requires_itinerary = (
             item.requires_itinerary
@@ -664,7 +706,9 @@ def _authoritative_rail_type(
 ) -> str:
     # "other" is an unclassified fallback, not positive non-rail evidence.
     if item.category is not ExpenseCategory.RAIL_FARE or evidence.get("categoryId") not in (
-        None, "other", "rail_fare",
+        None,
+        "other",
+        "rail_fare",
     ):
         return "unknown"
     observed = evidence.get("railType")
@@ -727,6 +771,13 @@ def detach_draft_file_from_input(
     file_id: str,
 ) -> DraftCalculation:
     """Canonicalize input after removing one file's item and disposition."""
+    return detach_draft_files_from_input(database, draft=draft, file_ids={file_id})
+
+
+def detach_draft_files_from_input(
+    database: Session, *, draft: ReimbursementDraft, file_ids: set[str]
+) -> DraftCalculation:
+    """Remove a batch of sources and proof links in one calculation."""
 
     draft_input = _stored_input(draft)
     draft_input = _bind_unique_legacy_ocr_matches(
@@ -738,18 +789,21 @@ def detach_draft_file_from_input(
         item.model_copy(
             update={
                 "itinerary_file_ids": [
-                    value for value in item.itinerary_file_ids if value != file_id
+                    value for value in item.itinerary_file_ids if value not in file_ids
                 ],
                 "payment_proof_file_ids": [
-                    value for value in item.payment_proof_file_ids if value != file_id
+                    value for value in item.payment_proof_file_ids if value not in file_ids
+                ],
+                "hotel_bill_file_ids": [
+                    value for value in item.hotel_bill_file_ids if value not in file_ids
                 ],
             }
         )
         for item in draft_input.items
-        if item.source_file_id != file_id
+        if item.source_file_id not in file_ids
     ]
     remaining_dismissed = [
-        value for value in draft_input.dismissed_ocr_file_ids if value != file_id
+        value for value in draft_input.dismissed_ocr_file_ids if value not in file_ids
     ]
     if remaining_items == draft_input.items and len(remaining_dismissed) == len(
         draft_input.dismissed_ocr_file_ids
@@ -782,6 +836,7 @@ def _calculate_input(
                 policy_confirmed=draft_input.trip.policy_confirmed,
                 confirmed_effective_days=draft_input.trip.confirmed_effective_days,
                 no_subsidy_exception=draft_input.trip.no_subsidy_exception,
+                manual_subsidy_amount=draft_input.trip.manual_subsidy_amount,
             )
         except (ApiError, ValueError):
             if not allow_partial:
@@ -819,7 +874,10 @@ def draft_data(
 ) -> dict[str, object]:
     if calculation is None:
         stored_input = _stored_input(draft)
-        calculation = _calculate_input(database, stored_input)
+        if draft.status == ReimbursementDraftStatus.LOCKED.value:
+            calculation = _locked_draft_calculation(database, draft, stored_input)
+        else:
+            calculation = _calculate_input(database, stored_input)
     related = database.scalars(
         select(ReimbursementDraftRelatedApproval)
         .where(ReimbursementDraftRelatedApproval.draft_id == draft.id)
@@ -837,6 +895,36 @@ def draft_data(
         "relatedApprovals": [_related_data(item) for item in related],
         "relatedApprovalSummary": _related_summary(related),
     }
+
+
+def _locked_draft_calculation(
+    database: Session,
+    draft: ReimbursementDraft,
+    stored_input: ReimbursementDraftInput,
+) -> DraftCalculation:
+    from app.services.oa_reimbursement_payload import parse_locked_submission_snapshot
+
+    submission = database.scalar(
+        select(ReimbursementSubmission).where(ReimbursementSubmission.draft_id == draft.id)
+    )
+    if submission is None:
+        raise ApiError(
+            "REIMBURSEMENT_DRAFT_CORRUPTED",
+            "锁定报销缺少提交快照，请联系管理员",
+            500,
+        )
+    snapshot = parse_locked_submission_snapshot(draft, submission)
+    totals = snapshot.totals.model_dump(mode="json", by_alias=True)
+    totals["subsidy"] = (
+        snapshot.subsidy.model_dump(mode="json", by_alias=True)
+        if snapshot.subsidy is not None
+        else None
+    )
+    return DraftCalculation(
+        canonical_json=draft.input_json,
+        input_data=_canonical_input_data(stored_input),
+        totals_data=totals,
+    )
 
 
 def _store_related_approvals(
@@ -863,6 +951,16 @@ def _store_related_approvals(
     _require_catalog_binding(current_draft, current_binding)
     approvals = verified.approvals if verified is not None else ()
     instance_ids = [item.instance.instance_id for item in approvals]
+    derived_input = _stored_input(current_draft).model_copy(
+        update={
+            "company_value": verified.company_option.value if verified else "",
+            "accounting_source_verified": verified is not None,
+            "budget_code_value": verified.budget_code_option.value if verified else "",
+            "project": BudgetProjectInput(mode="manual", text=verified.budget_code_option.label)
+            if verified
+            else None,
+        }
+    )
     try:
         bump_owned_draft_revision(
             database,
@@ -892,6 +990,7 @@ def _store_related_approvals(
                     listed_to_ms=approval.listed.query_window.end_time_ms,
                     travel_start_date=approval.start_date,
                     travel_end_date=approval.end_date,
+                    source_travel_type_value=approval.listed.source_travel_type_value,
                     title=approval.instance.title,
                     business_id=approval.instance.business_id,
                     instance_created_at=_upstream_datetime(approval.instance.created_at),
@@ -904,11 +1003,17 @@ def _store_related_approvals(
             update(ReimbursementDraft)
             .where(ReimbursementDraft.id == draft_id)
             .values(
+                input_json=json.dumps(
+                    _canonical_input_data(derived_input),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
                 related_instance_ids_json=json.dumps(
                     instance_ids,
                     ensure_ascii=False,
                     separators=(",", ":"),
-                )
+                ),
             )
         )
         database.commit()
@@ -945,6 +1050,7 @@ def _canonical_input_data(draft_input: ReimbursementDraftInput) -> dict[str, obj
     result = {
         "ocrDispositionVersion": draft_input.ocr_disposition_version,
         "companyValue": draft_input.company_value,
+        "accountingSourceVerified": draft_input.accounting_source_verified,
         "budgetCodeValue": draft_input.budget_code_value,
         "project": project,
         "trip": trip,
@@ -1168,7 +1274,13 @@ def _validate_related_snapshot(
             or item.travel_schema_fingerprint != profile.schema.fingerprint
         ):
             raise _template_changed_error()
-        travel_type_values.add(profile.travel_type_option.value)
+        if getattr(profile, "travel_type_mappings", None) is not None:
+            option = profile.travel_type_mappings.get(item.source_travel_type_value)
+            if option is None:
+                raise _template_changed_error()
+        else:
+            option = profile.travel_type_option
+        travel_type_values.add(option.value)
     if len(travel_type_values) != 1:
         raise _template_changed_error()
 
@@ -1238,14 +1350,20 @@ def _require_department(draft: ReimbursementDraft, actor: DraftActor) -> None:
 
 
 def _require_mutable(draft: ReimbursementDraft, *, now: datetime) -> None:
+    if draft.status == ReimbursementDraftStatus.LOCKED.value or draft.locked_at is not None:
+        raise ApiError("REIMBURSEMENT_DRAFT_LOCKED", "报销已进入提交处理，不能继续修改", 409)
     if draft.expires_at <= now or draft.status == ReimbursementDraftStatus.EXPIRED.value:
         raise ApiError("REIMBURSEMENT_DRAFT_EXPIRED", "报销资料已过期，请重新填写", 409)
-    if draft.status not in _MUTABLE_STATUSES or draft.locked_at is not None:
+    if draft.status not in _MUTABLE_STATUSES:
         raise ApiError("REIMBURSEMENT_DRAFT_LOCKED", "报销已进入提交处理，不能继续修改", 409)
 
 
 def _draft_summary(draft: ReimbursementDraft, *, now: datetime) -> dict[str, object]:
-    status = ReimbursementDraftStatus.EXPIRED.value if draft.expires_at <= now else draft.status
+    status = (
+        ReimbursementDraftStatus.EXPIRED.value
+        if draft.status in _MUTABLE_STATUSES and draft.expires_at <= now
+        else draft.status
+    )
     return {
         "id": draft.id,
         "status": status,
@@ -1265,6 +1383,11 @@ def _related_data(item: ReimbursementDraftRelatedApproval) -> dict[str, object]:
         "processInstanceId": item.process_instance_id,
         "profileKey": item.travel_profile_key,
         "sourceProcessCode": item.process_code,
+        **(
+            {"sourceTravelTypeValue": item.source_travel_type_value}
+            if item.source_travel_type_value is not None
+            else {}
+        ),
         "title": item.title,
         "businessId": item.business_id,
         "startDate": item.travel_start_date.isoformat(),

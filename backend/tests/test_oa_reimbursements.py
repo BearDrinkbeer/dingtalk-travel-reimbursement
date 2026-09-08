@@ -232,6 +232,9 @@ def test_travel_list_ignores_claimed_identity_and_process_code(monkeypatch) -> N
             "endDate": "2026-08-12",
             "createdAt": "2026-08-01T08:00:00+08:00",
             "finishedAt": "2026-08-02T08:00:00+08:00",
+            "companyOption": None,
+            "budgetCodeOption": None,
+            "unavailableReason": "出差模板尚未配置所属公司来源，请联系管理员",
         }
     ]
 

@@ -55,9 +55,6 @@ async function downloadExcel(): Promise<void> {
         <span>合计</span><strong>¥{{ expense.displayTotal }}</strong>
       </div>
     </div>
-    <p class="uppercase-amount">
-      人民币大写：{{ expense.totals?.uppercaseAmount ?? '待服务端计算' }}
-    </p>
     <el-alert
       v-if="expense.calculationError"
       :title="expense.calculationError"
