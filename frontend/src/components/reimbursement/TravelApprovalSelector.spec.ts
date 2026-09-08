@@ -119,6 +119,53 @@ describe('TravelApprovalSelector', () => {
     wrapper.unmount()
   })
 
+  it('allows only continuous approvals that overlap the subsidy period', () => {
+    const drafts = useReimbursementDraftStore()
+    drafts.travelApprovals = [
+      candidate,
+      { ...candidate, processInstanceId: 'adjacent', startDate: '2026-09-04', endDate: '2026-09-05' },
+      { ...candidate, processInstanceId: 'gap', startDate: '2026-09-07', endDate: '2026-09-08' },
+      { ...candidate, processInstanceId: 'unrelated', startDate: '2026-08-01', endDate: '2026-08-03' },
+    ]
+    const wrapper = mount(TravelApprovalSelector, {
+      props: {
+        modelValue: [selection],
+        requiredStartDate: '2026-09-01',
+        requiredEndDate: '2026-09-10',
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.findAllComponents({ name: 'ElCheckbox' }).map((item) => item.props('disabled')))
+      .toEqual([false, false, true, true])
+    expect(wrapper.text()).toContain('审批日期与已选审批不连续')
+    expect(wrapper.text()).toContain('审批日期与出差补助日期不重合')
+    wrapper.unmount()
+  })
+
+  it('does not allow removing a middle approval when that would create a date gap', async () => {
+    const drafts = useReimbursementDraftStore()
+    const middle = { ...candidate, processInstanceId: 'travel-2', startDate: '2026-09-04', endDate: '2026-09-05' }
+    const last = { ...candidate, processInstanceId: 'travel-3', startDate: '2026-09-06', endDate: '2026-09-07' }
+    drafts.travelApprovals = [candidate, middle, last]
+    const selections = [selection, middle, last].map((approval) => ({
+      processInstanceId: approval.processInstanceId,
+      profileKey: approval.profileKey,
+      queryWindow: selection.queryWindow,
+    }))
+    const wrapper = mount(TravelApprovalSelector, {
+      props: { modelValue: selections },
+      global: { plugins: [ElementPlus] },
+    })
+
+    wrapper.findAllComponents({ name: 'ElCheckbox' })[1]!.vm.$emit('change', false)
+    await nextTick()
+
+    expect(wrapper.emitted('update:modelValue')).toBeUndefined()
+    expect(wrapper.text()).toContain('移除后审批日期会中断')
+    wrapper.unmount()
+  })
+
   it('loads candidates by an explicit date range and keyword', async () => {
     const drafts = useReimbursementDraftStore()
     drafts.travelApprovals = [candidate]

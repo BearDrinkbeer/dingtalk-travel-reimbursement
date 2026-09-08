@@ -1599,6 +1599,43 @@ def test_review_rejects_related_approval_with_disjoint_trip_dates(
     assert unchanged["revision"] == 2
 
 
+def test_review_requires_selected_approvals_to_cover_the_subsidy_period(
+    client_factory,
+    monkeypatch,
+) -> None:
+    catalog = _catalog_with_travel()
+    monkeypatch.setattr(
+        reimbursement_drafts,
+        "require_submission_ready_catalog",
+        lambda _database: catalog,
+    )
+    client = client_factory(auth_mock_enabled=True)
+    login = mock_login(client)
+    headers = {"X-CSRF-Token": login["csrfToken"]}
+    draft_id = _create(client, headers).json()["data"]["id"]
+    client.app.state.dingtalk_workflow = FakeTravelWorkflow(
+        start_date="2026-09-02",
+        end_date="2026-09-03",
+    )
+    related = client.put(
+        f"/api/reimbursements/drafts/{draft_id}/related-approvals",
+        json={"expectedRevision": 1, "selections": [_selection()]},
+        headers=headers,
+    )
+    assert related.status_code == 200, related.text
+    _add_active_file(client, draft_id)
+
+    reviewed = client.post(
+        f"/api/reimbursements/drafts/{draft_id}/review",
+        json={"expectedRevision": 2},
+        headers=headers,
+    )
+
+    assert reviewed.status_code == 409
+    assert reviewed.json()["error"]["code"] == "REIMBURSEMENT_TRAVEL_DATE_MISMATCH"
+    assert "补助日期" in reviewed.json()["error"]["message"]
+
+
 def test_review_uses_expense_item_dates_when_the_draft_has_no_trip(
     client_factory,
     monkeypatch,

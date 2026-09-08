@@ -704,8 +704,11 @@ class ReimbursementQuotaCoordinator:
                     draft_id=draft.draft_id,
                     expected_revision=draft.revision,
                 )
-            except (ApiError, ReimbursementQuotaError):
-                _LOGGER.exception("Failed to reclaim expired reimbursement draft")
+            except (ApiError, ReimbursementQuotaError) as exc:
+                _LOGGER.error(
+                    "Failed to reclaim expired reimbursement draft",
+                    extra={"exception_type": type(exc).__name__},
+                )
             else:
                 reclaimed += 1
 
@@ -737,8 +740,11 @@ class ReimbursementQuotaCoordinator:
                 reservation = _draft_staging_reservation(record)
                 try:
                     self._staging.discard_reservation(reservation)
-                except (OSError, ReimbursementStagingError):
-                    _LOGGER.exception("Failed to reclaim expired draft file reservation")
+                except (OSError, ReimbursementStagingError) as exc:
+                    _LOGGER.error(
+                        "Failed to reclaim expired draft file reservation",
+                        extra={"exception_type": type(exc).__name__},
+                    )
                     continue
                 record.file_status = ReimbursementDraftFileStatus.PURGED.value
                 record.part_storage_key = None
@@ -774,9 +780,10 @@ class ReimbursementQuotaCoordinator:
                 reservation = _upload_staging_reservation(record)
                 try:
                     self._staging.discard_reservation(reservation)
-                except (OSError, ReimbursementStagingError):
-                    _LOGGER.exception(
-                        "Failed to reclaim expired generated upload reservation"
+                except (OSError, ReimbursementStagingError) as exc:
+                    _LOGGER.error(
+                        "Failed to reclaim expired generated upload reservation",
+                        extra={"exception_type": type(exc).__name__},
                     )
                     continue
                 record.upload_status = ReimbursementUploadStatus.DISCARDED.value
@@ -798,8 +805,11 @@ class ReimbursementQuotaCoordinator:
                     expected_sha256=item.sha256,
                     missing_ok=True,
                 )
-            except (OSError, ReimbursementStagingError):
-                _LOGGER.exception("Failed to reclaim deleting draft file")
+            except (OSError, ReimbursementStagingError) as exc:
+                _LOGGER.error(
+                    "Failed to reclaim deleting draft file",
+                    extra={"exception_type": type(exc).__name__},
+                )
                 continue
             if self._finalize_deleting_draft_file(item, cutoff=cutoff):
                 reclaimed += 1

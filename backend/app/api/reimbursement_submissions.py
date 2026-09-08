@@ -19,6 +19,7 @@ from app.services.oa_reimbursement_payload import (
     serialize_snapshot,
     snapshot_sha256,
 )
+from app.services.oa_template_profiles import load_fresh_submission_catalog
 from app.services.reimbursement_drafts import draft_actor
 from app.services.reimbursement_submissions import (
     create_or_get_submission,
@@ -43,7 +44,7 @@ _TERMINAL_STATUSES = frozenset(
     "/oa/reimbursements/{draft_id}/submit",
     status_code=status.HTTP_202_ACCEPTED,
 )
-def submit_reimbursement(
+async def submit_reimbursement(
     draft_id: str,
     body: SubmitReimbursementRequest,
     request: Request,
@@ -77,6 +78,14 @@ def submit_reimbursement(
             "钉钉应用 AgentId 尚未配置",
             503,
         )
+    # Verify the live OA schemas before producing an immutable snapshot or
+    # locking the draft. The helper persists DRIFTED so every session stops
+    # using an outdated catalog until an administrator reconfirms it.
+    database.rollback()
+    await load_fresh_submission_catalog(
+        request.app.state.database_session_factory,
+        request.app.state.dingtalk_workflow,
+    )
     source = collect_snapshot_source(
         database,
         staging=request.app.state.reimbursement_staging,

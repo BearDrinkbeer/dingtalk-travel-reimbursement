@@ -42,7 +42,8 @@ const durableAttachmentInput = ref<HTMLInputElement | null>(null)
 const durableItineraryInput = ref<HTMLInputElement | null>(null)
 const durablePaymentProofInput = ref<HTMLInputElement | null>(null)
 const durableHotelBillInput = ref<HTMLInputElement | null>(null)
-const paymentTarget = ref<{ itemId: string; draftId: string; departmentId: string; replaceId?: string; kind: 'payment_proof' | 'hotel_bill' } | null>(null)
+type ProofTarget = { itemId: string; draftId: string; departmentId: string; replaceId?: string; kind: 'payment_proof' | 'hotel_bill' }
+const paymentTarget = ref<ProofTarget | null>(null)
 const paymentUploadingItem = ref('')
 const paymentErrors = reactive<Record<string, string>>({})
 const proofPickerVisible = ref(false)
@@ -60,6 +61,11 @@ type BatchFileStatus = 'queued' | 'uploading' | 'uploaded' | 'recognizing' | 'do
 interface BatchFile {
   key: string
   name: string
+  source?: File
+  role: ReimbursementDraftFileRole
+  attachmentKind: ReimbursementAttachmentKind
+  autoClassify: boolean
+  target?: ProofTarget
   status: BatchFileStatus
   uploaded?: ReimbursementDraftFile
   recognized?: boolean
@@ -827,7 +833,16 @@ async function onDurableSelection(
   batchOriginalFileIds = new Set(drafts.files.map((file) => file.id))
   batchNeedsOcr.value = autoClassify || role === 'EXPENSE_SOURCE' || ['itinerary', 'hotel_bill'].includes(attachmentKind)
   batchPhase.value = pipelineId === undefined ? 'uploading' : 'processing'
-  batchFiles.value = files.map((file, index) => ({ key: `${scope.generation}-${index}`, name: file.name, status: 'queued' }))
+  batchFiles.value = files.map((file, index) => ({
+    key: `${scope.generation}-${index}`,
+    name: file.name,
+    source: file,
+    role,
+    attachmentKind,
+    autoClassify,
+    ...(target ? { target: { ...target } } : {}),
+    status: 'queued',
+  }))
   const entries = batchFiles.value
   const recognized: ReimbursementDraftFile[] = []
   const active = () => acceptsDurableOperation(scope)
@@ -859,6 +874,7 @@ async function onDurableSelection(
         if (!active() || uploaded.draftId !== scope.draftId) break
         delete durableErrors[uploaded.file.id]
         entry.uploaded = uploaded.file
+        entry.source = undefined
         entry.status = batchNeedsOcr.value ? 'uploaded' : 'done'
         if (pipelineId !== undefined) {
           // The OCR lane drains in upload order while the next upload runs.
@@ -915,6 +931,96 @@ async function onDurableSelection(
       }
       drafts.processingFiles = false
       paymentUploadingItem.value = ''
+    }
+    finishDurableOperation(scope)
+  }
+}
+
+function removeFailedBatchFile(entry: BatchFile): void {
+  if (durableBusy.value || entry.status !== 'failed' || entry.uploaded) return
+  batchFiles.value = batchFiles.value.filter((candidate) => candidate.key !== entry.key)
+  if (!batchFiles.value.length) batchPhase.value = null
+}
+
+async function retryFailedBatchUpload(entry: BatchFile): Promise<void> {
+  if (props.readonly || durableBusy.value || entry.status !== 'failed' || entry.uploaded || !entry.source) return
+  const source = entry.source
+  const target = entry.target
+  if (target && (target.draftId !== drafts.currentDraft?.id
+    || target.departmentId !== (auth.session?.selectedDepartment?.id ?? '')
+    || !expense.items.some((item) => item.id === target.itemId))) {
+    entry.error = '费用或报销表单已变化，请在当前费用下重新选择证明材料'
+    return
+  }
+  const scope = beginDurableOperation()
+  if (!scope) return
+  let pipelineId: number | undefined
+  try {
+    if (entry.autoClassify) pipelineId = drafts.beginFilePipeline()
+  } catch (error) {
+    finishDurableOperation(scope)
+    entry.error = readableOperationError(error, '请等待当前文件操作完成')
+    return
+  }
+
+  durableOperating.value = true
+  drafts.processingFiles = true
+  batchScope = scope
+  batchPipelineId = pipelineId ?? null
+  batchOriginalFileIds = new Set(drafts.files.map((file) => file.id))
+  batchPhase.value = pipelineId === undefined ? 'uploading' : 'processing'
+  entry.status = 'uploading'
+  entry.error = undefined
+  const needsOcr = entry.autoClassify || entry.role === 'EXPENSE_SOURCE'
+    || ['itinerary', 'hotel_bill'].includes(entry.attachmentKind)
+  try {
+    const uploaded = await drafts.uploadFile(
+      source,
+      entry.role,
+      entry.attachmentKind,
+      entry.autoClassify,
+      pipelineId,
+    )
+    if (!acceptsDurableOperation(scope) || uploaded.draftId !== scope.draftId) return
+    entry.uploaded = uploaded.file
+    entry.source = undefined
+    entry.status = needsOcr ? 'uploaded' : 'done'
+    let recognized: ReimbursementDraftFile | null = null
+    if (needsOcr) {
+      entry.status = 'recognizing'
+      recognized = await recognizeDurableFile(uploaded.file, scope, false, pipelineId)
+      if (!recognized || !acceptsDurableOperation(scope)) return
+      entry.recognized = true
+      entry.status = recognized.ocrResult?.status === 'failed' ? 'failed' : 'done'
+      if (entry.status === 'failed') {
+        entry.error = recognized.ocrResult?.error?.message ?? '识别未完成，请在材料列表中重新识别'
+      }
+    }
+    const synchronized = pipelineId === undefined || await drafts.finishFilePipeline(pipelineId)
+    if (!acceptsDurableOperation(scope) || !synchronized) return
+    const current = drafts.files.find((file) => file.id === uploaded.file.id) ?? recognized
+    if (current?.role === 'EXPENSE_SOURCE' && !expense.upsertDraftOcrItem(current)) {
+      durableErrors[current.id] = '识别结果不完整，请重试或手工添加费用明细'
+    }
+    if (current?.role === 'EXPENSE_SOURCE') void expense.refreshCalculations()
+    if (target && current && isActiveProof(current, target.kind)) {
+      const item = expense.items.find((candidate) => candidate.id === target.itemId)
+      if (item) {
+        const field = target.kind === 'hotel_bill' ? 'hotelBillFileIds' : 'paymentProofFileIds'
+        item[field] = [...new Set([...(item[field] ?? []).filter((id) => id !== target.replaceId), current.id])]
+      }
+    }
+  } catch (error) {
+    if (!acceptsDurableOperation(scope)) return
+    entry.status = 'failed'
+    entry.error = readableOperationError(error, '文件上传失败，请重试')
+  } finally {
+    if (scope.generation === durableOperationGeneration) {
+      if (pipelineId !== undefined) drafts.cancelFilePipeline(pipelineId)
+      batchPipelineId = null
+      batchPhase.value = 'done'
+      drafts.processingFiles = false
+      batchScope = null
     }
     finishDurableOperation(scope)
   }
@@ -1407,7 +1513,27 @@ async function retryItemRecognition(id: string): Promise<void> {
         data-testid="batch-file"
       >
         <span>{{ file.name }}</span>
-        <span>{{ batchStatusLabels[file.status] }}</span>
+        <span class="batch-file-status">{{ batchStatusLabels[file.status] }}</span>
+        <span
+          v-if="file.status === 'failed' && !file.uploaded"
+          class="batch-file-actions"
+        >
+          <el-button
+            link
+            type="primary"
+            :disabled="durableBusy"
+            @click="retryFailedBatchUpload(file)"
+          >
+            重试上传
+          </el-button>
+          <el-button
+            link
+            :disabled="durableBusy"
+            @click="removeFailedBatchFile(file)"
+          >
+            移除
+          </el-button>
+        </span>
         <p
           v-if="file.error"
           class="field-error"
@@ -2460,9 +2586,11 @@ async function retryItemRecognition(id: string): Promise<void> {
 <style scoped>
 .receipt-upload-button { min-width: 148px; }
 .batch-progress { margin-top: 16px; padding: 16px; border: 1px solid var(--el-border-color-light); border-radius: 8px; }
-.batch-file { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 16px; padding-top: 12px; }
+.batch-file { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 8px 12px; padding-top: 12px; }
 .batch-file > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .batch-file > p { grid-column: 1 / -1; margin: 0; }
+.batch-file-status { white-space: nowrap; }
+.batch-file-actions { display: flex; white-space: nowrap; }
 .linked-itinerary { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-top: 6px; color: #667085; font-size: 12px; }
 .itinerary-option { height: auto; min-height: 72px; padding: 10px 20px; line-height: 1.55; display: flex; flex-direction: column; white-space: normal; overflow-wrap: anywhere; }
 .itinerary-option > span, .itinerary-option > small { color: #667085; font-weight: 400; }

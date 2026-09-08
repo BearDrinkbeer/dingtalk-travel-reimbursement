@@ -30,6 +30,7 @@ def settings_factory(tmp_path: Path):
             "dingtalk_corp_id": "corp-fixed",
             "dingtalk_agent_id": 1234567890,
             "dingtalk_oa_worker_enabled": False,
+            "admin_user_ids": "bootstrap-admin",
             "session_secret": "test-session-secret-with-more-than-32-chars",
             "session_cookie_secure": False,
             # Unit tests opt out unless they exercise the OCR boundary

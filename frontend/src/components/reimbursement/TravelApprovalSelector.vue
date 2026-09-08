@@ -12,9 +12,13 @@ const props = withDefaults(defineProps<{
   modelValue: ReimbursementRelatedApprovalSelection[]
   linkedApprovals?: ReimbursementRelatedApproval[]
   readonly?: boolean
+  requiredStartDate?: string
+  requiredEndDate?: string
 }>(), {
   linkedApprovals: () => [],
   readonly: false,
+  requiredStartDate: '',
+  requiredEndDate: '',
 })
 
 const emit = defineEmits<{
@@ -146,6 +150,16 @@ function toggle(row: ApprovalRow, checked: boolean): void {
   if (props.readonly) return
   localError.value = ''
   if (!checked) {
+    const remainingIds = new Set(props.modelValue
+      .filter((selection) => selection.processInstanceId !== row.processInstanceId)
+      .map((selection) => selection.processInstanceId))
+    const remainingPeriods = rows.value
+      .filter((candidate) => remainingIds.has(candidate.processInstanceId))
+      .map((candidate) => [candidate.startDate, candidate.endDate] as const)
+    if (remainingPeriods.length === remainingIds.size && !periodsAreContiguous(remainingPeriods)) {
+      localError.value = '移除后审批日期会中断，请先移除日期位于首尾的审批'
+      return
+    }
     emit(
       'update:modelValue',
       props.modelValue.filter(
@@ -170,6 +184,10 @@ function unavailableReason(row: ApprovalRow): string {
   const candidate = candidateCache.get(row.processInstanceId)
   if (candidate?.unavailableReason) return candidate.unavailableReason
   if (!candidate?.companyOption || !candidate.budgetCodeOption) return '所属公司或预算代码不可用，请联系管理员'
+  if (props.requiredStartDate && props.requiredEndDate
+    && (row.endDate < props.requiredStartDate || row.startDate > props.requiredEndDate)) {
+    return '审批日期与出差补助日期不重合'
+  }
   const first = props.modelValue[0]
   if (!first) return ''
   const baseline = candidateCache.get(first.processInstanceId)
@@ -189,7 +207,30 @@ function unavailableReason(row: ApprovalRow): string {
   if (candidate.companyOption.value !== company) return '所属公司与已选审批不同'
   if (candidate.budgetCodeOption.value !== budget) return '预算代码与已选审批不同'
   if (candidate.travelTypeOption.value !== travelType) return '出差类别与已选审批不同'
+  const selectedPeriods = rows.value
+    .filter((candidateRow) => selectedIds.value.has(candidateRow.processInstanceId))
+    .map((candidateRow) => [candidateRow.startDate, candidateRow.endDate] as const)
+  if (selectedPeriods.length === props.modelValue.length
+    && !periodsAreContiguous([...selectedPeriods, [row.startDate, row.endDate]])) {
+    return '审批日期与已选审批不连续'
+  }
   return ''
+}
+
+function periodsAreContiguous(periods: ReadonlyArray<readonly [string, string]>): boolean {
+  const ordered = [...periods].sort(([left], [right]) => left.localeCompare(right))
+  if (ordered.length < 2) return true
+  let coveredEnd = ordered[0]![1]
+  for (const [start, end] of ordered.slice(1)) {
+    if (calendarDay(start) > calendarDay(coveredEnd) + 1) return false
+    if (end > coveredEnd) coveredEnd = end
+  }
+  return true
+}
+
+function calendarDay(value: string): number {
+  const [year, month, day] = value.split('-').map(Number)
+  return Math.floor(Date.UTC(year!, month! - 1, day!) / 86_400_000)
 }
 
 function accountingLabel(row: ApprovalRow): string {
@@ -209,7 +250,7 @@ function accountingLabel(row: ApprovalRow): string {
         <h2 id="travel-approval-heading">
           关联已通过的出差审批
         </h2>
-        <p>先选本人已通过的审批；可继续关联相同公司、预算和出差类别的多张审批。</p>
+        <p>先选本人已通过的审批；可继续关联相同公司、预算和出差类别且日期连续的多张审批。</p>
       </div>
       <el-tag
         :type="modelValue.length ? 'success' : 'warning'"

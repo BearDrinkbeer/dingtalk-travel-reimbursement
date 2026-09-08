@@ -76,7 +76,8 @@ def test_recheck_only_resumes_known_instance_with_csrf_and_keeps_original_draft(
         assert (locked.revision, locked.locked_at, locked.input_json) == before
 
 
-def test_submit_refresh_returns_existing_before_rebuilding_locked_snapshot(
+@pytest.mark.asyncio
+async def test_submit_refresh_returns_existing_before_rebuilding_locked_snapshot(
     monkeypatch,
 ) -> None:
     expected_actor = object()
@@ -119,7 +120,7 @@ def test_submit_refresh_returns_existing_before_rebuilding_locked_snapshot(
     results = []
     for revision in (3, 3, 999):
         results.append(
-            api.submit_reimbursement(
+            await api.submit_reimbursement(
                 "draft-1",
                 SubmitReimbursementRequest(expectedRevision=revision),
                 SimpleNamespace(),

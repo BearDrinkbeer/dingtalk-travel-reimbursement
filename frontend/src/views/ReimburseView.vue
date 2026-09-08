@@ -71,21 +71,34 @@ const selectedTravelTypeLabel = computed(() => {
     : undefined
   return mapped?.label ?? profile.travelTypeOption.label ?? profile.displayName
 })
+const selectedTravelApprovalPeriods = computed(() => selectedRelatedApprovals.value.flatMap((selection) => {
+  const candidate = drafts.travelApprovals.find(
+    (approval) => approval.processInstanceId === selection.processInstanceId,
+  )
+  const linked = drafts.currentDraft?.relatedApprovals.find(
+    (approval) => approval.processInstanceId === selection.processInstanceId,
+  )
+  const approval = candidate ?? linked
+  return approval ? [{ startDate: approval.startDate, endDate: approval.endDate }] : []
+}))
 const selectedTravelPeriod = computed(() => {
-  const periods = selectedRelatedApprovals.value.flatMap((selection) => {
-    const candidate = drafts.travelApprovals.find(
-      (approval) => approval.processInstanceId === selection.processInstanceId,
-    )
-    const linked = drafts.currentDraft?.relatedApprovals.find(
-      (approval) => approval.processInstanceId === selection.processInstanceId,
-    )
-    const approval = candidate ?? linked
-    return approval ? [{ startDate: approval.startDate, endDate: approval.endDate }] : []
-  })
+  const periods = selectedTravelApprovalPeriods.value
   if (!periods.length) return ''
   const startDate = periods.map((item) => item.startDate).sort()[0]!
   const endDate = periods.map((item) => item.endDate).sort().at(-1)!
   return startDate === endDate ? startDate : `${startDate} 至 ${endDate}`
+})
+const selectedTravelDateError = computed(() => {
+  if (!expense.includeSubsidy || !expense.trip.startDate || !expense.trip.endDate
+    || !selectedRelatedApprovals.value.length) return ''
+  const periods = selectedTravelApprovalPeriods.value
+  if (periods.length !== selectedRelatedApprovals.value.length) return ''
+  const approvalStart = periods.map((item) => item.startDate).sort()[0]!
+  const approvalEnd = periods.map((item) => item.endDate).sort().at(-1)!
+  if (approvalStart > expense.trip.startDate || approvalEnd < expense.trip.endDate) {
+    return '所选出差审批日期必须完整覆盖出差补助日期，请调整补助日期或关联审批'
+  }
+  return ''
 })
 const trackedSubmission = computed(() => Boolean(drafts.currentDraft
   && submission.activeDraftId === drafts.currentDraft.id
@@ -357,6 +370,7 @@ function validateSubmission(): string {
   if (unresolvedOcrFiles.value.length) return '请处理尚未加入费用明细的票据，或将其仅作为材料保留'
   if (pendingMaterialFiles.value.length) return '请先确认待处理材料的用途'
   if (!selectedRelatedApprovals.value.length) return '请至少关联一张已通过的出差审批'
+  if (selectedTravelDateError.value) return selectedTravelDateError.value
   if (!drafts.files.some((file) => file.status === 'ACTIVE')) return '请上传报销材料'
   for (const item of expense.items) {
     if (item.category === 'lodging' && !item.hotelBillFileIds?.some((id) =>
@@ -436,6 +450,16 @@ async function retrySameSubmission(): Promise<void> {
   const draft = drafts.currentDraft
   if (!draft) return
   try { await submission.submit(draft.id, draft.revision) } catch { /* Render the status error. */ }
+}
+async function retrySubmissionRecovery(): Promise<void> {
+  const draft = drafts.currentDraft
+  if (!draft) return
+  try {
+    await submission.restore(draft.id, {
+      discoverByDraft: true,
+      expectedRevision: draft.revision,
+    })
+  } catch { /* Render the recovery error in the submission card. */ }
 }
 async function refreshSubmissionService(refreshProgress = false): Promise<void> {
   if (refreshingServiceStatus.value) return
@@ -638,6 +662,8 @@ onBeforeUnmount(() => {
               v-model="selectedRelatedApprovals"
               :linked-approvals="drafts.currentDraft.relatedApprovals"
               :readonly="formReadOnly || drafts.processingFiles"
+              :required-start-date="expense.includeSubsidy ? expense.trip.startDate : ''"
+              :required-end-date="expense.includeSubsidy ? expense.trip.endDate : ''"
             />
             <el-alert
               v-if="drafts.currentDraft.relatedApprovals.length && !drafts.currentDraft.input.accountingSourceVerified && !formReadOnly"
@@ -869,12 +895,12 @@ onBeforeUnmount(() => {
                   刷新提交进度
                 </el-button>
                 <el-button
-                  v-if="submission.requestError && !submission.submission && submission.idempotencyKey"
+                  v-if="submission.requestError && !submission.submission"
                   :loading="submission.submitting"
-                  :disabled="submission.oaSubmissionEnabled !== true"
-                  @click="retrySameSubmission"
+                  :disabled="submission.idempotencyKey ? submission.oaSubmissionEnabled !== true : false"
+                  @click="submission.idempotencyKey ? retrySameSubmission() : retrySubmissionRecovery()"
                 >
-                  重试本次提交
+                  {{ submission.idempotencyKey ? '重试本次提交' : '重新查找提交记录' }}
                 </el-button>
               </div>
             </section>

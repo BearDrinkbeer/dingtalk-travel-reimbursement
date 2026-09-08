@@ -1519,7 +1519,7 @@ class DurableOAReimbursementWorker:
         except Exception as exc:
             # A processor must persist expected business failures itself. An
             # unexpected bug is intentionally left to lease-expiry recovery.
-            logger.exception(
+            logger.error(
                 "Reimbursement worker iteration failed",
                 extra={
                     "submission_id": lease.submission_id,

@@ -51,7 +51,7 @@ const itinerary = {
   },
 }
 const proof = { ...baseFile('payment-1', '酒店住宿付款截图-电子支付记录.png'), attachmentKind: 'payment_proof' as const, mediaType: 'image/png' }
-const hotelBill: ReimbursementDraftFile = { ...baseFile('hotel-1', '住宿明细-水单示例.pdf'), attachmentKind: 'hotel_bill',
+const hotelBill: ReimbursementDraftFile = { ...baseFile('hotel-1', '住宿明细示例.pdf'), attachmentKind: 'hotel_bill',
   materialClassification: { status: 'classified', kind: 'hotel_bill', reason: null, pageCount: 1 },
   hotelBillDetails: { guest: '示例住客', checkIn: '2026-07-06', checkOut: '2026-07-07', nights: 1,
     nightlyRate: '580.00', total: '580.00', currency: 'CNY', warnings: ['HOTEL_BILL_REVIEW_REQUIRED'] },
@@ -66,9 +66,9 @@ if (new URLSearchParams(location.search).get('scenario') === 'amount-only') {
     warnings: ['INVOICE_DATE_USED_AS_OCCURRENCE', 'MANUAL_REVIEW_REQUIRED'] })
 }
 expense.upsertDraftOcrItem(taxi)
-expense.upsertManualItem({ category: 'lodging', description: '住宿待补水单和付款凭证', date: '2026-07-06', displayDate: '2026-07-06', amount: '680.00', receiptCount: 1 })
-expense.upsertManualItem({ category: 'lodging', description: '已附水单和付款凭证的住宿费用', date: '2026-07-07', displayDate: '2026-07-07', amount: '580.00', receiptCount: 1, paymentProofFileIds: [proof.id], hotelBillFileIds: [hotelBill.id] })
-expense.upsertManualItem({ category: 'lodging', description: '低于 500 元仍需水单', date: '2026-07-08', displayDate: '2026-07-08', amount: '300.00', receiptCount: 1 })
+expense.upsertManualItem({ category: 'lodging', description: '住宿待补住宿明细和付款凭证', date: '2026-07-06', displayDate: '2026-07-06', amount: '680.00', receiptCount: 1 })
+expense.upsertManualItem({ category: 'lodging', description: '已附住宿明细和付款凭证的住宿费用', date: '2026-07-07', displayDate: '2026-07-07', amount: '580.00', receiptCount: 1, paymentProofFileIds: [proof.id], hotelBillFileIds: [hotelBill.id] })
+expense.upsertManualItem({ category: 'lodging', description: '低于 500 元仍需住宿明细', date: '2026-07-08', displayDate: '2026-07-08', amount: '300.00', receiptCount: 1 })
 expense.upsertManualItem({ category: 'rail_fare', description: 'G1234 高铁，超过 500 元免付款凭证', date: '2026-07-07', displayDate: '2026-07-07', amount: '650.00', receiptCount: 1, railType: 'high_speed' })
 if (new URLSearchParams(location.search).get('scenario') === 'payment-expense') {
   drafts.files = [{ ...baseFile('payment-card-fee', '制卡费银行付款凭证.jpg'), attachmentKind: 'payment_proof', mediaType: 'image/jpeg',

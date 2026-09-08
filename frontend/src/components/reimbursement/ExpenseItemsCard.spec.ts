@@ -1227,12 +1227,13 @@ describe('ExpenseItemsCard durable files', () => {
     const drafts = useReimbursementDraftStore()
     drafts.currentDraft = draft()
     let revision = 1
+    let failedUploadAttempts = 0
     const retained: ReimbursementDraftFile[] = []
     vi.mocked(getReimbursementDraft).mockImplementation(async () => draft(revision))
     vi.mocked(listReimbursementDraftFiles).mockImplementation(async () => ({ draftId: 'draft-1', revision, items: [...retained] }))
     vi.mocked(uploadReimbursementDraftFile).mockImplementation(async (draftId, expected, file) => {
       expect(expected).toBe(revision)
-      if (file.name === '上传失败.pdf') throw new Error('单张上传失败')
+      if (file.name === '上传失败.pdf' && failedUploadAttempts++ === 0) throw new Error('单张上传失败')
       const uploaded = serverFile(`file-${revision}`, file.name, 'EXPENSE_SOURCE')
       retained.push(uploaded)
       return { draftId, revision: ++revision, file: uploaded }
@@ -1255,6 +1256,17 @@ describe('ExpenseItemsCard durable files', () => {
     expect(expense.items.map((item) => item.description)).toEqual(['成功一.pdf 的行程', '成功二.pdf 的行程'])
     expect(wrapper.get('[data-testid="batch-progress"]').text()).toContain('单张上传失败')
     expect(wrapper.get('[data-testid="batch-progress"]').text()).toContain('单张识别失败')
+    const failedUploadRow = wrapper.findAll('[data-testid="batch-file"]')
+      .find((row) => row.text().includes('上传失败.pdf'))
+    expect(failedUploadRow).toBeDefined()
+    expect(failedUploadRow!.text()).toContain('重试上传')
+    expect(failedUploadRow!.text()).toContain('移除')
+    await failedUploadRow!.findAll('button').find((button) => button.text() === '重试上传')!.trigger('click')
+    await flushPromises()
+    expect(uploadReimbursementDraftFile).toHaveBeenCalledTimes(5)
+    expect(expense.items.map((item) => item.description)).toContain('上传失败.pdf 的行程')
+    expect(wrapper.findAll('[data-testid="batch-file"]')
+      .some((row) => row.text().includes('上传失败.pdf'))).toBe(false)
     expect(drafts.processingFiles).toBe(false)
     wrapper.unmount()
   })

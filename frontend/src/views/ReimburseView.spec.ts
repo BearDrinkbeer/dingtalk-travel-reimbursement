@@ -234,6 +234,8 @@ const TravelApprovalSelectorStub = defineComponent({
     modelValue: { type: Array, required: true },
     linkedApprovals: { type: Array, default: () => [] },
     readonly: { type: Boolean, default: false },
+    requiredStartDate: { type: String, default: '' },
+    requiredEndDate: { type: String, default: '' },
   },
   emits: ['update:modelValue'],
   template: '<section data-testid="travel-selector">关联出差审批</section>',
@@ -869,6 +871,27 @@ describe('ReimburseView single-form OA flow', () => {
     wrapper.unmount()
   })
 
+  it('offers an in-page retry when locked-submission discovery fails before an idempotency key exists', async () => {
+    const { wrapper } = await mountView()
+    const submission = useReimbursementSubmissionStore()
+    submission.activeDraftId = 'draft-1'
+    submission.idempotencyKey = null
+    submission.submission = null
+    submission.requestError = '提交记录恢复失败，请稍后重试'
+    vi.mocked(getOaReimbursementSubmissionForDraft).mockResolvedValue(submissionResult())
+    await nextTick()
+
+    await visibleButton(wrapper, '重新查找提交记录').trigger('click')
+    await flushPromises()
+
+    expect(getOaReimbursementSubmissionForDraft).toHaveBeenCalledWith(
+      'draft-1',
+      { signal: expect.any(AbortSignal) },
+    )
+    expect((submission.submission as ReimbursementSubmission | null)?.submissionId).toBe('submission-1')
+    wrapper.unmount()
+  })
+
   it('does not turn an ordinary failed save into an endless automatic retry loop', async () => {
     vi.useFakeTimers()
     const { wrapper, expense } = await mountView()
@@ -897,6 +920,43 @@ describe('ReimburseView single-form OA flow', () => {
     expect(submitOaReimbursement).toHaveBeenCalledOnce()
     expect(vi.mocked(submitOaReimbursement).mock.calls[0]?.slice(0, 2)).toEqual(['draft-1', 4])
     expect(wrapper.findComponent(ExpenseItemsCardStub).props('readonly')).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('requires selected approvals to cover the complete subsidy period before submission', async () => {
+    const confirm = vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue(undefined as never)
+    const { wrapper, expense, drafts } = await mountView()
+    drafts.travelApprovals = [{
+      ...linkedApproval,
+      profileDisplayName: '境内出差',
+      travelTypeOption: { value: 'business', label: '境内出差', key: null },
+      companyOption: options.companyOptions[0]!,
+      budgetCodeOption: options.budgetCodeOptions[0]!,
+      unavailableReason: null,
+      createdAt: '2026-08-30T00:00:00Z',
+      finishedAt: '2026-08-31T00:00:00Z',
+    }]
+    wrapper.findComponent(TravelApprovalSelectorStub).vm.$emit('update:modelValue', [selection])
+    expense.includeSubsidy = true
+    Object.assign(expense.trip, {
+      tripType: 'business', startDate: '2026-09-01', startTime: '09:00',
+      endDate: '2026-09-03', endTime: '18:00',
+    })
+    await nextTick()
+
+    expect(wrapper.findComponent(TravelApprovalSelectorStub).props()).toMatchObject({
+      requiredStartDate: '2026-09-01',
+      requiredEndDate: '2026-09-03',
+    })
+    await visibleButton(wrapper, '提交 OA').trigger('click')
+    expect(confirm).not.toHaveBeenCalled()
+    expect(submitOaReimbursement).not.toHaveBeenCalled()
+
+    expense.trip.endDate = '2026-09-02'
+    await nextTick()
+    await visibleButton(wrapper, '提交 OA').trigger('click')
+    await flushPromises()
+    expect(confirm).toHaveBeenCalledOnce()
     wrapper.unmount()
   })
 

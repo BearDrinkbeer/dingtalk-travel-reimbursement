@@ -510,6 +510,7 @@ def _persist_ready_draft(
     *,
     travel_instance_ids: tuple[str, ...] = (TRAVEL_INSTANCE_ID,),
 ):
+    client.app.state.dingtalk_workflow = workflow
     settings = client.app.state.settings
     now = utc_now()
     with client.app.state.database_session_factory() as database:
@@ -757,6 +758,39 @@ def test_disabled_worker_rejects_new_submission_without_locking_draft(
     )
     assert edited.status_code == 200, edited.text
     assert edited.json()["data"]["revision"] == 5
+
+
+def test_submit_detects_live_template_drift_before_locking_draft(
+    enabled_manual_worker_client,
+) -> None:
+    reimbursement_schema, travel_schema, travel_type = _schemas()
+    workflow = LocalWorkflowBoundary(reimbursement_schema, travel_schema)
+    client = enabled_manual_worker_client
+    csrf = str(mock_login(client)["csrfToken"])
+    draft_id, _ = _persist_ready_draft(client, workflow, travel_type)
+    workflow.schemas[REIMBURSEMENT_PROCESS_CODE] = replace(
+        reimbursement_schema,
+        fingerprint="f" * 64,
+    )
+
+    response = client.post(
+        f"/api/oa/reimbursements/{draft_id}/submit",
+        json={"expectedRevision": 4},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "99999999-9999-4999-8999-999999999999",
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "OA_TEMPLATE_CONFIRMATION_REQUIRED"
+    with client.app.state.database_session_factory() as database:
+        draft = database.get(ReimbursementDraft, draft_id)
+        assert draft.status == ReimbursementDraftStatus.REVIEW_READY.value
+        assert draft.locked_at is None
+        with pytest.raises(ApiError) as caught:
+            require_submission_ready_catalog(database)
+        assert caught.value.code == "OA_TEMPLATE_CONFIRMATION_REQUIRED"
 
 
 @pytest.fixture

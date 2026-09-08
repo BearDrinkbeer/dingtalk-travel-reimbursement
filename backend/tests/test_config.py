@@ -26,6 +26,15 @@ def test_admin_ids_are_trimmed() -> None:
     assert settings.admin_ids == frozenset({"user-1", "user-2"})
 
 
+def test_production_requires_a_bootstrap_admin(settings_factory) -> None:
+    with pytest.raises(ValidationError, match="ADMIN_USER_IDS"):
+        settings_factory(
+            app_env="production",
+            session_cookie_secure=True,
+            admin_user_ids=" , ",
+        )
+
+
 def test_mock_departments_are_parsed_without_accepting_invalid_entries() -> None:
     settings = Settings(auth_mock_departments="10:部门一,invalid,20: 部门二")
 

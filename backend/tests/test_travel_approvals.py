@@ -665,6 +665,31 @@ async def test_reverification_proves_membership_and_aggregates_one_travel_type()
 
 
 @pytest.mark.asyncio
+async def test_reverification_rejects_a_gap_between_selected_approvals() -> None:
+    window = _window()
+    workflow = FakeWorkflow(
+        {("PROC-A", 0): WorkflowInstanceIdPage(("first", "second"), None)},
+        {
+            "first": _instance("first", start_date="2026-08-01", end_date="2026-08-02"),
+            "second": _instance("second", start_date="2026-08-04", end_date="2026-08-05"),
+        },
+    )
+
+    with pytest.raises(ApiError) as caught:
+        await reverify_travel_approval_selection(
+            workflow,
+            _catalog(_profile("domestic", "PROC-A")),
+            current_user_id="employee-1",
+            selections=(
+                TravelApprovalSelection("domestic", "first", window),
+                TravelApprovalSelection("domestic", "second", window),
+            ),
+        )
+
+    assert caught.value.code == "TRAVEL_APPROVAL_DATE_GAP"
+
+
+@pytest.mark.asyncio
 async def test_reverification_rejects_mixed_travel_types() -> None:
     window = _window()
     workflow = FakeWorkflow(

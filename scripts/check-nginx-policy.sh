@@ -18,6 +18,13 @@ do
     grep -F "$required" "$config" >/dev/null
 done
 
+if [ "$(grep -Fc 'proxy_request_buffering off' "$config")" -ne 2 ]; then
+    echo "Both temporary and persistent upload routes must disable request buffering." >&2
+    exit 1
+fi
+
+grep -F 'location ~ ^/api/reimbursements/drafts/[^/]+/files$' "$config" >/dev/null
+
 for required in \
     "proxy_pass http://backend:8000" \
     "proxy_set_header X-Forwarded-Proto" \

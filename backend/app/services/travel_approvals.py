@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from typing import Protocol
@@ -155,6 +156,20 @@ class VerifiedTravelSelection:
     end_date: date
     company_option: FormOption
     budget_code_option: FormOption
+
+
+def travel_periods_are_contiguous(periods: Sequence[tuple[date, date]]) -> bool:
+    """Return whether inclusive travel periods form one gap-free calendar range."""
+
+    ordered = sorted(periods)
+    if not ordered:
+        return True
+    covered_end = ordered[0][1]
+    for start_date, end_date in ordered[1:]:
+        if start_date > covered_end + timedelta(days=1):
+            return False
+        covered_end = max(covered_end, end_date)
+    return True
 
 
 def requested_query_window(
@@ -322,6 +337,14 @@ async def reverify_travel_approval_selection(
         raise ApiError(
             "TRAVEL_APPROVAL_ACCOUNTING_MISMATCH",
             "所选出差审批的所属公司或预算代码不同，不能放在同一张报销单中",
+            422,
+        )
+    if not travel_periods_are_contiguous(
+        [(item.start_date, item.end_date) for item in approvals]
+    ):
+        raise ApiError(
+            "TRAVEL_APPROVAL_DATE_GAP",
+            "所选出差审批日期不连续，只能关联日期相邻或重叠的审批",
             422,
         )
     return VerifiedTravelSelection(

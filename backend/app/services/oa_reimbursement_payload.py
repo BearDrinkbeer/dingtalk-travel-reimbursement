@@ -78,6 +78,7 @@ from app.services.reimbursement_staging import (
     ReimbursementStaging,
     ReimbursementStagingError,
 )
+from app.services.travel_approvals import travel_periods_are_contiguous
 
 SNAPSHOT_VERSION = 5
 _MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
@@ -979,21 +980,35 @@ def _validate_related_sources(
         travel_types.add(_profile_selected_type(profile, item.source_travel_type_value).value)
     if len(travel_types) != 1:
         raise _snapshot_error("关联的出差审批类别不一致，请重新选择")
+    periods = [(item.start_date, item.end_date) for item in related]
+    if not travel_periods_are_contiguous(periods):
+        raise ApiError(
+            "TRAVEL_APPROVAL_DATE_GAP",
+            "所选出差审批日期不连续，只能关联日期相邻或重叠的审批",
+            409,
+        )
+    approval_start = min(start for start, _end in periods)
+    approval_end = max(end for _start, end in periods)
     if draft_input.trip is not None:
         reimbursement_start = draft_input.trip.start_date
         reimbursement_end = draft_input.trip.end_date
+        if approval_start > reimbursement_start or approval_end < reimbursement_end:
+            raise ApiError(
+                "REIMBURSEMENT_TRAVEL_DATE_MISMATCH",
+                "所选出差审批日期必须完整覆盖出差补助日期",
+                409,
+            )
     elif draft_input.items:
         reimbursement_start = min(item.date for item in draft_input.items)
         reimbursement_end = max(item.date for item in draft_input.items)
     else:
         return
-    if any(
-        item.end_date < reimbursement_start or item.start_date > reimbursement_end
-        for item in related
+    if draft_input.trip is None and (
+        approval_end < reimbursement_start or approval_start > reimbursement_end
     ):
         raise ApiError(
             "REIMBURSEMENT_TRAVEL_DATE_MISMATCH",
-            "所选出差审批日期与本次报销日期不重叠，请重新选择",
+            "所选出差审批日期与本次报销费用日期不重叠，请重新选择",
             409,
         )
 

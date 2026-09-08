@@ -338,6 +338,8 @@ class Settings(BaseSettings):
                 value = raw_value.strip()
                 if not value or value.lower() in placeholders:
                     raise ValueError(f"{name} must be configured for production")
+            if not self.admin_ids:
+                raise ValueError("ADMIN_USER_IDS must contain at least one userId in production")
             if len(self.session_secret) < 32:
                 raise ValueError("SESSION_SECRET must contain at least 32 characters")
             if self.ocr_fake_enabled:
