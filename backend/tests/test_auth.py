@@ -482,7 +482,7 @@ def test_admin_access_is_rederived_from_current_configuration(client_factory) ->
     raw_cookie = client.cookies["expense_session"]
 
     client.app.state.settings.admin_user_ids = ""
-    assert client.get("/api/admin/projects").status_code == 403
+    assert client.get("/api/admin/settings").status_code == 403
     with client.app.state.database_session_factory() as database:
         record = database.get(
             UserSession,
@@ -491,7 +491,7 @@ def test_admin_access_is_rederived_from_current_configuration(client_factory) ->
         assert record is not None and record.is_admin is False
 
     client.app.state.settings.admin_user_ids = "admin-live-config"
-    assert client.get("/api/admin/projects").status_code == 200
+    assert client.get("/api/admin/settings").status_code == 200
     with client.app.state.database_session_factory() as database:
         record = database.get(
             UserSession,

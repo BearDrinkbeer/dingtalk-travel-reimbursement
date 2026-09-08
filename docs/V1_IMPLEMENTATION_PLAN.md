@@ -243,16 +243,9 @@ interface TripInput {
 
 17 类都可手工填写，但“可选择类别”与“自动识别能力”是两个概念。V1 Parser 自动分类仅覆盖 `rail_fare`，以及旅客运输发票中有明确交通工具证据的 `rail_fare`、`airfare`、已支持公路/出租汽车类型的 `local_transport`；通用或不确定票据返回 `other` 和人工确认警告。新增类别不要求同时新增 OCR Parser。
 
-### 5.2 SQLite 只保存三类数据
+### 5.2 SQLite 持久化数据
 
-`projects`
-
-- `id`
-- `project_code`
-- `project_name`
-- `enabled`
-- `created_at`
-- `updated_at`
+预算代码不在本系统维护；系统从关联的钉钉出差审批读取所属公司和预算代码，并把预算代码完整名称写入报销 Excel。
 
 `settings`
 
@@ -483,7 +476,6 @@ V1 实现顺序：
 | POST | `/api/auth/logout` | Session + CSRF | 退出并清理当前临时文件 |
 | GET | `/api/me` | Session | 当前用户、合法部门列表、管理员标识 |
 | POST | `/api/me/department` | Session + CSRF | 选择当前合法部门 |
-| GET | `/api/projects?q=` | Session | 搜索启用项目 |
 | GET | `/api/settings` | Session | 读取补助显示配置 |
 | GET | `/api/expense-categories` | Session | 读取 17 类集中费用契约及手工可选标记 |
 | POST | `/api/calculate/subsidy` | Session + CSRF | 服务端计算补助 |
@@ -492,10 +484,6 @@ V1 实现顺序：
 | DELETE | `/api/files/{fileId}` | Session + CSRF | 应用内部取消/竞态清理本 Session 临时票据；员工页面不提供入口 |
 | POST | `/api/ocr` | Session + CSRF | 单个文件同步识别，便于逐文件进度和重试 |
 | POST | `/api/excel/generate` | Session + CSRF | 后端校验、重算并下载 Excel |
-| GET | `/api/admin/projects` | Admin | 管理端查询全部项目 |
-| POST | `/api/admin/projects` | Admin + CSRF | 新增项目 |
-| PUT | `/api/admin/projects/{id}` | Admin + CSRF | 修改/启停项目 |
-| DELETE | `/api/admin/projects/{id}` | Admin + CSRF | 删除项目 |
 | PUT | `/api/admin/settings` | Admin + CSRF | 修改五类每日补助标准；计算模式固定为 `half_day_12` |
 
 管理员由 `ADMIN_USER_IDS` 环境变量配置。前端路由守卫只改善体验，后端依赖注入才是权限边界。
@@ -504,7 +492,7 @@ V1 实现顺序：
 
 - `UNAUTHORIZED`、`FORBIDDEN`、`INVALID_CORP_CONTEXT`。
 - `DINGTALK_AUTH_FAILED`、`DINGTALK_PERMISSION_MISSING`。
-- `INVALID_DATE_RANGE`、`INVALID_DEPARTMENT`、`PROJECT_NOT_FOUND`。
+- `INVALID_DATE_RANGE`、`INVALID_DEPARTMENT`。
 - `INVALID_TRIP_TIME`、`INVALID_TRIP_DURATION`、`INVALID_SUBSIDY_INPUT`、`SUBSIDY_CONFIRMATION_REQUIRED`、`INVALID_SUBSIDY_EXCEPTION`。
 - `UNSUPPORTED_FILE`、`FILE_TOO_LARGE`、`TOO_MANY_FILES`、`SESSION_FILE_LIMIT`、`SESSION_STORAGE_LIMIT`、`TEMP_STORAGE_FULL`、`UPLOAD_BUSY`、`FILE_OPERATION_BUSY`。
 - `MULTI_PAGE_PDF_UNSUPPORTED`、`ENCRYPTED_PDF_UNSUPPORTED`、`PDF_PAGE_TOO_LARGE`、`PDF_TOO_COMPLEX`、`IMAGE_VALIDATION_TIMEOUT`、`PDF_VALIDATION_TIMEOUT`、`PROCESS_RESOURCE_LIMIT`。
@@ -516,7 +504,7 @@ V1 实现顺序：
 ## 10. 目录结构
 
 ```text
-dingtalk-expense/
+dingtalk-travel-reimbursement/
 ├── frontend/
 │   ├── src/
 │   │   ├── api/
@@ -524,12 +512,11 @@ dingtalk-expense/
 │   │   │   ├── reimbursement/   # 补助、费用明细与 Excel 下载业务组件
 │   │   │   └── settings/        # 分类关键词与补助标准管理组件
 │   │   ├── router/
-│   │   ├── stores/              # Session、项目和当前报销单内存状态
+│   │   ├── stores/              # Session 和当前报销单内存状态
 │   │   ├── types/
 │   │   ├── utils/
 │   │   └── views/
 │   │       ├── ReimburseView.vue
-│   │       ├── ProjectAdminView.vue
 │   │       └── SettingsAdminView.vue
 │   ├── package.json
 │   └── vite.config.ts
@@ -600,7 +587,7 @@ dingtalk-expense/
 要实现：
 
 - 创建 Vue 3 + Vite + TypeScript 前端和 FastAPI 后端。
-- 建立 SQLAlchemy/Alembic：projects、settings、sessions。
+- 建立 SQLAlchemy/Alembic：settings、sessions 及报销业务表。
 - 建立统一配置、错误响应、结构化脱敏日志和 request ID。
 - 完成 `/api/health`、Vite `/api` 代理、基础 Dockerfile 和 Compose。
 - 建立 pytest、Vitest、lint/typecheck 命令。

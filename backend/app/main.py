@@ -20,7 +20,6 @@ from app.api.health import router as health_router
 from app.api.oa_reimbursements import router as oa_reimbursements_router
 from app.api.oa_templates import router as oa_templates_router
 from app.api.ocr import router as ocr_router
-from app.api.projects import router as projects_router
 from app.api.receipt_keywords import router as receipt_keywords_router
 from app.api.reimbursement_files import router as reimbursement_files_router
 from app.api.reimbursement_submissions import router as reimbursement_submissions_router
@@ -242,7 +241,7 @@ def create_app(
             yield
 
     application = FastAPI(
-        title="DingTalk Expense API",
+        title="DingTalk Travel Reimbursement API",
         version="0.2.0",
         docs_url="/api/docs" if runtime_settings.app_env != "production" else None,
         openapi_url="/api/openapi.json" if runtime_settings.app_env != "production" else None,
@@ -333,7 +332,6 @@ def create_app(
     install_error_handlers(application)
     application.include_router(health_router, prefix="/api")
     application.include_router(auth_router, prefix="/api")
-    application.include_router(projects_router, prefix="/api")
     application.include_router(receipt_keywords_router, prefix="/api")
     application.include_router(settings_router, prefix="/api")
     application.include_router(calculations_router, prefix="/api")

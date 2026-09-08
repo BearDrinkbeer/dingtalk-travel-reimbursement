@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -35,12 +35,6 @@ class ManualProjectInput(BaseModel):
         return normalized
 
 
-ProjectInput = Annotated[
-    SelectedProjectInput | ManualProjectInput,
-    Field(discriminator="mode"),
-]
-
-
 class ExcelExpenseItemInput(ExpenseLineBase):
     """Only the line fields needed for authoritative workbook recomputation."""
 
@@ -58,7 +52,7 @@ class ExcelExpenseItemInput(ExpenseLineBase):
 class ExcelGenerateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    project: ProjectInput
+    project: ManualProjectInput
     # A missing trip explicitly means no travel subsidy is claimed.
     trip: TripInput | None = None
     # The deployment-configured technical limit is enforced by the endpoint.

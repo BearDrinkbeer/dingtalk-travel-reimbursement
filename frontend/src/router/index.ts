@@ -13,11 +13,6 @@ const router = createRouter({
       component: ReimburseView,
     },
     {
-      path: '/admin/projects',
-      name: 'admin-projects',
-      redirect: { name: 'reimburse' },
-    },
-    {
       path: '/admin/settings',
       name: 'admin-settings',
       component: () => import('@/views/SettingsAdminView.vue'),

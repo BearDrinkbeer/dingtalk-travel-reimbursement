@@ -156,7 +156,7 @@ OA 开关沿用 `.env`，开启后提交会创建正式公司的审批。
 `make dev-dingtalk-frontend`。
 
 新模式固定关闭 `AUTH_MOCK_ENABLED`，使用独立的 `backend/data/dev-dingtalk.db` 和
-`/tmp/dingtalk-expense-dingtalk-dev`。前端仍通过 Vite 将同源 `/api` 代理到本机后端。
+`/tmp/dingtalk-travel-reimbursement-dingtalk-dev`。前端仍通过 Vite 将同源 `/api` 代理到本机后端。
 `dev-dingtalk-frontend` 会显式设置 `VITE_DINGTALK_REMOTE_DEBUG=true`，按需动态加载锁定的
 `dingtalk-h5-remote-debug@0.1.3`；只有钉钉调试平台生成的调试链接才会继续加载远程调试 SDK。
 真实钉钉联调后端不启用 Uvicorn 热重载，以免 macOS 的重载子进程与图片/OCR 隔离子进程冲突；

@@ -14,7 +14,7 @@ import type {
   ReimbursementSubmissionStatus,
 } from '@/types/reimbursements'
 
-const STORAGE_KEY = 'dingtalk-expense.reimbursement-submissions.v1'
+const STORAGE_KEY = 'dingtalk-travel-reimbursement.reimbursement-submissions.v1'
 const DEFAULT_POLL_AFTER_MS = 1_500
 const MAX_POLL_AFTER_MS = 60_000
 const MAX_PERSISTED_DRAFTS = 100

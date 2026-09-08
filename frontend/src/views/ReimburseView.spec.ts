@@ -8,7 +8,6 @@ import { defineComponent, nextTick } from 'vue'
 import { getPublicConfig } from '@/api/auth'
 import { calculateTotals } from '@/api/expenses'
 import { fetchReadiness } from '@/api/health'
-import { searchProjects } from '@/api/projects'
 import {
   createReimbursementDraft,
   deleteReimbursementDraft,
@@ -45,7 +44,6 @@ vi.mock('@/api/auth', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/api/auth')>(),
   getPublicConfig: vi.fn(),
 }))
-vi.mock('@/api/projects', () => ({ searchProjects: vi.fn() }))
 vi.mock('@/api/expenses', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/api/expenses')>()
   return { ...actual, calculateTotals: vi.fn() }
@@ -254,9 +252,6 @@ function installServerMocks(): void {
     status: 'ready',
     checks: { database: 'ok', excelTemplate: 'ok', tempStorage: 'ok', ocr: 'disabled' },
   })
-  vi.mocked(searchProjects).mockResolvedValue([
-    { id: 101, projectCode: 'P-101', projectName: '内部项目一', enabled: true },
-  ])
   vi.mocked(calculateTotals).mockResolvedValue(serverDraft.totals)
   vi.mocked(getOaReimbursementOptions).mockResolvedValue(options)
   vi.mocked(listReimbursementDrafts).mockImplementation(async () => ({
@@ -586,7 +581,6 @@ describe('ReimburseView single-form OA flow', () => {
 
   it('loads DingTalk budget choices and restores one form without project or draft management', async () => {
     const { wrapper, expense, drafts } = await mountView()
-    expect(searchProjects).not.toHaveBeenCalled()
     expect(getOaReimbursementOptions).toHaveBeenCalledOnce()
     expect(drafts.reimbursementOptions).toEqual(options)
     expect(expense.manualProjectText).toBe('26007 · MES 项目')

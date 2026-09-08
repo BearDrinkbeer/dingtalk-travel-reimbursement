@@ -19,7 +19,6 @@ from app.core.config import Settings, get_settings
 from app.database.base import Base
 from app.database.session import create_database_engine, create_session_factory, get_db
 from app.main import create_app
-from app.models.project import Project
 from app.models.session import UserSession, utc_now
 from app.models.setting import Setting
 
@@ -208,45 +207,6 @@ def test_session_load_opportunistically_purges_expired_sessions(
 
     with client.app.state.database_session_factory() as database:
         assert database.get(UserSession, "expired-after-startup") is None
-
-
-def test_sqlite_project_timestamps_round_trip_as_utc_naive(tmp_path: Path) -> None:
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'projects.db'}")
-    session_factory = create_session_factory(engine)
-    Base.metadata.create_all(engine)
-
-    with session_factory() as database:
-        project = Project(project_code="P-001", project_name="Timestamp test")
-        database.add(project)
-        database.commit()
-        project_id = project.id
-        database.expunge_all()
-
-        persisted = database.get(Project, project_id)
-
-        assert persisted is not None
-        assert persisted.created_at.tzinfo is None
-        assert persisted.updated_at.tzinfo is None
-        assert persisted.created_at <= utc_now()
-        assert persisted.updated_at <= utc_now()
-
-        original_created_at = persisted.created_at
-        original_updated_at = persisted.updated_at
-        persisted.project_name = "Timestamp test updated"
-        database.commit()
-        database.expunge_all()
-
-        updated = database.get(Project, project_id)
-
-        assert updated is not None
-        assert updated.created_at == original_created_at
-        assert updated.created_at.tzinfo is None
-        assert updated.updated_at.tzinfo is None
-        assert updated.updated_at >= original_updated_at
-        assert updated.updated_at <= utc_now()
-
-    engine.dispose()
-
 
 def test_alembic_0003_preserves_legacy_rate_for_old_automatic_types(
     tmp_path: Path,

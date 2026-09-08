@@ -71,12 +71,12 @@ export APP_ENV=development
 export AUTH_MOCK_ENABLED=false
 export SESSION_COOKIE_SECURE="$DINGTALK_DEV_COOKIE_SECURE"
 export DATABASE_URL=sqlite:///./data/dev-dingtalk.db
-export TEMP_DIR=/tmp/dingtalk-expense-dingtalk-dev
+export TEMP_DIR=/tmp/dingtalk-travel-reimbursement-dingtalk-dev
 REIMBURSEMENT_STAGING_DIR=${REIMBURSEMENT_STAGING_DIR:-"$PROJECT_DIR/backend/data/reimbursement-staging"}
 export REIMBURSEMENT_STAGING_DIR
 if [ "${1:-}" = prod ]; then
     export DATABASE_URL=sqlite:///./data/dev-dingtalk-prod.db
-    export TEMP_DIR=/tmp/dingtalk-expense-dingtalk-prod
+    export TEMP_DIR=/tmp/dingtalk-travel-reimbursement-dingtalk-prod
     export REIMBURSEMENT_STAGING_DIR="$PROJECT_DIR/backend/data/reimbursement-staging-prod"
     export SESSION_COOKIE_NAME=expense_dingtalk_prod_session
     echo "正式公司本地联调：使用独立数据；提交会进入真实 OA。模板目录需在本环境确认。"

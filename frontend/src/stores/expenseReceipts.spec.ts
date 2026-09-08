@@ -361,7 +361,7 @@ describe('expense receipt flow', () => {
     })
     const store = useExpenseStore()
     store.categories = CATEGORIES
-    store.selectedProjectId = 7
+    store.manualProjectText = 'P-007 测试项目'
     store.setSubsidyIncluded(true)
     Object.assign(store.trip, {
       startDate: '2026-06-30', startTime: '09:00',

@@ -16,7 +16,6 @@ from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.table import Table
 
 from app.excel.template_contract import EXCEL_TEMPLATE, apply_output_page_setup
-from app.models.project import Project
 from app.services.excel_generator import XLSX_MEDIA_TYPE
 
 TEMPLATE_PATH = Path(__file__).parents[1] / "app" / "templates" / "expense_template.xlsx"
@@ -244,15 +243,8 @@ def test_excel_exact_cells_order_totals_and_layout_are_preserved(client_factory)
 
     client = client_factory(auth_mock_enabled=True)
     csrf = mock_login(client)["csrfToken"]
-    with client.app.state.database_session_factory() as database:
-        project = Project(project_code="P-001", project_name="示例项目", enabled=True)
-        database.add(project)
-        database.commit()
-        database.refresh(project)
-        project_id = project.id
-
     body = {
-        "project": {"mode": "selected", "id": project_id},
+        "project": {"mode": "manual", "text": "P-001 示例项目"},
         "trip": trip(),
         "items": [
             item(
@@ -588,25 +580,3 @@ def test_filename_is_sanitized_and_rfc5987_encoded(client_factory) -> None:
     filename = unquote(encoded)
     assert filename.startswith("差旅费报销单-") and filename.endswith(".xlsx")
     assert not any(character in filename for character in '/\\:*?"<>|')
-
-
-def test_selected_project_is_reread_and_must_be_enabled(client_factory) -> None:
-    client = client_factory(auth_mock_enabled=True)
-    csrf = mock_login(client)["csrfToken"]
-    with client.app.state.database_session_factory() as database:
-        project = Project(project_code="P-OFF", project_name="已停用项目", enabled=False)
-        database.add(project)
-        database.commit()
-        database.refresh(project)
-        project_id = project.id
-    response = client.post(
-        "/api/excel/generate",
-        json={
-            "project": {"mode": "selected", "id": project_id},
-            "trip": trip(),
-            "items": [],
-        },
-        headers={"X-CSRF-Token": csrf},
-    )
-    assert response.status_code == 404
-    assert response.json()["error"]["code"] == "PROJECT_NOT_FOUND"

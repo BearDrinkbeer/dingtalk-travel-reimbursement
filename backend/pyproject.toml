@@ -3,9 +3,9 @@ requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "dingtalk-expense-backend"
+name = "dingtalk-travel-reimbursement-backend"
 version = "0.1.0"
-description = "DingTalk expense Excel generator backend"
+description = "DingTalk travel reimbursement backend"
 requires-python = ">=3.11,<3.14"
 dependencies = [
   "alembic==1.19.1",

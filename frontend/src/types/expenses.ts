@@ -90,9 +90,7 @@ export interface ExpenseTotals {
   subsidy: SubsidyResult | null
 }
 
-export type ExcelProjectInput =
-  | { mode: 'selected'; id: number }
-  | { mode: 'manual'; text: string }
+export type ExcelProjectInput = { mode: 'manual'; text: string }
 
 export interface ExcelExpenseItemInput {
   category: ExpenseCategoryId

@@ -92,8 +92,6 @@ function legacyOcrMatchKey(item: ExpenseItem): string | null {
 }
 
 export const useExpenseStore = defineStore('expense', () => {
-  const manualProject = ref(false)
-  const selectedProjectId = ref<number | null>(null)
   const manualProjectText = ref('')
   const trip = reactive({
     tripType: 'business' as TripType,
@@ -461,13 +459,7 @@ export const useExpenseStore = defineStore('expense', () => {
     ocrUnavailable.value = false
 
     const project = draft.input.project
-    manualProject.value = project?.mode === 'manual'
     manualProjectText.value = project?.mode === 'manual' ? project.text : ''
-    selectedProjectId.value = project?.mode === 'selected'
-      && Number.isSafeInteger(project.id)
-      && project.id > 0
-      ? project.id
-      : null
 
     const persistedTrip = draft.input.editingState?.trip ?? draft.input.trip
     includeSubsidy.value = draft.input.editingState?.includeSubsidy ?? draft.input.trip !== null
@@ -717,17 +709,12 @@ export const useExpenseStore = defineStore('expense', () => {
   })
 
   function projectPayload(): ExcelProjectInput | null {
-    if (manualProject.value) {
-      const text = manualProjectText.value.trim()
-      return text ? { mode: 'manual', text } : null
-    }
-    return selectedProjectId.value && selectedProjectId.value > 0
-      ? { mode: 'selected', id: selectedProjectId.value }
-      : null
+    const text = manualProjectText.value.trim()
+    return text ? { mode: 'manual', text } : null
   }
 
   const excelDisabledReason = computed(() => {
-    if (!projectPayload()) return manualProject.value ? '请填写报销项目/预算代码' : '请选择报销项目'
+    if (!projectPayload()) return '请先关联出差审批以获取预算代码'
     if (items.value.length > maxExpenseItems.value) {
       return `报销单最多填写 ${maxExpenseItems.value} 条票据费用明细`
     }
@@ -1039,8 +1026,6 @@ export const useExpenseStore = defineStore('expense', () => {
 
   function reset(): void {
     abortReceiptOperations()
-    manualProject.value = false
-    selectedProjectId.value = null
     manualProjectText.value = ''
     Object.assign(trip, {
       tripType: 'business' as TripType,
@@ -1065,8 +1050,6 @@ export const useExpenseStore = defineStore('expense', () => {
   }
 
   return {
-    manualProject,
-    selectedProjectId,
     manualProjectText,
     trip,
     items,

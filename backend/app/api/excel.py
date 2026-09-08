@@ -12,8 +12,7 @@ from app.core.errors import ApiError
 from app.database.session import get_db
 from app.domain.expenses import calculate_expense_totals
 from app.domain.subsidy import calculate_subsidy
-from app.models.project import Project
-from app.schemas.excel import ExcelGenerateRequest, ManualProjectInput
+from app.schemas.excel import ExcelGenerateRequest
 from app.services.application_settings import get_expense_settings
 from app.services.excel_generator import (
     XLSX_MEDIA_TYPE,
@@ -27,23 +26,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["excel"])
 
 
-def _resolve_project(database: Session, body: ExcelGenerateRequest) -> ResolvedProject:
-    if isinstance(body.project, ManualProjectInput):
-        return ResolvedProject(
-            display_text=body.project.text,
-            filename_component=body.project.text,
-        )
-    project = database.get(Project, body.project.id)
-    if project is None or not project.enabled:
-        raise ApiError("PROJECT_NOT_FOUND", "项目不存在或已停用", 404)
-    display = (
-        f"{project.project_code} {project.project_name}"
-        if project.project_code
-        else project.project_name
-    )
+def _resolve_project(body: ExcelGenerateRequest) -> ResolvedProject:
     return ResolvedProject(
-        display_text=display,
-        filename_component=project.project_code or project.project_name,
+        display_text=body.project.text,
+        filename_component=body.project.text,
     )
 
 
@@ -63,7 +49,7 @@ def generate_excel(
             422,
         )
     department_name = require_selected_department(current)
-    project = _resolve_project(database, body)
+    project = _resolve_project(body)
     subsidy = None
     if body.trip is not None:
         settings = get_expense_settings(database)

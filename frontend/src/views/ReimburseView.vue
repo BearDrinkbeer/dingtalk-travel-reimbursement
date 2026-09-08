@@ -483,7 +483,7 @@ watch(() => drafts.busy, () => {
   // must keep the existing explicit-retry behavior, not retry every 600 ms.
   if (!saving.value) scheduleAutosave()
 })
-watch(budgetLabel, (label) => { expense.manualProject = true; expense.manualProjectText = label; expense.selectedProjectId = null })
+watch(budgetLabel, (label) => { expense.manualProjectText = label })
 watch(() => [sessionScope(), expense.includeSubsidy, expense.trip, expense.items, drafts.processingFiles, formReadOnly.value], () => {
   if (calculationTimer) clearTimeout(calculationTimer)
   const scope = sessionScope()

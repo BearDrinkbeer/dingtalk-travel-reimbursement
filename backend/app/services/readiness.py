@@ -43,7 +43,6 @@ _REQUIRED_COLUMNS = {
         "created_at",
         "updated_at",
     },
-    "projects": {"id", "project_code", "project_name", "enabled", "created_at", "updated_at"},
     "settings": {"key", "value"},
     "receipt_keyword_mappings": {
         "id",

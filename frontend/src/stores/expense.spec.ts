@@ -210,7 +210,6 @@ describe('expense store', () => {
     store.hydrateFromDraft(draft, files)
     store.hydrateFromDraft(draft, files)
 
-    expect(store.manualProject).toBe(true)
     expect(store.manualProjectText).toBe('测试项目')
     expect(store.includeSubsidy).toBe(true)
     expect(store.trip.startDate).toBe('2026-09-01')
@@ -426,7 +425,6 @@ describe('expense store', () => {
     })
     const store = useExpenseStore()
     store.categories = MANUAL_CATEGORIES
-    store.manualProject = true
     store.manualProjectText = '测试项目'
     store.upsertDraftOcrItem(durableFile('file-calculation'))
 
@@ -758,7 +756,6 @@ describe('expense store', () => {
       startDate: '2026-06-30',
       endDate: '2026-07-07',
     })
-    store.manualProject = true
     store.manualProjectText = '临时项目'
     store.upsertManualItem({
       category: 'local_transport',
@@ -820,7 +817,7 @@ describe('expense store', () => {
     })
     const store = useExpenseStore()
     store.categories = MANUAL_CATEGORIES
-    store.selectedProjectId = 7
+    store.manualProjectText = 'P-007 测试项目'
     store.setSubsidyIncluded(true)
     Object.assign(store.trip, {
       startDate: '2026-06-30',
@@ -840,7 +837,7 @@ describe('expense store', () => {
     await store.refreshCalculations()
     const payload = store.buildExcelPayload()
     expect(payload).toMatchObject({
-      project: { mode: 'selected', id: 7 },
+      project: { mode: 'manual', text: 'P-007 测试项目' },
       trip: { startDate: '2026-06-30', endDate: '2026-07-07' },
       items: [{
         category: 'local_transport',
@@ -866,9 +863,7 @@ describe('expense store', () => {
       uppercaseAmount: '零元整', subsidy: null,
     })
     const store = useExpenseStore()
-    expect(store.excelDisabledReason).toBe('请选择报销项目')
-    store.manualProject = true
-    expect(store.excelDisabledReason).toBe('请填写报销项目/预算代码')
+    expect(store.excelDisabledReason).toBe('请先关联出差审批以获取预算代码')
     store.manualProjectText = '临时项目'
     expect(store.excelDisabledReason).toBe('费用类别尚未正确加载')
     store.categories = MANUAL_CATEGORIES
