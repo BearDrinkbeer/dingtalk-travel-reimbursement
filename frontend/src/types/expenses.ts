@@ -22,10 +22,10 @@ export type SubsidyRateType =
   | 'long_term_project'
   | 'same_city_project'
   | 'internal'
-  | 'overseas'
 
 export interface TripInput {
   tripType: TripType
+  relatedApprovalId?: string
   startDate: string
   startTime: string
   endDate: string
@@ -74,6 +74,8 @@ export function isForeignExpense(item: Pick<ExpenseItem, 'originalCurrency' | 'w
 }
 
 export interface SubsidyResult {
+  /** Stable key used to keep each amount attached to its source approval. */
+  relatedApprovalId?: string
   tripType: SubsidyRateType | 'overseas'
   calendarDays: number
   effectiveDays: string
@@ -88,6 +90,8 @@ export interface ExpenseTotals {
   receiptCount: number
   uppercaseAmount: string
   subsidy: SubsidyResult | null
+  /** Present on current API responses; optional while hydrating pre-v6 saved drafts. */
+  subsidies?: SubsidyResult[]
 }
 
 export type ExcelProjectInput = { mode: 'manual'; text: string }
@@ -104,5 +108,6 @@ export interface ExcelExpenseItemInput {
 export interface ExcelGeneratePayload {
   project: ExcelProjectInput
   trip: TripInput | null
+  trips?: TripInput[]
   items: ExcelExpenseItemInput[]
 }

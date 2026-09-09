@@ -26,7 +26,7 @@ from app.domain.material_classification import (
     PENDING_CLASSIFICATION_STATUSES,
     material_classification,
 )
-from app.domain.subsidy import SubsidyCalculation, calculate_subsidy
+from app.domain.subsidy import SubsidyCalculation
 from app.models.reimbursement import (
     ReimbursementAttachmentKind,
     ReimbursementDraft,
@@ -41,7 +41,6 @@ from app.models.reimbursement import (
 )
 from app.models.session import UserSession
 from app.schemas.reimbursements import ReimbursementDraftInput
-from app.services.application_settings import get_expense_settings
 from app.services.excel_generator import (
     ResolvedProject,
     WorkbookResult,
@@ -90,6 +89,7 @@ from app.services.reimbursement_staging import (
     StagingObjectExists,
     StagingObjectNotFound,
 )
+from app.services.subsidy_calculation import calculate_trip_subsidies, request_trips
 from app.services.temp_files import (
     StoredFile,
     validate_new_file,
@@ -147,6 +147,7 @@ class WorkbookPreviewSnapshot:
     department_name: str
     project: ResolvedProject
     subsidy: SubsidyCalculation | None
+    subsidies: tuple[SubsidyCalculation, ...]
     totals: ExpenseTotals
 
 
@@ -169,9 +170,11 @@ def serialize_draft_file(file: DraftFileSnapshot) -> dict[str, object]:
                 ocr_result.pop(_PIPELINE_INPUT_HASH_KEY, None)
                 details = ocr_result.pop("paymentDetails", None)
                 hotel_details = ocr_result.pop("hotelBillDetails", None)
-                if (file.processing_role == ReimbursementDraftFileRole.ATTACHMENT_ONLY.value
+                if (
+                    file.processing_role == ReimbursementDraftFileRole.ATTACHMENT_ONLY.value
                     and file.attachment_kind == ReimbursementAttachmentKind.HOTEL_BILL.value
-                    and isinstance(hotel_details, dict)):
+                    and isinstance(hotel_details, dict)
+                ):
                     hotel_bill_details = hotel_details
                 if (
                     file.processing_role == ReimbursementDraftFileRole.ATTACHMENT_ONLY.value
@@ -232,10 +235,7 @@ def list_draft_files(
         if referenced_file_ids:
             visible_file_status = or_(
                 visible_file_status,
-                (
-                    ReimbursementDraftFile.file_status
-                    == ReimbursementDraftFileStatus.PURGED.value
-                )
+                (ReimbursementDraftFile.file_status == ReimbursementDraftFileStatus.PURGED.value)
                 & ReimbursementDraftFile.id.in_(referenced_file_ids),
             )
     files = database.scalars(
@@ -872,9 +872,12 @@ async def recognize_draft_file(
         # Stay OCR is advisory even if the model is unavailable or times out.
         # Keep failed expense-shaped candidates out of this attachment's data.
         def failure_payload(_file_id: str, _code: str, _message: str) -> dict[str, object]:
-            return {"hotelBillDetails": {
-                "warnings": ["HOTEL_BILL_INCOMPLETE", "HOTEL_BILL_REVIEW_REQUIRED"]
-            }}
+            return {
+                "hotelBillDetails": {
+                    "warnings": ["HOTEL_BILL_INCOMPLETE", "HOTEL_BILL_REVIEW_REQUIRED"]
+                }
+            }
+
     try:
         worker_path = await _materialize_cancellation_safe(source, settings, staging)
         stored = StoredFile(
@@ -894,9 +897,12 @@ async def recognize_draft_file(
             if is_hotel_bill and not auto_classify:
                 # Explicit purpose is authoritative; OCR is advisory and must
                 # neither replace the purpose nor create an expense result.
-                payload = {"hotelBillDetails": payload.get("hotelBillDetails", {
-                    "warnings": ["HOTEL_BILL_INCOMPLETE", "HOTEL_BILL_REVIEW_REQUIRED"]
-                })}
+                payload = {
+                    "hotelBillDetails": payload.get(
+                        "hotelBillDetails",
+                        {"warnings": ["HOTEL_BILL_INCOMPLETE", "HOTEL_BILL_REVIEW_REQUIRED"]},
+                    )
+                }
         elif is_itinerary:
             payload = await ocr_service.recognize_itinerary_file(
                 stored,
@@ -1001,6 +1007,8 @@ async def generate_draft_excel_preview(
         items=complete_expense_items(snapshot.input),
         subsidy=snapshot.subsidy,
         totals=snapshot.totals,
+        trips=snapshot.input.trips,
+        subsidies=snapshot.subsidies,
     )
 
     # Do not serve a workbook calculated from a draft that changed during the
@@ -1045,6 +1053,7 @@ def _workbook_preview_snapshot(
             department_name=excel_input.department_name,
             project=excel_input.project,
             subsidy=excel_input.subsidy,
+            subsidies=excel_input.subsidies,
             totals=excel_input.totals,
         )
     try:
@@ -1077,20 +1086,12 @@ def _workbook_preview_snapshot(
     project = ResolvedProject(
         display_text=draft_input.project.text, filename_component=draft_input.project.text
     )
-    subsidy = None
-    if draft_input.trip is not None:
-        expense_settings = get_expense_settings(database)
-        subsidy_trip_type = draft_input.trip.subsidy_trip_type()
-        subsidy = calculate_subsidy(
-            trip_type=subsidy_trip_type,
-            period=draft_input.trip.as_period(),
-            configured_daily_rate=expense_settings.daily_rate_for(subsidy_trip_type),
-            policy_confirmed=draft_input.trip.policy_confirmed,
-            confirmed_effective_days=draft_input.trip.confirmed_effective_days,
-            no_subsidy_exception=draft_input.trip.no_subsidy_exception,
-            manual_subsidy_amount=draft_input.trip.manual_subsidy_amount,
-        )
-    totals = calculate_expense_totals(complete_expense_items(draft_input), subsidy)
+    subsidies = calculate_trip_subsidies(
+        database,
+        request_trips(trip=draft_input.trip, trips=draft_input.trips),
+    )
+    subsidy = subsidies[0] if draft_input.trip is not None and len(subsidies) == 1 else None
+    totals = calculate_expense_totals(complete_expense_items(draft_input), subsidies)
     return WorkbookPreviewSnapshot(
         canonical_input_json=draft.input_json,
         input=draft_input,
@@ -1098,6 +1099,7 @@ def _workbook_preview_snapshot(
         department_name=draft.department_name,
         project=project,
         subsidy=subsidy,
+        subsidies=tuple(subsidies),
         totals=totals,
     )
 

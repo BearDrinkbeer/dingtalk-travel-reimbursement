@@ -219,9 +219,7 @@ def test_create_submission_locks_draft_and_copies_original_manifest(database: Se
     persisted_draft = database.get(ReimbursementDraft, draft.id)
     submission = database.get(ReimbursementSubmission, result.submission_id)
     upload = database.scalar(
-        select(ReimbursementUpload).where(
-            ReimbursementUpload.submission_id == result.submission_id
-        )
+        select(ReimbursementUpload).where(ReimbursementUpload.submission_id == result.submission_id)
     )
     assert persisted_draft.status == ReimbursementDraftStatus.LOCKED.value
     assert persisted_draft.revision == 5
@@ -491,9 +489,7 @@ def test_put_done_can_restart_with_a_fresh_process_local_ticket(database: Sessio
     draft, _ = _new_ready_draft(database)
     result, lease = _claim_to_uploading(database, draft, now=now)
     upload = database.scalar(
-        select(ReimbursementUpload).where(
-            ReimbursementUpload.submission_id == result.submission_id
-        )
+        select(ReimbursementUpload).where(ReimbursementUpload.submission_id == result.submission_id)
     )
     putting = begin_upload_put(
         database,
@@ -550,9 +546,7 @@ def test_definitive_commit_rejection_resets_only_that_checkpoint(database: Sessi
     draft, _ = _new_ready_draft(database)
     result, lease = _claim_to_uploading(database, draft, now=now)
     upload = database.scalar(
-        select(ReimbursementUpload).where(
-            ReimbursementUpload.submission_id == result.submission_id
-        )
+        select(ReimbursementUpload).where(ReimbursementUpload.submission_id == result.submission_id)
     )
     upload.upload_status = ReimbursementUploadStatus.PUT_DONE.value
     upload.put_started_at = now - timedelta(seconds=5)
@@ -663,9 +657,7 @@ def test_expired_commit_checkpoint_stops_in_manual_review(database: Session) -> 
     draft, _ = _new_ready_draft(database)
     result, lease = _claim_to_uploading(database, draft, now=now)
     upload = database.scalar(
-        select(ReimbursementUpload).where(
-            ReimbursementUpload.submission_id == result.submission_id
-        )
+        select(ReimbursementUpload).where(ReimbursementUpload.submission_id == result.submission_id)
     )
     upload.upload_status = ReimbursementUploadStatus.PUT_DONE.value
     database.commit()
@@ -702,9 +694,7 @@ def test_explicit_commit_uncertainty_atomically_stops_parent(database: Session) 
     draft, _ = _new_ready_draft(database)
     result, lease = _claim_to_uploading(database, draft, now=now)
     upload = database.scalar(
-        select(ReimbursementUpload).where(
-            ReimbursementUpload.submission_id == result.submission_id
-        )
+        select(ReimbursementUpload).where(ReimbursementUpload.submission_id == result.submission_id)
     )
     upload.upload_status = ReimbursementUploadStatus.PUT_DONE.value
     database.commit()
@@ -831,9 +821,7 @@ def test_linked_local_release_purges_shared_original_accounting_atomically(
     submission.oa_request_hash = hashlib.sha256(b"{}").hexdigest()
     submission.process_instance_id = "instance-1"
     upload = database.scalar(
-        select(ReimbursementUpload).where(
-            ReimbursementUpload.submission_id == submission.id
-        )
+        select(ReimbursementUpload).where(ReimbursementUpload.submission_id == submission.id)
     )
     upload.upload_status = ReimbursementUploadStatus.LINKED.value
     upload.space_id = "space-1"
@@ -895,19 +883,20 @@ def test_failed_final_local_file_is_retained_until_expiry_then_discarded_atomica
     result = _create(database, draft, now=expires_at - timedelta(minutes=1))
     submission = database.get(ReimbursementSubmission, result.submission_id)
     upload = database.scalar(
-        select(ReimbursementUpload).where(
-            ReimbursementUpload.submission_id == submission.id
-        )
+        select(ReimbursementUpload).where(ReimbursementUpload.submission_id == submission.id)
     )
     submission.status = ReimbursementSubmissionStatus.FAILED_FINAL.value
     submission.next_attempt_at = None
     draft.expires_at = expires_at
     database.commit()
 
-    assert list_due_linked_local_release_candidates(
-        database,
-        now=expires_at - timedelta(microseconds=1),
-    ) == ()
+    assert (
+        list_due_linked_local_release_candidates(
+            database,
+            now=expires_at - timedelta(microseconds=1),
+        )
+        == ()
+    )
     candidates = list_due_linked_local_release_candidates(database, now=expires_at)
 
     assert [candidate.upload_id for candidate in candidates] == [upload.id]
@@ -951,9 +940,7 @@ def test_failed_final_cleanup_includes_safe_put_states_and_generated_excel(
     result = _create(database, draft, now=expires_at - timedelta(minutes=1))
     submission = database.get(ReimbursementSubmission, result.submission_id)
     original = database.scalar(
-        select(ReimbursementUpload).where(
-            ReimbursementUpload.submission_id == submission.id
-        )
+        select(ReimbursementUpload).where(ReimbursementUpload.submission_id == submission.id)
     )
     generated = _add_generated_upload(database, submission)
     original.upload_status = ReimbursementUploadStatus.PUTTING.value
@@ -1013,9 +1000,7 @@ def test_failed_final_cleanup_excludes_any_state_that_might_have_remote_effects(
     result = _create(database, draft, now=now - timedelta(minutes=1))
     submission = database.get(ReimbursementSubmission, result.submission_id)
     upload = database.scalar(
-        select(ReimbursementUpload).where(
-            ReimbursementUpload.submission_id == submission.id
-        )
+        select(ReimbursementUpload).where(ReimbursementUpload.submission_id == submission.id)
     )
     submission.status = ReimbursementSubmissionStatus.FAILED_FINAL.value
     submission.next_attempt_at = None
@@ -1060,9 +1045,7 @@ def test_failed_final_cleanup_rejects_a_stale_candidate_without_purging_source(
     result = _create(database, draft, now=now - timedelta(minutes=1))
     submission = database.get(ReimbursementSubmission, result.submission_id)
     upload = database.scalar(
-        select(ReimbursementUpload).where(
-            ReimbursementUpload.submission_id == submission.id
-        )
+        select(ReimbursementUpload).where(ReimbursementUpload.submission_id == submission.id)
     )
     submission.status = ReimbursementSubmissionStatus.FAILED_FINAL.value
     submission.next_attempt_at = None
@@ -1111,9 +1094,7 @@ async def test_failed_final_maintenance_retries_after_restart_and_is_idempotent(
     result = _create(database, draft, now=now - timedelta(minutes=1))
     submission = database.get(ReimbursementSubmission, result.submission_id)
     upload = database.scalar(
-        select(ReimbursementUpload).where(
-            ReimbursementUpload.submission_id == submission.id
-        )
+        select(ReimbursementUpload).where(ReimbursementUpload.submission_id == submission.id)
     )
     submission.status = ReimbursementSubmissionStatus.FAILED_FINAL.value
     submission.next_attempt_at = None

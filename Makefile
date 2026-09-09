@@ -1,4 +1,12 @@
-.PHONY: backend-install backend-test backend-lint backend-format frontend-install frontend-test frontend-typecheck frontend-lint frontend-build compose-config compose-config-development nginx-policy-check ocr-models-check ocr-runtime-check verify deploy-check dev dev-backend dev-frontend dev-dingtalk dev-dingtalk-backend dev-dingtalk-frontend deploy up logs down
+.PHONY: \
+	backend-install backend-test backend-lint backend-format \
+	frontend-install frontend-test frontend-typecheck frontend-lint frontend-build \
+	compose-config compose-config-development nginx-policy-check \
+	ocr-models-check ocr-runtime-check verify deploy-check clean \
+	dev dev-backend dev-frontend \
+	dev-dingtalk dev-dingtalk-backend dev-dingtalk-frontend \
+	dev-dingtalk-prod dev-dingtalk-prod-backend dev-dingtalk-prod-frontend \
+	deploy up logs down
 
 backend-install:
 	cd backend && uv sync --frozen --extra dev --extra ocr
@@ -10,7 +18,7 @@ backend-lint:
 	cd backend && uv run --frozen --extra dev ruff check app tests migrations
 
 backend-format:
-	cd backend && uv run --frozen --extra dev ruff format app tests
+	cd backend && uv run --frozen --extra dev ruff format app tests migrations
 
 frontend-install:
 	cd frontend && npm ci --ignore-scripts --no-audit --no-fund
@@ -51,6 +59,13 @@ verify: backend-test backend-lint frontend-test frontend-typecheck frontend-lint
 
 deploy-check: compose-config nginx-policy-check ocr-models-check
 
+# Remove only reproducible development artifacts. Runtime databases, uploaded
+# files, OCR models, virtual environments, and installed Node dependencies are
+# intentionally preserved.
+clean:
+	rm -rf .ruff_cache backend/.pytest_cache backend/.ruff_cache frontend/dist node_modules
+	find backend/app backend/migrations backend/tests scripts -type d -name __pycache__ -prune -exec rm -rf {} +
+
 dev:
 	$(MAKE) -j2 dev-backend dev-frontend
 
@@ -69,7 +84,6 @@ dev-dingtalk-frontend:
 dev-dingtalk:
 	$(MAKE) -j2 dev-dingtalk-backend dev-dingtalk-frontend
 
-.PHONY: dev-dingtalk-prod dev-dingtalk-prod-backend dev-dingtalk-prod-frontend
 dev-dingtalk-prod:
 	$(MAKE) -j2 dev-dingtalk-prod-backend dev-dingtalk-prod-frontend
 

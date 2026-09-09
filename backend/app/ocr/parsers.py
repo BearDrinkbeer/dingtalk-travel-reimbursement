@@ -13,6 +13,7 @@ from app.ocr.extractors import (
     extract_passenger_occurrence_date,
     extract_passenger_transport_type,
     extract_route,
+    extract_train_route,
     extract_train_travel_date,
     uses_invoice_date_as_occurrence,
 )
@@ -121,7 +122,7 @@ class TrainTicketParser:
     def parse(self, lines: list[OcrLine], context: ParseContext) -> ParsedExpense:
         parsed_date = extract_train_travel_date(lines, context.reference_year)
         amount = extract_amount(lines, ("票价", "金额", "价税合计"))
-        route = extract_route(lines)
+        route = extract_train_route(lines)
         warnings = _warnings(lines, amount=amount, parsed_date=parsed_date)
         if uses_invoice_date_as_occurrence(
             lines,

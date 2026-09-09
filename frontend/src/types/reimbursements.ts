@@ -34,7 +34,7 @@ export interface ReimbursementDraftExpenseItemInput extends Omit<ExcelExpenseIte
 
 export interface ReimbursementDraftInput extends Omit<ExcelGeneratePayload, 'items' | 'project'> {
   project?: ExcelProjectInput | null
-  editingState?: { includeSubsidy: boolean; trip: TripInput }
+  editingState?: { includeSubsidy: boolean; trip: TripInput; trips?: TripInput[] }
   ocrDispositionVersion: 0 | 1
   companyValue: string
   accountingSourceVerified?: boolean
@@ -108,11 +108,13 @@ export interface ReimbursementDraftList {
 
 export interface OaReimbursementTravelProfile {
   travelTypeMappings?: Record<string, OaFormOption>
+  subsidyTripTypeMappings?: Record<string, TripInput['tripType'] | null>
   profileKey: string
   displayName: string
   processCode: string
   schemaFingerprint: string
   travelTypeOption: OaFormOption
+  subsidyTripType?: TripInput['tripType'] | null
 }
 
 export interface OaReimbursementOptions {
@@ -134,6 +136,8 @@ export interface OaTravelApproval {
   profileDisplayName: string
   sourceProcessCode: string
   travelTypeOption: OaFormOption
+  subsidyTripType?: TripInput['tripType'] | null
+  sourceTravelTypeValue?: string | null
   companyOption?: OaFormOption | null
   budgetCodeOption?: OaFormOption | null
   unavailableReason?: string | null

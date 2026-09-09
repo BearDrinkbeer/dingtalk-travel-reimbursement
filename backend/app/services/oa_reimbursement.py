@@ -601,6 +601,8 @@ class SnapshotSubmissionMaterializer:
             items=workbook_input.items,
             subsidy=workbook_input.subsidy,
             totals=workbook_input.totals,
+            trips=workbook_input.trips,
+            subsidies=workbook_input.subsidies,
         )
         if result.filename != snapshot.excel.file_name:
             raise ApiError(

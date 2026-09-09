@@ -84,7 +84,7 @@ def test_native_range_command_emits_one_field_and_roundtrips():
     assert not _form_value_matches(ranges[0], replace(actual, value='["2026-09-01","2026-09-04"]'))
     with pytest.raises((ApiError, ValueError)):
         parse_snapshot(
-            serialize_snapshot(snapshot).replace('"snapshotVersion":5', '"snapshotVersion":4')
+            serialize_snapshot(snapshot).replace('"snapshotVersion":6', '"snapshotVersion":4')
         )
 
 

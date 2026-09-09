@@ -275,15 +275,15 @@ def test_mock_auth_is_explicit_and_cannot_accept_identity_or_admin_override(clie
         assert record.dingtalk_union_id == "mock-union-id:fixed-user"
 
 
-def test_production_rejects_mock_placeholders_and_insecure_cookie(settings_factory) -> None:
+def test_production_rejects_mock_and_placeholders_but_allows_http(settings_factory) -> None:
     with pytest.raises(ValidationError, match="AUTH_MOCK_ENABLED"):
         settings_factory(app_env="production", auth_mock_enabled=True)
-    with pytest.raises(ValidationError, match="SESSION_COOKIE_SECURE"):
-        settings_factory(app_env="production", session_cookie_secure=False)
+    settings = settings_factory(app_env="production", session_cookie_secure=False)
+    assert settings.session_cookie_secure is False
     with pytest.raises(ValidationError, match="DINGTALK_CLIENT_SECRET"):
         settings_factory(
             app_env="production",
-            session_cookie_secure=True,
+            session_cookie_secure=False,
             dingtalk_client_secret="placeholder",
         )
 
@@ -500,7 +500,7 @@ def test_admin_access_is_rederived_from_current_configuration(client_factory) ->
         assert record is not None and record.is_admin is True
 
 
-def test_production_cookie_is_secure(client_factory) -> None:
+def test_https_configuration_sets_secure_cookie(client_factory) -> None:
     transport, _calls = success_transport()
     client = client_factory(
         transport=transport,
@@ -511,6 +511,19 @@ def test_production_cookie_is_secure(client_factory) -> None:
     response = client.post("/api/auth/dingtalk", json={"authCode": "one-time-code"})
     assert response.status_code == 200
     assert "Secure" in response.headers["set-cookie"]
+
+
+def test_production_http_configuration_omits_secure_cookie(client_factory) -> None:
+    transport, _calls = success_transport()
+    client = client_factory(
+        transport=transport,
+        app_env="production",
+        session_cookie_secure=False,
+        session_secret="production-session-secret-at-least-32-characters",
+    )
+    response = client.post("/api/auth/dingtalk", json={"authCode": "one-time-code"})
+    assert response.status_code == 200
+    assert "Secure" not in response.headers["set-cookie"]
 
 
 def test_login_rejects_identity_spoof_fields(client_factory) -> None:

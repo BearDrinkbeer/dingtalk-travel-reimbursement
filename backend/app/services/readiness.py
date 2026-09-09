@@ -22,7 +22,7 @@ class ReadinessReport:
     checks: dict[str, str]
 
 
-_EXPECTED_ALEMBIC_REVISION = "20260907_0016"
+_EXPECTED_ALEMBIC_REVISION = "20260909_0017"
 _REQUIRED_COLUMNS = {
     "oa_template_profiles": {
         "profile_key",
@@ -35,7 +35,6 @@ _REQUIRED_COLUMNS = {
         "config_version",
         "allowed_travel_process_codes_json",
         "travel_profiles_json",
-        "related_approval_smoke_test_confirmed",
         "compatibility_status",
         "confirmed_by_user_id",
         "last_checked_at",

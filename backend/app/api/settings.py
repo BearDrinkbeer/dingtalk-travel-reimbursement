@@ -36,7 +36,6 @@ class SubsidyRatesWrite(BaseModel):
     long_term_project: DecimalString = Field(gt=0, le=MAX_DAILY_SUBSIDY)
     same_city_project: DecimalString = Field(gt=0, le=MAX_DAILY_SUBSIDY)
     internal: DecimalString = Field(gt=0, le=MAX_DAILY_SUBSIDY)
-    overseas: DecimalString = Field(ge=0, le=MAX_DAILY_SUBSIDY)
 
     @field_validator(
         "business",
@@ -44,7 +43,6 @@ class SubsidyRatesWrite(BaseModel):
         "long_term_project",
         "same_city_project",
         "internal",
-        "overseas",
     )
     @classmethod
     def validate_money_scale(cls, value: Decimal) -> Decimal:
@@ -59,7 +57,6 @@ class SubsidyRatesWrite(BaseModel):
             TripType.LONG_TERM_PROJECT: self.long_term_project,
             TripType.SAME_CITY_PROJECT: self.same_city_project,
             TripType.INTERNAL: self.internal,
-            TripType.OVERSEAS: self.overseas,
         }
 
 
@@ -83,15 +80,9 @@ class SettingsWrite(BaseModel):
     @classmethod
     def normalize_admin_ids(cls, values: list[str]) -> list[str]:
         normalized = [value.strip() for value in values]
-        if (
-            len(set(normalized)) != len(normalized)
-            or any(
-                not value
-                or len(value) > 128
-                or "," in value
-                or any(ord(char) < 33 for char in value)
-                for value in normalized
-            )
+        if len(set(normalized)) != len(normalized) or any(
+            not value or len(value) > 128 or "," in value or any(ord(char) < 33 for char in value)
+            for value in normalized
         ):
             raise ValueError("invalid administrator userId")
         return normalized

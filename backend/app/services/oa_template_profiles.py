@@ -215,18 +215,6 @@ async def inspect_template_catalog(
             )
         )
     )
-    reusable_relationship_confirmation = bool(
-        same_catalog
-        and compatible
-        and profile is not None
-        and _relationship_confirmation_matches_inspection(
-            profile,
-            reimbursement_schema=reimbursement_schema,
-            requested_profiles=normalized_profiles,
-            travel_schemas=travel_schemas,
-            stored_profiles=configured_travel_profiles,
-        )
-    )
     status = (
         UNCONFIGURED
         if profile is None
@@ -315,7 +303,6 @@ async def inspect_template_catalog(
             ),
         },
         "travelProfiles": travel_data,
-        "relatedApprovalSmokeTestConfirmed": reusable_relationship_confirmation,
     }
 
 
@@ -328,7 +315,6 @@ async def confirm_template_catalog(
     reimbursement_schema_fingerprint: str,
     reimbursement_mappings: dict[str, str],
     travel_profiles: list[TravelProfileConfirmation],
-    related_approval_smoke_test_confirmed: bool,
     administrator_user_id: str,
 ) -> dict[str, object]:
     if not _FINGERPRINT_PATTERN.fullmatch(reimbursement_schema_fingerprint):
@@ -400,7 +386,6 @@ async def confirm_template_catalog(
         normalized_reimbursement_mapping,
         reimbursement_process_code=reimbursement_process_code,
         allowed_travel_process_codes=list(allowed_process_codes),
-        smoke_test_confirmed=related_approval_smoke_test_confirmed,
     )
 
     now = utc_now()
@@ -413,7 +398,6 @@ async def confirm_template_catalog(
         "mapping_json": _serialize_mapping(normalized_reimbursement_mapping),
         "allowed_travel_process_codes_json": _serialize_process_codes(allowed_process_codes),
         "travel_profiles_json": _serialize_travel_profiles(contracts),
-        "related_approval_smoke_test_confirmed": related_approval_smoke_test_confirmed,
         "compatibility_status": COMPATIBLE,
         "confirmed_by_user_id": administrator_user_id,
         "last_checked_at": now,
@@ -745,10 +729,7 @@ def validate_related_approval_configuration(
     *,
     reimbursement_process_code: str,
     allowed_travel_process_codes: list[str],
-    smoke_test_confirmed: bool,
 ) -> tuple[str, ...]:
-    # Historical smoke-test evidence is informational, not a prerequisite for
-    # configuring the first real submission. Keep validating the actual policy.
     if not allowed_travel_process_codes:
         raise _relationship_error("至少配置一个允许关联的出差审批模板")
 
@@ -775,63 +756,6 @@ def validate_related_approval_configuration(
         if outside_policy:
             raise _relationship_error("出差审批模板不在关联控件声明的允许范围内")
     return tuple(normalized)
-
-
-def _relationship_confirmation_matches_inspection(
-    profile: OaTemplateProfile,
-    *,
-    reimbursement_schema: FormSchema,
-    requested_profiles: list[TravelProfileInspection],
-    travel_schemas: list[FormSchema],
-    stored_profiles: list[dict[str, object]],
-) -> bool:
-    if not profile.related_approval_smoke_test_confirmed:
-        return False
-    try:
-        reimbursement_mapping = validate_template_mapping(
-            reimbursement_schema,
-            _deserialize_mapping(profile.mapping_json),
-        )
-        allowed_process_codes: list[str] = []
-        for requested, schema, stored in zip(
-            requested_profiles,
-            travel_schemas,
-            stored_profiles,
-            strict=True,
-        ):
-            if (
-                not _profile_keys_valid(stored)
-                or stored.get("profileKey") != requested.profile_key
-                or stored.get("processCode") != requested.process_code
-            ):
-                return False
-            validate_travel_template_mapping(
-                schema,
-                _mapping_from_value(stored.get("mappings")),
-            )
-            validate_exact_travel_type_option(
-                reimbursement_schema,
-                reimbursement_mapping,
-                _option_from_value(stored.get("travelTypeOption")),
-            )
-            validate_travel_type_mappings(
-                schema,
-                _mapping_from_value(stored.get("mappings")),
-                _stored_type_mappings(stored),
-                reimbursement_schema,
-                reimbursement_mapping,
-            )
-            allowed_process_codes.append(requested.process_code)
-        validate_related_approval_configuration(
-            reimbursement_schema,
-            reimbursement_mapping,
-            reimbursement_process_code=profile.process_code,
-            allowed_travel_process_codes=allowed_process_codes,
-            smoke_test_confirmed=True,
-        )
-    except (ApiError, KeyError, TypeError, ValueError):
-        return False
-    return True
 
 
 def template_catalog_data(profile: OaTemplateProfile) -> dict[str, object]:
@@ -868,7 +792,6 @@ def template_catalog_data(profile: OaTemplateProfile) -> dict[str, object]:
         },
         "travelProfiles": [_travel_profile_api_data(item) for item in travel_profiles],
         "allowedTravelProcessCodes": allowed_codes,
-        "relatedApprovalSmokeTestConfirmed": profile.related_approval_smoke_test_confirmed,
         "lastCheckedAt": _timestamp(profile.last_checked_at),
         "confirmedAt": _timestamp(profile.confirmed_at),
         "updatedAt": _timestamp(profile.updated_at),
@@ -1289,7 +1212,6 @@ def _validated_persisted_catalog(profile: OaTemplateProfile) -> OaTemplateCatalo
         reimbursement_mapping,
         reimbursement_process_code=profile.process_code,
         allowed_travel_process_codes=list(derived_codes),
-        smoke_test_confirmed=profile.related_approval_smoke_test_confirmed,
     )
     return OaTemplateCatalogContract(
         config_version=profile.config_version,

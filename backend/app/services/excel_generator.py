@@ -147,6 +147,8 @@ def _ordered_lines(
     items: list[ExcelExpenseItemInput],
     trip: TripInput | None,
     subsidy: SubsidyCalculation | None,
+    trips: list[TripInput] | tuple[TripInput, ...] = (),
+    subsidies: list[SubsidyCalculation] | tuple[SubsidyCalculation, ...] = (),
 ) -> list[OutputLine]:
     indexed_lines = [
         (
@@ -163,17 +165,25 @@ def _ordered_lines(
         )
         for index, item in enumerate(items)
     ]
-    if trip is not None and subsidy is not None:
+    if trips and subsidies:
+        subsidy_pairs = list(zip(trips, subsidies, strict=True))
+    elif trip is not None and subsidy is not None:
+        subsidy_pairs = [(trip, subsidy)]
+    else:
+        # An overseas approval is a valid reimbursement relation but creates
+        # no subsidy line.
+        subsidy_pairs = []
+    for index, (subsidy_trip, subsidy_item) in enumerate(subsidy_pairs):
         indexed_lines.append(
             (
-                trip.end_date,
-                len(items),
+                subsidy_trip.end_date,
+                len(items) + index,
                 OutputLine(
                     category=ExpenseCategory.SUBSIDY,
-                    sort_date=trip.end_date,
-                    display_date=_compact_date(trip.end_date),
-                    description=_subsidy_description(trip, subsidy),
-                    amount=subsidy.total,
+                    sort_date=subsidy_trip.end_date,
+                    display_date=_compact_date(subsidy_trip.end_date),
+                    description=_subsidy_description(subsidy_trip, subsidy_item),
+                    amount=subsidy_item.total,
                     receipt_count=0,
                     subsidy=True,
                 ),
@@ -254,9 +264,7 @@ def _prepare_output_layout(
             )
 
     validation = worksheet.data_validations.dataValidation[0]
-    validation.sqref = (
-        f"B{EXCEL_TEMPLATE.detail_start_row}:B{layout.detail_end_row}"
-    )
+    validation.sqref = f"B{EXCEL_TEMPLATE.detail_start_row}:B{layout.detail_end_row}"
     apply_output_page_setup(worksheet, layout)
     return layout
 
@@ -271,6 +279,8 @@ def generate_expense_workbook(
     items: list[ExcelExpenseItemInput],
     subsidy: SubsidyCalculation | None,
     totals: ExpenseTotals,
+    trips: list[TripInput] | tuple[TripInput, ...] = (),
+    subsidies: list[SubsidyCalculation] | tuple[SubsidyCalculation, ...] = (),
 ) -> WorkbookResult:
     workbook, worksheet = load_validated_template(template_path)
     try:
@@ -302,7 +312,7 @@ def generate_expense_workbook(
             409.5, max(worksheet.row_dimensions[project_cell.row].height or 35, header_height)
         )
 
-        lines = _ordered_lines(items, trip, subsidy)
+        lines = _ordered_lines(items, trip, subsidy, trips, subsidies)
         layout = _prepare_output_layout(worksheet, len(lines))
         for offset, line in enumerate(lines):
             row = EXCEL_TEMPLATE.detail_start_row + offset

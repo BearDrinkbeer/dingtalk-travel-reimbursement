@@ -208,6 +208,7 @@ def test_session_load_opportunistically_purges_expired_sessions(
     with client.app.state.database_session_factory() as database:
         assert database.get(UserSession, "expired-after-startup") is None
 
+
 def test_alembic_0003_preserves_legacy_rate_for_old_automatic_types(
     tmp_path: Path,
     monkeypatch,
@@ -247,7 +248,7 @@ def test_alembic_0003_preserves_legacy_rate_for_old_automatic_types(
                 row[1]
                 for row in connection.execute("PRAGMA table_info(oa_template_profiles)").fetchall()
             }
-        assert revision == ("20260907_0016",)
+        assert revision == ("20260909_0017",)
         assert keyword_count == (23,)
         assert keyword_columns == {
             "id",
@@ -266,7 +267,6 @@ def test_alembic_0003_preserves_legacy_rate_for_old_automatic_types(
             "config_version",
             "allowed_travel_process_codes_json",
             "travel_profiles_json",
-            "related_approval_smoke_test_confirmed",
             "compatibility_status",
             "confirmed_by_user_id",
             "last_checked_at",
@@ -340,7 +340,7 @@ def test_alembic_0008_adds_nullable_union_id_without_fabricating_legacy_identity
                 ("legacy-session",),
             ).fetchone()
 
-        assert revision == ("20260907_0016",)
+        assert revision == ("20260909_0017",)
         assert "dingtalk_union_id" in session_columns
         assert union_id == (None,)
     finally:

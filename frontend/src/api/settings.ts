@@ -44,9 +44,9 @@ export async function updateExpenseSettings(
 ): Promise<AdminExpenseSettings> {
   const normalizedRates = Object.fromEntries(
     Object.entries(input.subsidyRates).map(([tripType, value]) => {
-      const normalized = normalizeSubsidyRate(value, tripType === 'overseas')
+      const normalized = normalizeSubsidyRate(value)
       if (normalized === null) {
-        throw new Error('境外出差的每日补助可以为 0，其他类型必须大于 0；均不能超过 10000 元')
+        throw new Error('每日补助必须大于 0 且不能超过 10000 元，最多两位小数')
       }
       return [tripType, normalized]
     }),

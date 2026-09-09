@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, Integer, String, Text
+from sqlalchemy import CheckConstraint, DateTime, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import Base
@@ -38,11 +38,6 @@ class OaTemplateProfile(Base):
         Text,
         default="[]",
         server_default="[]",
-    )
-    related_approval_smoke_test_confirmed: Mapped[bool] = mapped_column(
-        Boolean,
-        default=False,
-        server_default="0",
     )
     compatibility_status: Mapped[str] = mapped_column(String(32))
     confirmed_by_user_id: Mapped[str] = mapped_column(String(128))

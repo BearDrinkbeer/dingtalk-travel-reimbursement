@@ -72,7 +72,6 @@ describe('OA template catalog API', () => {
         mappings: { startDate: 'start-id', endDate: 'end-id' },
         travelTypeOption: { value: 'business', label: '商务出差', key: null },
       }],
-      relatedApprovalSmokeTestConfirmed: true,
     }
     vi.mocked(http.put).mockResolvedValue({ data: { data: { configVersion: 4 } } })
 

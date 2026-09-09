@@ -553,16 +553,16 @@ class ReimbursementQuotaCoordinator:
             if draft is None:
                 raise _draft_not_found_error()
             _require_draft_department(draft, actor)
-            if (
-                draft.status == ReimbursementDraftStatus.LOCKED.value
-                or draft.locked_at is not None
-            ):
+            if draft.status == ReimbursementDraftStatus.LOCKED.value or draft.locked_at is not None:
                 raise _draft_locked_error()
-            if database.scalar(
-                select(ReimbursementSubmission.id)
-                .where(ReimbursementSubmission.draft_id == draft.id)
-                .limit(1)
-            ) is not None:
+            if (
+                database.scalar(
+                    select(ReimbursementSubmission.id)
+                    .where(ReimbursementSubmission.draft_id == draft.id)
+                    .limit(1)
+                )
+                is not None
+            ):
                 raise _draft_in_use_error()
 
             if draft.status == ReimbursementDraftStatus.EXPIRED.value:
@@ -587,8 +587,7 @@ class ReimbursementQuotaCoordinator:
             files = database.scalars(
                 select(ReimbursementDraftFile).where(
                     ReimbursementDraftFile.draft_id == draft.id,
-                    ReimbursementDraftFile.file_status
-                    != ReimbursementDraftFileStatus.PURGED.value,
+                    ReimbursementDraftFile.file_status != ReimbursementDraftFileStatus.PURGED.value,
                 )
             ).all()
             for record in files:
@@ -631,11 +630,14 @@ class ReimbursementQuotaCoordinator:
                 # A concurrent retry may already have completed after this call
                 # authenticated the same durable delete intent.
                 return normalized_draft_id
-            if database.scalar(
-                select(ReimbursementSubmission.id)
-                .where(ReimbursementSubmission.draft_id == draft.id)
-                .limit(1)
-            ) is not None:
+            if (
+                database.scalar(
+                    select(ReimbursementSubmission.id)
+                    .where(ReimbursementSubmission.draft_id == draft.id)
+                    .limit(1)
+                )
+                is not None
+            ):
                 raise _draft_in_use_error()
             database.delete(draft)
         return normalized_draft_id
@@ -686,10 +688,7 @@ class ReimbursementQuotaCoordinator:
                         ReimbursementDraft.locked_at.is_(None),
                         (
                             (ReimbursementDraft.expires_at <= cutoff)
-                            | (
-                                ReimbursementDraft.status
-                                == ReimbursementDraftStatus.EXPIRED.value
-                            )
+                            | (ReimbursementDraft.status == ReimbursementDraftStatus.EXPIRED.value)
                         ),
                         ~select(ReimbursementSubmission.id)
                         .where(ReimbursementSubmission.draft_id == ReimbursementDraft.id)
@@ -1056,9 +1055,7 @@ def _delete_draft_file_cleanup(
         ReimbursementDraftFileStatus.WRITING.value,
     }:
         if item.part_storage_key is None:
-            raise ReimbursementReservationConflict(
-                "draft reservation attempt is incomplete"
-            )
+            raise ReimbursementReservationConflict("draft reservation attempt is incomplete")
         staging.discard_reservation(
             StagingReservation(
                 storage_key=item.storage_key,

@@ -179,6 +179,12 @@ function isCancellation(error: unknown): boolean {
     || (error instanceof DOMException && error.name === 'AbortError')
 }
 
+function isDefiniteClientRejection(error: unknown): boolean {
+  if (!axios.isAxiosError(error)) return false
+  const status = error.response?.status
+  return status !== undefined && status >= 400 && status < 500
+}
+
 function isTerminal(status: ReimbursementSubmissionStatus): boolean {
   return TERMINAL_STATUSES.has(status)
 }
@@ -225,6 +231,7 @@ export const useReimbursementSubmissionStore = defineStore(
     const submitting = ref(false)
     const polling = ref(false)
     const requestError = ref('')
+    const requestAction = ref<'retry' | 'discover' | null>(null)
     const oaSubmissionEnabled = ref<boolean | null>(null)
 
     let generation = 0
@@ -277,6 +284,7 @@ export const useReimbursementSubmissionStore = defineStore(
         idempotencyKey.value = null
         submission.value = null
         requestError.value = ''
+        requestAction.value = null
       }
       return generation
     }
@@ -345,6 +353,7 @@ export const useReimbursementSubmissionStore = defineStore(
       submission.value = value
       idempotencyKey.value = record.idempotencyKey
       requestError.value = ''
+      requestAction.value = null
       saveRecord(
         record.draftId,
         record.expectedRevision,
@@ -363,6 +372,7 @@ export const useReimbursementSubmissionStore = defineStore(
       activeController = controller
       submitting.value = true
       requestError.value = ''
+      requestAction.value = null
       try {
         const value = await submitOaReimbursement(
           record.draftId,
@@ -375,12 +385,16 @@ export const useReimbursementSubmissionStore = defineStore(
       } catch (error) {
         if (accepts(requestGeneration, record.draftId) && !isCancellation(error)) {
           requestError.value = apiErrorMessage(error, '报销提交失败，请重试')
-          if (apiErrorCode(error) === 'OA_SUBMISSION_DISABLED') {
-            // This explicit rejection guarantees no task or draft lock was created.
-            oaSubmissionEnabled.value = false
+          const disabled = apiErrorCode(error) === 'OA_SUBMISSION_DISABLED'
+          if (disabled || isDefiniteClientRejection(error)) {
+            // A definite server rejection guarantees no task or draft lock was created.
+            requestAction.value = null
+            if (disabled) oaSubmissionEnabled.value = false
             memoryRecords.delete(record.draftId)
             removePersistedSubmission(record.draftId)
             idempotencyKey.value = null
+          } else {
+            requestAction.value = 'retry'
           }
         }
         throw error
@@ -533,6 +547,7 @@ export const useReimbursementSubmissionStore = defineStore(
         ).then((value) => {
           if (record !== null && value === null && accepts(requestGeneration, draftId)) {
             requestError.value = '尚未找到本次提交记录，服务恢复后可重试本次提交'
+            requestAction.value = 'retry'
           }
           return value
         }).finally(() => {
@@ -569,6 +584,7 @@ export const useReimbursementSubmissionStore = defineStore(
       activeController = controller
       polling.value = true
       requestError.value = ''
+      requestAction.value = null
       try {
         const value = await getOaReimbursementSubmissionForDraft(draftId, {
           signal: controller.signal,
@@ -585,11 +601,15 @@ export const useReimbursementSubmissionStore = defineStore(
         return accepts(requestGeneration, draftId) ? submission.value : null
       } catch (error) {
         if (apiErrorCode(error) === 'REIMBURSEMENT_SUBMISSION_NOT_FOUND') {
-          if (accepts(requestGeneration, draftId)) requestError.value = ''
+          if (accepts(requestGeneration, draftId)) {
+            requestError.value = ''
+            requestAction.value = null
+          }
           return null
         }
         if (accepts(requestGeneration, draftId) && !isCancellation(error)) {
           requestError.value = apiErrorMessage(error, '提交记录恢复失败，请稍后重试')
+          requestAction.value = 'discover'
         }
         throw error
       } finally {
@@ -609,6 +629,7 @@ export const useReimbursementSubmissionStore = defineStore(
     function abort(): void {
       invalidateRequests()
       requestError.value = ''
+      requestAction.value = null
     }
 
     function reset(): void {
@@ -619,6 +640,7 @@ export const useReimbursementSubmissionStore = defineStore(
       idempotencyKey.value = null
       submission.value = null
       requestError.value = ''
+      requestAction.value = null
     }
 
     return {
@@ -628,6 +650,7 @@ export const useReimbursementSubmissionStore = defineStore(
       submitting,
       polling,
       requestError,
+      requestAction,
       oaSubmissionEnabled,
       status,
       terminal,

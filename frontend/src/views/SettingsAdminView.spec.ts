@@ -52,7 +52,6 @@ describe('SettingsAdminView receipt keywords', () => {
         long_term_project: '150.00',
         same_city_project: '50.00',
         internal: '100.00',
-        overseas: '0.00',
       },
       calculationMode: 'half_day_12',
     })

@@ -19,6 +19,7 @@ from app.services.sessions import (
     require_csrf,
     require_selected_department,
 )
+from app.services.subsidy_calculation import calculate_trip_subsidies, request_trips
 
 router = APIRouter(tags=["reimbursement"])
 
@@ -69,9 +70,11 @@ def totals(
             f"当前部署每张报销单最多处理 {max_items} 条费用明细",
             422,
         )
-    subsidy_calculation = _calculate(body.trip, database) if body.trip is not None else None
-    result = calculate_expense_totals(body.items, subsidy_calculation).as_api_dict()
+    requested = request_trips(trip=body.trip, trips=body.trips)
+    subsidy_calculations = calculate_trip_subsidies(database, requested)
+    result = calculate_expense_totals(body.items, subsidy_calculations).as_api_dict()
     result["subsidy"] = (
-        subsidy_calculation.as_api_dict() if subsidy_calculation is not None else None
+        subsidy_calculations[0].as_api_dict() if len(subsidy_calculations) == 1 else None
     )
+    result["subsidies"] = [item.as_api_dict() for item in subsidy_calculations]
     return success(result)

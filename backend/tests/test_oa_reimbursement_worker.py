@@ -130,9 +130,7 @@ def _job(
         created_at=NOW,
         oa_create_started_at=NOW if checkpointed else None,
         reconciliation_deadline_at=(
-            reconciliation_deadline_at or NOW + timedelta(minutes=15)
-            if checkpointed
-            else None
+            reconciliation_deadline_at or NOW + timedelta(minutes=15) if checkpointed else None
         ),
         process_instance_id=process_instance_id,
         attempt_count=0,
@@ -231,9 +229,7 @@ class FakeState:
 
     def mark_upload_commit_uncertain(self, _lease, upload, **_kwargs):
         self.events.append("commit:uncertain")
-        self._replace_upload(
-            replace(upload, status=ReimbursementUploadStatus.COMMIT_UNCERTAIN)
-        )
+        self._replace_upload(replace(upload, status=ReimbursementUploadStatus.COMMIT_UNCERTAIN))
         self.job = replace(self.job, status=ReimbursementSubmissionStatus.MANUAL_REVIEW)
 
     def mark_committed_upload_missing(self, _lease, upload):
@@ -578,9 +574,7 @@ async def test_unknown_create_enters_reconciliation_and_is_never_replayed() -> N
 
 async def test_unknown_commit_becomes_manual_review_and_is_not_replayed() -> None:
     state = FakeState(_job(ReimbursementSubmissionStatus.UPLOADING))
-    storage = FakeStorage(
-        commit_error=DingTalkStorageCommitOutcomeUnknown(http_status=None)
-    )
+    storage = FakeStorage(commit_error=DingTalkStorageCommitOutcomeUnknown(http_status=None))
     workflow = FakeWorkflow()
 
     await _processor(state, workflow, storage).process(
@@ -659,9 +653,7 @@ async def test_transient_staging_failure_keeps_bounded_retry_behavior() -> None:
 
 async def test_permanent_orphan_cleanup_error_requires_manual_review() -> None:
     committed = _upload(ReimbursementUploadStatus.COMMITTED)
-    state = FakeState(
-        _job(ReimbursementSubmissionStatus.ORPHAN_CLEANUP, upload=committed)
-    )
+    state = FakeState(_job(ReimbursementSubmissionStatus.ORPHAN_CLEANUP, upload=committed))
     storage = FakeStorage(
         recycle_error=ApiError(
             "DINGTALK_PERMISSION_MISSING",
@@ -972,9 +964,7 @@ async def test_transient_validation_failure_is_retried_from_validation_phase() -
     state = FakeState(_job(ReimbursementSubmissionStatus.VALIDATING))
     processor = OAReimbursementProcessor(
         state=state,
-        materializer=FailingValidationMaterializer(
-            DingTalkOpenAPIError(http_status=503)
-        ),
+        materializer=FailingValidationMaterializer(DingTalkOpenAPIError(http_status=503)),
         workflow=FakeWorkflow(),
         storage=FakeStorage(),
         lease_seconds=30,

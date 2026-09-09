@@ -19,7 +19,6 @@ describe('settings API', () => {
       long_term_project: '150',
       same_city_project: '50',
       internal: '100',
-      overseas: '0',
     } as const
     vi.mocked(http.put).mockResolvedValue({
       data: {
@@ -50,7 +49,6 @@ describe('settings API', () => {
         long_term_project: '150.00',
         same_city_project: '50.00',
         internal: '100.00',
-        overseas: '0.00',
       },
       calculationMode: 'half_day_12',
     })
@@ -70,11 +68,10 @@ describe('settings API', () => {
             long_term_project: '150.00',
             same_city_project: '50.00',
             internal: '100.00',
-            overseas: '0.00',
           },
           calculationMode: 'half_day_12',
         }),
-      ).rejects.toThrow('其他类型必须大于 0')
+      ).rejects.toThrow('每日补助必须大于 0')
     }
     expect(normalizeSubsidyRate('0')).toBeNull()
     expect(normalizeSubsidyRate('0', true)).toBe('0.00')

@@ -92,7 +92,7 @@ class Settings(BaseSettings):
     session_cookie_name: str = "expense_session"
     session_ttl_minutes: int = 480
     session_cleanup_interval_seconds: int = 300
-    session_cookie_secure: bool = True
+    session_cookie_secure: bool = False
 
     auth_mock_enabled: bool = False
     auth_mock_user_id: str = "mock-user"
@@ -202,8 +202,7 @@ class Settings(BaseSettings):
         parsed = urlsplit(normalized)
         if parsed.scheme not in {"https", "dingtalk"} or not parsed.netloc:
             raise ValueError(
-                "DINGTALK_APPROVAL_DETAIL_URL_TEMPLATE must be an absolute HTTPS or "
-                "dingtalk URL"
+                "DINGTALK_APPROVAL_DETAIL_URL_TEMPLATE must be an absolute HTTPS or dingtalk URL"
             )
         if parsed.username is not None or parsed.password is not None:
             raise ValueError("DINGTALK_APPROVAL_DETAIL_URL_TEMPLATE must not contain credentials")
@@ -213,9 +212,7 @@ class Settings(BaseSettings):
     @classmethod
     def validate_dingtalk_oa_worker_poll_interval(cls, value: float) -> float:
         if not 0.1 <= value <= 60:
-            raise ValueError(
-                "DINGTALK_OA_WORKER_POLL_INTERVAL_SECONDS must be between 0.1 and 60"
-            )
+            raise ValueError("DINGTALK_OA_WORKER_POLL_INTERVAL_SECONDS must be between 0.1 and 60")
         return value
 
     @field_validator(
@@ -323,8 +320,6 @@ class Settings(BaseSettings):
         if self.app_env == "production":
             if self.auth_mock_enabled:
                 raise ValueError("AUTH_MOCK_ENABLED must be false in production")
-            if not self.session_cookie_secure:
-                raise ValueError("SESSION_COOKIE_SECURE must be true in production")
             if self.dingtalk_agent_id is None:
                 raise ValueError("DINGTALK_AGENT_ID must be configured for production")
             required = {
@@ -387,17 +382,10 @@ class Settings(BaseSettings):
                 "DINGTALK_OA_WORKER_LEASE_SECONDS must cover the upload timeout plus "
                 "checkpoint headroom"
             )
-        if (
-            self.dingtalk_oa_worker_retry_max_seconds
-            < self.dingtalk_oa_worker_retry_base_seconds
-        ):
-            raise ValueError(
-                "DINGTALK_OA_WORKER_RETRY_MAX_SECONDS must be at least the retry base"
-            )
+        if self.dingtalk_oa_worker_retry_max_seconds < self.dingtalk_oa_worker_retry_base_seconds:
+            raise ValueError("DINGTALK_OA_WORKER_RETRY_MAX_SECONDS must be at least the retry base")
         if self.dingtalk_oa_worker_reconciliation_seconds < 30:
-            raise ValueError(
-                "DINGTALK_OA_WORKER_RECONCILIATION_SECONDS must be at least 30"
-            )
+            raise ValueError("DINGTALK_OA_WORKER_RECONCILIATION_SECONDS must be at least 30")
         if not 1 <= self.reimbursement_draft_ttl_days <= 365:
             raise ValueError("REIMBURSEMENT_DRAFT_TTL_DAYS must be between 1 and 365")
         if self.app_env == "production":

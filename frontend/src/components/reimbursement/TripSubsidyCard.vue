@@ -2,27 +2,82 @@
 import { computed } from 'vue'
 
 import { useExpenseStore } from '@/stores/expense'
-import type { TripType } from '@/types/expenses'
+import type { SubsidyResult, TripInput, TripType } from '@/types/expenses'
+import { groupOverlappingSubsidyTrips, type SubsidyTripGroup } from '@/utils/subsidyTripGroups'
 import { TRIP_PERIOD_TIME, tripPeriodFromTime, type TripDayPeriod } from '@/utils/tripPeriod'
 
-const props = withDefaults(defineProps<{ readonly?: boolean }>(), { readonly: false })
-const expense = useExpenseStore()
-const departurePeriod = computed<TripDayPeriod | undefined>({
-  get: () => tripPeriodFromTime(expense.trip.startTime),
-  set: (period) => { if (period) expense.trip.startTime = TRIP_PERIOD_TIME[period] },
-})
-const returnPeriod = computed<TripDayPeriod | undefined>({
-  get: () => tripPeriodFromTime(expense.trip.endTime),
-  set: (period) => { if (period) expense.trip.endTime = TRIP_PERIOD_TIME[period] },
+interface SubsidyApproval {
+  processInstanceId: string
+  title: string
+  startDate: string
+  endDate: string
+}
+
+const props = withDefaults(defineProps<{
+  readonly?: boolean
+  approvals?: readonly SubsidyApproval[]
+  approvalTripType?: TripType | null
+}>(), {
+  readonly: false,
+  approvals: () => [],
+  approvalTripType: null,
 })
 
-const tripTypes: Array<{ id: TripType; name: string }> = [
-  { id: 'business', name: '境内商务出差' },
-  { id: 'project', name: '境内市外项目' },
-  { id: 'same_city_project', name: '境内同市项目' },
-  { id: 'internal', name: '公司内部出差' },
-  { id: 'overseas', name: '境外出差' },
-]
+const expense = useExpenseStore()
+const isOverseas = computed(() => props.approvalTripType === 'overseas')
+const subsidyGroups = computed(() => groupOverlappingSubsidyTrips(expense.subsidyTrips))
+const subsidyCalculationError = computed(() => {
+  if (!expense.includeSubsidy || !expense.calculationError || expense.itemReadinessError) return ''
+  if (expense.calculationError === expense.policyInputError) return ''
+  return expense.calculationError
+})
+
+const tripTypeNames: Record<Exclude<TripType, 'overseas'>, string> = {
+  business: '境内商务出差',
+  project: '境内市外项目',
+  same_city_project: '境内同市项目',
+  internal: '公司内部出差',
+}
+
+function tripTypeName(type: TripType | null | undefined): string {
+  if (type === 'overseas') return '境外出差（不申请补助）'
+  return type ? tripTypeNames[type] : '未识别出差类别'
+}
+
+function approvalFor(item: TripInput): SubsidyApproval | undefined {
+  return props.approvals.find((approval) => approval.processInstanceId === item.relatedApprovalId)
+}
+
+function calendarDays(group: SubsidyTripGroup): number | null {
+  const start = Date.parse(`${group.startDate}T00:00:00Z`)
+  const end = Date.parse(`${group.endDate}T00:00:00Z`)
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return null
+  return Math.floor((end - start) / 86_400_000) + 1
+}
+
+function period(time: string): TripDayPeriod | undefined {
+  return tripPeriodFromTime(time)
+}
+
+function setPeriod(group: SubsidyTripGroup, field: 'startTime' | 'endTime', value: string | number | boolean | undefined): void {
+  if (value !== 'morning' && value !== 'afternoon') return
+  const boundary = field === 'startTime' ? group.startDate : group.endDate
+  const dateField = field === 'startTime' ? 'startDate' : 'endDate'
+  for (const trip of group.trips) {
+    if (trip[dateField] === boundary) trip[field] = TRIP_PERIOD_TIME[value]
+  }
+}
+
+function setPolicyConfirmed(group: SubsidyTripGroup, value: boolean): void {
+  for (const trip of group.trips) trip.policyConfirmed = value
+}
+
+function subsidyFor(group: SubsidyTripGroup, index: number): SubsidyResult | null {
+  const subsidies = expense.totals?.subsidies
+  return subsidies?.find((result) => result.relatedApprovalId === group.primaryRelatedApprovalId)
+    ?? subsidies?.[index]
+    ?? (expense.subsidyTrips.length === 1 ? expense.totals?.subsidy ?? null : null)
+}
 </script>
 
 <template>
@@ -40,144 +95,247 @@ const tripTypes: Array<{ id: TripType; name: string }> = [
       <el-form-item label="是否申请出差补助">
         <el-switch
           :model-value="expense.includeSubsidy"
+          :disabled="props.readonly || (!expense.includeSubsidy
+            && (isOverseas || !props.approvals.length || !props.approvalTripType))"
           active-text="申请出差补助"
           inactive-text="不申请"
           @update:model-value="expense.setSubsidyIncluded"
         />
       </el-form-item>
+
       <el-alert
-        v-if="!expense.includeSubsidy"
-        title="本报销单不申请出差补助"
-        description="无需填写出差类型和出发、返回时间；系统只汇总费用明细。"
+        v-if="isOverseas"
+        title="境外出差不计算出差补助"
+        description="境外审批仍可用于报销关联，但本系统不生成境外出差补助。"
         type="info"
         :closable="false"
       />
+      <el-alert
+        v-else-if="!props.approvals.length"
+        title="请先关联已通过的出差审批"
+        description="系统按审批日期生成补助时段；不连续时分别计算，日期重叠时自动合并。"
+        type="info"
+        :closable="false"
+      />
+      <el-alert
+        v-else-if="!props.approvalTripType"
+        title="未能识别关联审批的出差类别"
+        description="请让管理员检查出差审批模板的类别映射后再申请补助。"
+        type="warning"
+        :closable="false"
+      />
+      <el-alert
+        v-else-if="!expense.includeSubsidy"
+        title="本报销单不申请出差补助"
+        description="费用明细仍可正常填写和提交。"
+        type="info"
+        :closable="false"
+      />
+
       <template v-else>
-        <el-form-item label="出差类型">
-          <el-select
-            :model-value="expense.trip.tripType"
-            class="full-width"
-            @update:model-value="expense.setTripType"
-          >
-            <el-option
-              v-for="type in tripTypes"
-              :key="type.id"
-              :label="type.name"
-              :value="type.id"
-            />
-          </el-select>
-        </el-form-item>
-        <div class="trip-grid">
-          <el-form-item label="出发日期">
-            <el-date-picker
-              v-model="expense.trip.startDate"
-              type="date"
-              value-format="YYYY-MM-DD"
-              class="full-width"
-            />
-          </el-form-item>
-          <el-form-item label="出发时段">
-            <el-radio-group
-              v-model="departurePeriod"
-              aria-label="出发时段"
-            >
-              <el-radio-button value="morning">
-                上午
-              </el-radio-button>
-              <el-radio-button value="afternoon">
-                下午
-              </el-radio-button>
-            </el-radio-group>
-          </el-form-item>
-          <el-form-item label="返回日期">
-            <el-date-picker
-              v-model="expense.trip.endDate"
-              type="date"
-              value-format="YYYY-MM-DD"
-              class="full-width"
-            />
-          </el-form-item>
-          <el-form-item label="返回时段">
-            <el-radio-group
-              v-model="returnPeriod"
-              aria-label="返回时段"
-            >
-              <el-radio-button value="morning">
-                上午
-              </el-radio-button>
-              <el-radio-button value="afternoon">
-                下午
-              </el-radio-button>
-            </el-radio-group>
-          </el-form-item>
-        </div>
-        <el-alert
-          v-if="expense.trip.tripType === 'project' && expense.projectPolicyType"
-          :title="expense.projectPolicyType === 'long_term_project'
-            ? `系统识别为市外长期项目（${expense.projectCalendarDays} 个自然日）`
-            : `系统识别为市外短期项目（${expense.projectCalendarDays} 个自然日）`"
-          :description="expense.projectPolicyType === 'long_term_project'
-            ? '超过 30 个自然日，使用长期标准并按半天规则自动计算。'
-            : '30 个自然日以内（含），使用短期标准并自动计算。'"
-          type="info"
-          :closable="false"
-          class="calculation-alert"
-        />
-        <el-alert
-          v-if="!expense.requiresPolicyConfirmation"
-          title="自动计算规则"
-          description="出发日：上午计 1 天，下午计 0.5 天；返回日：上午计 0.5 天，下午计 1 天。同一天上午出发、下午返回计 1 天，同一时段往返计 0.5 天。上午指 12:00 前，下午指 12:00 及以后。"
-          type="info"
-          :closable="false"
-        />
-        <div
-          v-else
-          class="policy-confirmation"
-        >
-          <el-alert
-            title="该类型不自动推断政策例外"
-            description="请按公司现行制度确认本次有效天数；每日标准由管理员统一配置，员工不能修改。"
-            type="warning"
-            :closable="false"
+        <el-form-item label="补助规则">
+          <el-input
+            :model-value="tripTypeName(props.approvalTripType)"
+            disabled
           />
-          <div class="policy-fields">
-            <el-form-item label="确认有效天数（0.5 天为单位）">
-              <el-input
-                v-model="expense.trip.confirmedEffectiveDays"
-                inputmode="decimal"
-                placeholder="例如 8.0"
-                maxlength="5"
-              />
+        </el-form-item>
+
+        <article
+          v-for="(group, index) in subsidyGroups"
+          :key="group.key"
+          class="subsidy-item"
+        >
+          <div class="subsidy-item__heading">
+            <div>
+              <strong>补助 {{ index + 1 }}</strong>
+              <p>
+                {{ group.trips.map((item) => approvalFor(item)?.title || '出差审批').join('、') }}
+              </p>
+              <small v-if="group.trips.length > 1">由 {{ group.trips.length }} 张审批合并</small>
+            </div>
+            <span>{{ group.trips.length > 1 ? '合并时段' : '审批日期' }}：{{ group.startDate }} 至 {{ group.endDate }}</span>
+          </div>
+
+          <div class="trip-grid">
+            <el-form-item label="出发时段">
+              <el-radio-group
+                :model-value="period(group.startTime)"
+                :aria-label="`补助 ${index + 1} 出发时段`"
+                @update:model-value="setPeriod(group, 'startTime', $event)"
+              >
+                <el-radio-button value="morning">
+                  上午
+                </el-radio-button>
+                <el-radio-button value="afternoon">
+                  下午
+                </el-radio-button>
+              </el-radio-group>
+            </el-form-item>
+            <el-form-item label="返回时段">
+              <el-radio-group
+                :model-value="period(group.endTime)"
+                :aria-label="`补助 ${index + 1} 返回时段`"
+                @update:model-value="setPeriod(group, 'endTime', $event)"
+              >
+                <el-radio-button value="morning">
+                  上午
+                </el-radio-button>
+                <el-radio-button value="afternoon">
+                  下午
+                </el-radio-button>
+              </el-radio-group>
             </el-form-item>
           </div>
-          <el-checkbox v-model="expense.trip.policyConfirmed">
-            我已按公司现行制度确认以上有效天数
-          </el-checkbox>
-          <el-checkbox
-            v-if="expense.trip.tripType === 'internal'"
-            v-model="expense.trip.noSubsidyException"
+
+          <el-alert
+            v-if="props.approvalTripType === 'project'"
+            :title="(calendarDays(group) ?? 0) > 30 ? '市外长期项目' : '市外短期项目'"
+            :description="(calendarDays(group) ?? 0) > 30
+              ? `共 ${calendarDays(group)} 个自然日，系统自动采用长期项目标准。`
+              : `共 ${calendarDays(group)} 个自然日，系统自动采用短期项目标准。`"
+            type="info"
+            :closable="false"
+          />
+          <el-alert
+            v-else-if="props.approvalTripType === 'internal'"
+            :title="(calendarDays(group) ?? 0) > 30 ? '公司内部长期出差，不计算补助' : '公司内部短期出差'"
+            :description="(calendarDays(group) ?? 0) > 30
+              ? `共 ${calendarDays(group)} 个自然日，超过 30 天，本项补助为 0。`
+              : `共 ${calendarDays(group)} 个自然日，按设置中的公司内部出差每日标准自动计算。`"
+            type="info"
+            :closable="false"
+          />
+          <el-alert
+            v-else
+            title="自动计算规则"
+            description="出发日上午计 1 天、下午计 0.5 天；返回日上午计 0.5 天、下午计 1 天。同一天最多计 1 天。"
+            type="info"
+            :closable="false"
+          />
+
+          <div
+            v-if="props.approvalTripType === 'same_city_project'"
+            class="policy-confirmation"
           >
-            本次适用不补助例外（例如无锡—苏州）
-          </el-checkbox>
-          <p
-            v-if="expense.policyInputError"
-            class="field-error"
+            <el-checkbox
+              :model-value="group.trips.every((item) => item.policyConfirmed)"
+              @update:model-value="setPolicyConfirmed(group, $event)"
+            >
+              我已按公司现行制度确认本项补助
+            </el-checkbox>
+          </div>
+
+          <div
+            v-if="subsidyFor(group, index)"
+            class="subsidy-preview"
+            role="status"
+            aria-live="polite"
           >
-            {{ expense.policyInputError }}
-          </p>
-        </div>
+            <span>自然日 {{ subsidyFor(group, index)?.calendarDays }} 天</span>
+            <span>有效 {{ subsidyFor(group, index)?.effectiveDays }} 天</span>
+            <span>¥{{ subsidyFor(group, index)?.dailyRate }} / 天</span>
+            <strong>补助 ¥{{ subsidyFor(group, index)?.total }}</strong>
+          </div>
+        </article>
+
+        <p
+          v-if="expense.policyInputError"
+          class="field-error"
+        >
+          {{ expense.policyInputError }}
+        </p>
+        <el-alert
+          v-if="subsidyCalculationError"
+          :title="subsidyCalculationError"
+          type="error"
+          :closable="false"
+          class="subsidy-calculation-error"
+        />
       </template>
-      <div
-        v-if="expense.includeSubsidy && expense.totals?.subsidy"
-        class="subsidy-preview"
-        role="status"
-        aria-live="polite"
-      >
-        <span>自然日 {{ expense.totals.subsidy.calendarDays }} 天</span>
-        <span>有效 {{ expense.totals.subsidy.effectiveDays }} 天</span>
-        <span>¥{{ expense.totals.subsidy.dailyRate }} / 天</span>
-        <strong>补助 ¥{{ expense.displaySubsidyTotal }}</strong>
-      </div>
     </el-form>
   </el-card>
 </template>
+
+<style scoped>
+.subsidy-item {
+  margin-top: 16px;
+  padding: 18px;
+  border: 1px solid var(--el-border-color-light);
+  border-radius: 10px;
+  background: var(--el-fill-color-lighter);
+}
+
+.subsidy-item__heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.subsidy-item__heading p {
+  margin: 6px 0 0;
+  color: var(--el-text-color-secondary);
+}
+
+.subsidy-item__heading small {
+  display: block;
+  margin-top: 5px;
+  color: var(--el-color-primary);
+}
+
+.subsidy-item__heading > span {
+  color: var(--el-text-color-secondary);
+  white-space: nowrap;
+}
+
+.trip-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 24px;
+}
+
+.policy-confirmation {
+  margin-top: 14px;
+}
+
+.subsidy-preview {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 20px;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: var(--el-color-primary-light-9);
+}
+
+.subsidy-preview strong {
+  margin-left: auto;
+  color: var(--el-color-primary);
+}
+
+.field-error {
+  margin: 12px 0 0;
+  color: var(--el-color-danger);
+}
+
+@media (max-width: 720px) {
+  .trip-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .subsidy-item__heading {
+    display: block;
+  }
+
+  .subsidy-item__heading > span {
+    display: block;
+    margin-top: 6px;
+  }
+
+  .subsidy-preview strong {
+    width: 100%;
+    margin-left: 0;
+  }
+}
+</style>

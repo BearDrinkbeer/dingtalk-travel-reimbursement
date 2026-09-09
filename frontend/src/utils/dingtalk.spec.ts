@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const bridge = vi.hoisted(() => ({}) as Record<string, unknown>)
 
@@ -10,6 +10,8 @@ describe('requestDingTalkAuthCode', () => {
   beforeEach(() => {
     for (const key of Object.keys(bridge)) delete bridge[key]
   })
+
+  afterEach(() => vi.useRealTimers())
 
   it('uses the current top-level dd.requestAuthCode API', async () => {
     bridge.ready = (callback: () => void) => callback()
@@ -40,5 +42,18 @@ describe('requestDingTalkAuthCode', () => {
       '当前钉钉客户端不支持 dd.requestAuthCode，请升级客户端后重试',
     )
     expect(legacy).not.toHaveBeenCalled()
+  })
+
+  it('rejects instead of leaving the page blank when DingTalk never returns a result', async () => {
+    vi.useFakeTimers()
+    bridge.ready = (callback: () => void) => callback()
+    bridge.requestAuthCode = vi.fn()
+
+    const result = expect(requestDingTalkAuthCode('corp-1', 'client-1')).rejects.toThrow(
+      '钉钉免登响应超时，请从公司钉钉工作台重新打开本应用',
+    )
+    await vi.advanceTimersByTimeAsync(8_000)
+
+    await result
   })
 })

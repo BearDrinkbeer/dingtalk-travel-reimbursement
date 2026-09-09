@@ -207,7 +207,6 @@ class CatalogConfirmationRequest(StrictRequest):
         min_length=1,
         max_length=20,
     )
-    related_approval_smoke_test_confirmed: bool = Field(alias="relatedApprovalSmokeTestConfirmed")
 
 
 @router.post("/admin/oa/templates/catalog/inspect")
@@ -257,7 +256,6 @@ async def confirm_catalog(
         reimbursement_schema_fingerprint=body.reimbursement.schema_fingerprint,
         reimbursement_mappings=body.reimbursement.mappings.as_mapping(),
         travel_profiles=[item.as_confirmation() for item in body.travel_profiles],
-        related_approval_smoke_test_confirmed=(body.related_approval_smoke_test_confirmed),
         administrator_user_id=administrator_user_id,
     )
     return success(catalog)

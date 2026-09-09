@@ -29,6 +29,8 @@ _ROUTE = re.compile(
     r"([\u4e00-\u9fff]{2,12}(?:站|南|北|东|西)?)\s*(?:[-—–→至])\s*"
     r"([\u4e00-\u9fff]{2,12}(?:站|南|北|东|西)?)"
 )
+_TRAIN_NUMBER = re.compile(r"^[GDCZTK]\d{1,6}$", re.IGNORECASE)
+_PINYIN_STATION = re.compile(r"^[A-Za-z][A-Za-z\s]{3,60}$")
 PASSENGER_ROUTE_PREFIX = "行程路线："
 PASSENGER_OCCURRENCE_DATE_PREFIX = "发生日期："
 _LAYOUT_COLUMN_GAP = re.compile(r"\s{4,}")
@@ -761,4 +763,30 @@ def extract_route(lines: list[OcrLine]) -> str | None:
     ]
     if len(station_lines) >= 2:
         return f"{station_lines[0]}-{station_lines[1]}"
+    return None
+
+
+def extract_train_route(lines: list[OcrLine]) -> str | None:
+    """Extract a rail route, retaining pinyin as a Linux font-fallback safety net."""
+
+    route = extract_route(lines)
+    if route is not None:
+        return route
+
+    texts = [line.text.strip() for line in lines if line.text.strip()]
+    for index, text in enumerate(texts):
+        if _TRAIN_NUMBER.fullmatch("".join(text.split())) is None:
+            continue
+        candidates: list[str] = []
+        for value in texts[index + 1 : index + 5]:
+            if not _PINYIN_STATION.fullmatch(value):
+                continue
+            compact = "".join(value.split()).lower()
+            if not 4 <= len(compact) <= 40:
+                continue
+            candidates.append(compact[0].upper() + compact[1:])
+            if len(candidates) == 2:
+                if candidates[0] != candidates[1]:
+                    return f"{candidates[0]}-{candidates[1]}"
+                break
     return None

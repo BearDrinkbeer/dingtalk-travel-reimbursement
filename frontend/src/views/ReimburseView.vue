@@ -11,8 +11,7 @@ import { useExpenseStore } from '@/stores/expense'
 import { useHealthStore } from '@/stores/health'
 import { useReimbursementDraftStore } from '@/stores/reimbursementDraft'
 import { useReimbursementSubmissionStore } from '@/stores/reimbursementSubmission'
-import { isForeignExpense } from '@/types/expenses'
-import { isActiveProof, missingExpenseMaterials, needsMaterialConfirmation, requiresPaymentProof } from '@/utils/expenseProofs'
+import { isForeignExpense, type TripType } from '@/types/expenses'
 import type {
   ReimbursementDraft,
   ReimbursementDraftInput,
@@ -20,6 +19,13 @@ import type {
   ReimbursementRelatedApprovalSelection,
   ReimbursementSubmissionStatus,
 } from '@/types/reimbursements'
+import { isActiveProof, missingExpenseMaterials, needsMaterialConfirmation, requiresPaymentProof } from '@/utils/expenseProofs'
+import { groupOverlappingSubsidyTrips } from '@/utils/subsidyTripGroups'
+import {
+  mappedTravelTypeOption,
+  subsidyTripTypeForProfile,
+  subsidyTripTypeForTravelLabel,
+} from '@/utils/travelTypes'
 
 const auth = useAuthStore()
 const expense = useExpenseStore()
@@ -65,13 +71,9 @@ const selectedTravelTypeLabel = computed(() => {
   const profile = drafts.reimbursementOptions?.travelProfiles.find(
     (item) => item.profileKey === first.profileKey,
   )
-  if (!profile) return ''
-  const mapped = linked?.sourceTravelTypeValue
-    ? profile.travelTypeMappings?.[linked.sourceTravelTypeValue]
-    : undefined
-  return mapped?.label ?? profile.travelTypeOption.label ?? profile.displayName
+  return mappedTravelTypeOption(profile, linked?.sourceTravelTypeValue)?.label ?? ''
 })
-const selectedTravelApprovalPeriods = computed(() => selectedRelatedApprovals.value.flatMap((selection) => {
+const selectedSubsidyApprovals = computed(() => selectedRelatedApprovals.value.flatMap((selection) => {
   const candidate = drafts.travelApprovals.find(
     (approval) => approval.processInstanceId === selection.processInstanceId,
   )
@@ -79,26 +81,36 @@ const selectedTravelApprovalPeriods = computed(() => selectedRelatedApprovals.va
     (approval) => approval.processInstanceId === selection.processInstanceId,
   )
   const approval = candidate ?? linked
-  return approval ? [{ startDate: approval.startDate, endDate: approval.endDate }] : []
+  return approval ? [{
+    processInstanceId: approval.processInstanceId,
+    title: approval.title,
+    startDate: approval.startDate,
+    endDate: approval.endDate,
+  }] : []
 }))
-const selectedTravelPeriod = computed(() => {
-  const periods = selectedTravelApprovalPeriods.value
-  if (!periods.length) return ''
-  const startDate = periods.map((item) => item.startDate).sort()[0]!
-  const endDate = periods.map((item) => item.endDate).sort().at(-1)!
-  return startDate === endDate ? startDate : `${startDate} 至 ${endDate}`
+const selectedSubsidyTripType = computed<TripType | null>(() => {
+  const first = selectedRelatedApprovals.value[0]
+  if (!first) return null
+  const candidate = drafts.travelApprovals.find(
+    (approval) => approval.processInstanceId === first.processInstanceId,
+  )
+  if (candidate?.subsidyTripType) return candidate.subsidyTripType
+  const linked = drafts.currentDraft?.relatedApprovals.find(
+    (approval) => approval.processInstanceId === first.processInstanceId,
+  )
+  const profile = drafts.reimbursementOptions?.travelProfiles.find(
+    (item) => item.profileKey === first.profileKey,
+  )
+  return subsidyTripTypeForProfile(profile, linked?.sourceTravelTypeValue)
+    ?? subsidyTripTypeForTravelLabel(selectedTravelTypeLabel.value)
 })
-const selectedTravelDateError = computed(() => {
-  if (!expense.includeSubsidy || !expense.trip.startDate || !expense.trip.endDate
-    || !selectedRelatedApprovals.value.length) return ''
-  const periods = selectedTravelApprovalPeriods.value
-  if (periods.length !== selectedRelatedApprovals.value.length) return ''
-  const approvalStart = periods.map((item) => item.startDate).sort()[0]!
-  const approvalEnd = periods.map((item) => item.endDate).sort().at(-1)!
-  if (approvalStart > expense.trip.startDate || approvalEnd < expense.trip.endDate) {
-    return '所选出差审批日期必须完整覆盖出差补助日期，请调整补助日期或关联审批'
-  }
-  return ''
+const selectedTravelPeriod = computed(() => {
+  const periods = groupOverlappingSubsidyTrips(expense.subsidyTrips)
+  if (!periods.length) return ''
+  const labels = periods.map((item) => item.startDate === item.endDate
+    ? item.startDate
+    : `${item.startDate} 至 ${item.endDate}`)
+  return labels.length === 1 ? labels[0]! : `共 ${labels.length} 个时间段：${labels.join('；')}`
 })
 const trackedSubmission = computed(() => Boolean(drafts.currentDraft
   && submission.activeDraftId === drafts.currentDraft.id
@@ -128,20 +140,22 @@ const formReadOnlyReason = computed(() => {
   return ''
 })
 const currentFormInput = computed<ReimbursementDraftInput>(() => {
-  const trip = expense.tripPayload()
+  const trips = expense.tripPayloads()
   return {
     ocrDispositionVersion: 1,
     companyValue: companyValue.value,
     budgetCodeValue: budgetCodeValue.value,
-    trip,
+    trip: expense.subsidyTrips.length ? null : trips[0] ?? null,
+    trips: expense.subsidyTrips.length ? trips : [],
     editingState: {
       includeSubsidy: expense.includeSubsidy,
       trip: {
         ...expense.trip,
         // Persist the same half-day encoding checked by the backend at submission.
-        startTime: trip?.startTime ?? expense.trip.startTime,
-        endTime: trip?.endTime ?? expense.trip.endTime,
+        startTime: trips[0]?.startTime ?? expense.trip.startTime,
+        endTime: trips.at(-1)?.endTime ?? expense.trip.endTime,
       },
+      trips: expense.subsidyTrips.map((item) => ({ ...item })),
     },
     items: expense.buildDraftExpenseItems(),
     dismissedOcrFileIds: [...expense.dismissedOcrFileIds],
@@ -198,6 +212,7 @@ function inputSignature(input: ReimbursementDraftInput): string {
     companyValue: input.companyValue,
     budgetCodeValue: input.budgetCodeValue,
     trip: input.trip,
+    trips: input.trips,
     editingState: input.editingState,
     items: input.items,
     dismissedOcrFileIds: input.dismissedOcrFileIds,
@@ -254,12 +269,14 @@ async function createBlankReimbursement(): Promise<void> {
     companyValue: '',
     budgetCodeValue: '',
     trip: null,
+    trips: [],
     editingState: {
       includeSubsidy: false,
       trip: {
         tripType: 'business', startDate: '', startTime: '09:00', endDate: '', endTime: '18:00',
         policyConfirmed: false, confirmedEffectiveDays: '', noSubsidyException: false,
       },
+      trips: [],
     },
     items: [],
     dismissedOcrFileIds: [],
@@ -363,14 +380,15 @@ async function flushAutosave(): Promise<void> {
 function validateSubmission(): string {
   if (!companyOptions.value.some((option) => option.value === companyValue.value)) return '请选择所属公司'
   if (!budgetOptions.value.some((option) => option.value === budgetCodeValue.value)) return '请选择预算代码'
-  if (expense.includeSubsidy && !expense.tripPayload()) return expense.policyInputError || '请完整填写出发和返回日期、时间'
+  if (expense.includeSubsidy && expense.tripPayloads().length !== selectedRelatedApprovals.value.length) {
+    return expense.policyInputError || '请完整确认每个补助项的出发和返回时段'
+  }
   if (expense.categoryLoadError || !expense.categories.length) return '请先加载费用类别'
   if (!expense.items.length) return '请至少添加一条费用明细'
   if (expense.itemReadinessError) return expense.itemReadinessError
   if (unresolvedOcrFiles.value.length) return '请处理尚未加入费用明细的票据，或将其仅作为材料保留'
   if (pendingMaterialFiles.value.length) return '请先确认待处理材料的用途'
   if (!selectedRelatedApprovals.value.length) return '请至少关联一张已通过的出差审批'
-  if (selectedTravelDateError.value) return selectedTravelDateError.value
   if (!drafts.files.some((file) => file.status === 'ACTIVE')) return '请上传报销材料'
   for (const item of expense.items) {
     if (item.category === 'lodging' && !item.hotelBillFileIds?.some((id) =>
@@ -484,7 +502,23 @@ watch(() => drafts.busy, () => {
   if (!saving.value) scheduleAutosave()
 })
 watch(budgetLabel, (label) => { expense.manualProjectText = label })
-watch(() => [sessionScope(), expense.includeSubsidy, expense.trip, expense.items, drafts.processingFiles, formReadOnly.value], () => {
+watch(selectedSubsidyApprovals, (approvals) => expense.syncSubsidyApprovals(approvals), {
+  deep: true,
+  immediate: true,
+})
+watch(selectedSubsidyTripType, (value) => {
+  if (value && value !== 'overseas' && expense.trip.tripType !== value) expense.setTripType(value)
+  if (value === 'overseas' && expense.includeSubsidy) expense.setSubsidyIncluded(false)
+}, { immediate: true })
+watch(() => [
+  sessionScope(),
+  expense.includeSubsidy,
+  expense.trip,
+  expense.subsidyTrips,
+  expense.items,
+  drafts.processingFiles,
+  formReadOnly.value,
+], () => {
   if (calculationTimer) clearTimeout(calculationTimer)
   const scope = sessionScope()
   if (!scope || disposed || drafts.processingFiles || formReadOnly.value) return
@@ -662,8 +696,6 @@ onBeforeUnmount(() => {
               v-model="selectedRelatedApprovals"
               :linked-approvals="drafts.currentDraft.relatedApprovals"
               :readonly="formReadOnly || drafts.processingFiles"
-              :required-start-date="expense.includeSubsidy ? expense.trip.startDate : ''"
-              :required-end-date="expense.includeSubsidy ? expense.trip.endDate : ''"
             />
             <el-alert
               v-if="drafts.currentDraft.relatedApprovals.length && !drafts.currentDraft.input.accountingSourceVerified && !formReadOnly"
@@ -738,6 +770,8 @@ onBeforeUnmount(() => {
           >
             <TripSubsidyCard
               :readonly="formReadOnly"
+              :approvals="selectedSubsidyApprovals"
+              :approval-trip-type="selectedSubsidyTripType"
             />
             <ExpenseItemsCard
               ref="expenseItemsCard"
@@ -895,12 +929,12 @@ onBeforeUnmount(() => {
                   刷新提交进度
                 </el-button>
                 <el-button
-                  v-if="submission.requestError && !submission.submission"
+                  v-if="submission.requestError && !submission.submission && submission.requestAction"
                   :loading="submission.submitting"
-                  :disabled="submission.idempotencyKey ? submission.oaSubmissionEnabled !== true : false"
-                  @click="submission.idempotencyKey ? retrySameSubmission() : retrySubmissionRecovery()"
+                  :disabled="submission.requestAction === 'retry' && submission.oaSubmissionEnabled !== true"
+                  @click="submission.requestAction === 'retry' ? retrySameSubmission() : retrySubmissionRecovery()"
                 >
-                  {{ submission.idempotencyKey ? '重试本次提交' : '重新查找提交记录' }}
+                  {{ submission.requestAction === 'retry' ? '重试本次提交' : '重新查找提交记录' }}
                 </el-button>
               </div>
             </section>

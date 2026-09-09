@@ -35,18 +35,8 @@ import { TRIP_PERIOD_TIME, tripPeriodFromTime } from '@/utils/tripPeriod'
 
 const SPECIAL_TRIP_TYPES = new Set<TripType>([
   'same_city_project',
-  'internal',
 ])
-const EFFECTIVE_DAYS_PATTERN = /^(?:0|[1-9]\d{0,2})(?:\.(?:0|5))?$/
-const MAX_CONFIRMED_DAYS = 366
 const CALENDAR_DATE_PATTERN = /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/
-function normalizeEffectiveDays(value: string): string | null {
-  const normalized = value.trim()
-  if (!EFFECTIVE_DAYS_PATTERN.test(normalized)) return null
-  const parsed = Number(normalized)
-  if (!Number.isFinite(parsed) || parsed > MAX_CONFIRMED_DAYS) return null
-  return parsed.toFixed(1)
-}
 
 function newItemId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -103,6 +93,7 @@ export const useExpenseStore = defineStore('expense', () => {
     confirmedEffectiveDays: '',
     noSubsidyException: false,
   })
+  const subsidyTrips = ref<TripInput[]>([])
   const items = ref<ExpenseItem[]>([])
   const dismissedOcrFileIds = ref<string[]>([])
   const includeSubsidy = ref(false)
@@ -133,10 +124,20 @@ export const useExpenseStore = defineStore('expense', () => {
   const maxExpenseItems = ref(200)
   const policyInputError = computed(() => {
     if (!includeSubsidy.value) return ''
-    if (!requiresPolicyConfirmation.value) return ''
-    const effectiveDays = normalizeEffectiveDays(trip.confirmedEffectiveDays)
-    if (effectiveDays === null) return '有效天数必须在 0 到 366 天之间，并以 0.5 天为单位'
-    if (!trip.policyConfirmed) return '请勾选确认本次有效天数'
+    if (trip.tripType === 'overseas') return '境外出差不申请出差补助'
+    // Pre-v6 drafts used one aggregate trip. Keep them editable while all new
+    // reimbursement flows use one subsidyTrips entry per related approval.
+    if (!subsidyTrips.value.length) {
+      if (!trip.startDate || !trip.endDate) return '请完整填写出发和返回日期、时段'
+      if (requiresPolicyConfirmation.value && !trip.policyConfirmed) {
+        return '请勾选已按公司制度确认'
+      }
+      return ''
+    }
+    if (requiresPolicyConfirmation.value
+      && subsidyTrips.value.some((item) => !item.policyConfirmed)) {
+      return '请逐项勾选已按公司制度确认'
+    }
     return ''
   })
   const manualCategories = computed(() => categories.value.filter((item) => item.manualSelectable))
@@ -191,9 +192,9 @@ export const useExpenseStore = defineStore('expense', () => {
     return ''
   })
 
-  function calculationSignature(payload: TripInput | null): string {
+  function calculationSignature(payload: TripInput | readonly TripInput[] | null): string {
     return JSON.stringify({
-      trip: payload,
+      trips: Array.isArray(payload) ? payload : payload ? [payload] : [],
       items: items.value.map((item) => ({
         category: item.category,
         date: item.date,
@@ -206,7 +207,32 @@ export const useExpenseStore = defineStore('expense', () => {
   }
 
   function tripPayload(): TripInput | null {
-    if (!includeSubsidy.value) return null
+    const values = tripPayloads()
+    return values.length === 1 ? values[0]! : null
+  }
+
+  function tripPayloads(): TripInput[] {
+    if (!includeSubsidy.value) return []
+    if (trip.tripType === 'overseas') return []
+    if (subsidyTrips.value.length) {
+      return subsidyTrips.value.flatMap((item) => {
+        const startPeriod = tripPeriodFromTime(item.startTime)
+        const endPeriod = tripPeriodFromTime(item.endTime)
+        if (!item.relatedApprovalId || !item.startDate || !item.endDate || !startPeriod || !endPeriod) {
+          return []
+        }
+        const payload: TripInput = {
+          relatedApprovalId: item.relatedApprovalId,
+          tripType: trip.tripType,
+          startDate: item.startDate,
+          startTime: TRIP_PERIOD_TIME[startPeriod],
+          endDate: item.endDate,
+          endTime: TRIP_PERIOD_TIME[endPeriod],
+        }
+        if (trip.tripType === 'same_city_project') payload.policyConfirmed = Boolean(item.policyConfirmed)
+        return [payload]
+      })
+    }
     const startPeriod = tripPeriodFromTime(trip.startTime)
     const endPeriod = tripPeriodFromTime(trip.endTime)
     if (
@@ -214,7 +240,7 @@ export const useExpenseStore = defineStore('expense', () => {
       !trip.endDate ||
       !startPeriod ||
       !endPeriod
-    ) return null
+    ) return []
     // Normalize both ends so legacy exact times cannot conflict within the same half-day.
     const payload: TripInput = {
       tripType: trip.tripType,
@@ -223,17 +249,48 @@ export const useExpenseStore = defineStore('expense', () => {
       endDate: trip.endDate,
       endTime: TRIP_PERIOD_TIME[endPeriod],
     }
-    if (requiresPolicyConfirmation.value) {
-      if (policyInputError.value) return null
-      const effectiveDays = normalizeEffectiveDays(trip.confirmedEffectiveDays)
-      if (effectiveDays === null) return null
-      payload.policyConfirmed = true
-      payload.confirmedEffectiveDays = effectiveDays
-      if (trip.tripType === 'internal' && trip.noSubsidyException) {
-        payload.noSubsidyException = true
+    if (requiresPolicyConfirmation.value) payload.policyConfirmed = trip.policyConfirmed
+    return [payload]
+  }
+
+  function syncSubsidyApprovals(
+    approvals: readonly { processInstanceId: string; startDate: string; endDate: string }[],
+  ): void {
+    const previous = new Map(subsidyTrips.value.map((item) => [item.relatedApprovalId, item]))
+    const ordered = [...approvals].sort((left, right) =>
+      left.startDate.localeCompare(right.startDate)
+      || left.endDate.localeCompare(right.endDate)
+      || left.processInstanceId.localeCompare(right.processInstanceId))
+    const lastIndex = ordered.length - 1
+    const nextTrips = ordered.map((approval, index) => {
+      const current = previous.get(approval.processInstanceId)
+      return {
+        relatedApprovalId: approval.processInstanceId,
+        tripType: trip.tripType,
+        startDate: approval.startDate,
+        startTime: current?.startTime ?? (index === 0 ? trip.startTime : '09:00'),
+        endDate: approval.endDate,
+        endTime: current?.endTime ?? (index === lastIndex ? trip.endTime : '18:00'),
+        policyConfirmed: current?.policyConfirmed ?? false,
       }
+    })
+    const changed = JSON.stringify(nextTrips) !== JSON.stringify(subsidyTrips.value)
+    if (changed) subsidyTrips.value = nextTrips
+    if (!nextTrips.length) {
+      if (!changed) return
+      totals.value = null
+      calculatedSignature.value = ''
+      return
     }
-    return payload
+    const first = nextTrips[0]
+    const last = nextTrips.at(-1)
+    trip.startDate = first?.startDate ?? ''
+    trip.startTime = first?.startTime ?? '09:00'
+    trip.endDate = last?.endDate ?? ''
+    trip.endTime = last?.endTime ?? '18:00'
+    if (!changed) return
+    totals.value = null
+    calculatedSignature.value = ''
   }
 
   async function loadCategories(force = false): Promise<boolean> {
@@ -461,8 +518,12 @@ export const useExpenseStore = defineStore('expense', () => {
     const project = draft.input.project
     manualProjectText.value = project?.mode === 'manual' ? project.text : ''
 
-    const persistedTrip = draft.input.editingState?.trip ?? draft.input.trip
-    includeSubsidy.value = draft.input.editingState?.includeSubsidy ?? draft.input.trip !== null
+    const persistedTrips = draft.input.editingState?.trips?.length
+      ? draft.input.editingState.trips
+      : (draft.input.trips?.length ? draft.input.trips : [])
+    const persistedTrip = draft.input.editingState?.trip ?? draft.input.trip ?? persistedTrips[0]
+    includeSubsidy.value = draft.input.editingState?.includeSubsidy
+      ?? Boolean(draft.input.trip || draft.input.trips?.length)
     Object.assign(trip, {
       tripType: persistedTrip?.tripType ?? 'business',
       startDate: persistedTrip?.startDate ?? '',
@@ -473,6 +534,7 @@ export const useExpenseStore = defineStore('expense', () => {
       confirmedEffectiveDays: persistedTrip?.confirmedEffectiveDays ?? '',
       noSubsidyException: persistedTrip?.noSubsidyException ?? false,
     })
+    subsidyTrips.value = persistedTrips.map((item) => ({ ...item }))
 
     const candidates = draftFiles
       .map((file) => ({ file, item: draftOcrExpenseItem(file) }))
@@ -586,11 +648,15 @@ export const useExpenseStore = defineStore('expense', () => {
       : {
           ...draft.totals,
           subsidy: draft.totals.subsidy ? { ...draft.totals.subsidy } : null,
+          subsidies: (draft.totals.subsidies ?? (draft.totals.subsidy ? [draft.totals.subsidy] : []))
+            .map((item) => ({ ...item })),
         }
     calculationError.value = ''
     calculating.value = false
     calculationVersion += 1
-    calculatedSignature.value = recovered.length ? '' : calculationSignature(tripPayload())
+    calculatedSignature.value = recovered.length ? '' : calculationSignature(
+      subsidyTrips.value.length ? tripPayloads() : tripPayload(),
+    )
   }
 
   function removeItem(id: string): void {
@@ -672,12 +738,13 @@ export const useExpenseStore = defineStore('expense', () => {
   }
 
   async function refreshCalculations(): Promise<void> {
-    const payload = tripPayload()
+    const payload = subsidyTrips.value.length ? tripPayloads() : tripPayload()
     const version = ++calculationVersion
     totals.value = null
     calculatedSignature.value = ''
     calculationError.value = includeSubsidy.value ? policyInputError.value : ''
-    if (includeSubsidy.value && !payload) return
+    if (includeSubsidy.value && (policyInputError.value || !payload || (Array.isArray(payload)
+      && payload.length !== subsidyTrips.value.length))) return
     if (itemReadinessError.value) {
       calculationError.value = itemReadinessError.value
       return
@@ -701,8 +768,9 @@ export const useExpenseStore = defineStore('expense', () => {
   }
 
   const calculationsCurrent = computed(() => {
-    const payload = tripPayload()
-    if (includeSubsidy.value && !payload) return false
+    const payload = subsidyTrips.value.length ? tripPayloads() : tripPayload()
+    if (includeSubsidy.value && (policyInputError.value || !payload || (Array.isArray(payload)
+      && payload.length !== subsidyTrips.value.length))) return false
     return Boolean(
       totals.value && calculatedSignature.value === calculationSignature(payload),
     )
@@ -723,7 +791,10 @@ export const useExpenseStore = defineStore('expense', () => {
       return '费用明细中存在不可用类别'
     }
     if (itemReadinessError.value) return itemReadinessError.value
-    if (includeSubsidy.value && !tripPayload()) {
+    const subsidyPayloadCount = tripPayloads().length
+    const expectedSubsidyCount = subsidyTrips.value.length || 1
+    if (includeSubsidy.value && (policyInputError.value
+      || subsidyPayloadCount !== expectedSubsidyCount)) {
       return policyInputError.value || '请完整填写出发和返回日期、时间'
     }
     if (calculating.value) return '正在重新计算，请稍候'
@@ -734,11 +805,12 @@ export const useExpenseStore = defineStore('expense', () => {
 
   function buildExcelPayload(): ExcelGeneratePayload | null {
     const project = projectPayload()
-    const tripValue = tripPayload()
+    const tripValues = tripPayloads()
     if (excelDisabledReason.value || !project) return null
     return {
       project,
-      trip: tripValue,
+      trip: subsidyTrips.value.length ? null : tripValues[0] ?? null,
+      ...(subsidyTrips.value.length ? { trips: tripValues } : {}),
       items: excelExpenseItems(),
     }
   }
@@ -771,6 +843,13 @@ export const useExpenseStore = defineStore('expense', () => {
     trip.policyConfirmed = false
     trip.confirmedEffectiveDays = ''
     trip.noSubsidyException = false
+    subsidyTrips.value = subsidyTrips.value.map((item) => ({
+      ...item,
+      tripType: value,
+      policyConfirmed: false,
+      confirmedEffectiveDays: undefined,
+      noSubsidyException: undefined,
+    }))
     totals.value = null
     calculatedSignature.value = ''
   }
@@ -866,8 +945,9 @@ export const useExpenseStore = defineStore('expense', () => {
       receipt.error = undefined
       receipt.candidate = undefined
     }
-    const tripYear = includeSubsidy.value && /^\d{4}-/.test(trip.startDate)
-      ? Number(trip.startDate.slice(0, 4))
+    const subsidyStartDate = subsidyTrips.value[0]?.startDate ?? trip.startDate
+    const tripYear = includeSubsidy.value && /^\d{4}-/.test(subsidyStartDate)
+      ? Number(subsidyStartDate.slice(0, 4))
       : undefined
     for (const receipt of recognizing) {
       if (!currentReceiptOperation(version)) return
@@ -1037,6 +1117,7 @@ export const useExpenseStore = defineStore('expense', () => {
       confirmedEffectiveDays: '',
       noSubsidyException: false,
     })
+    subsidyTrips.value = []
     items.value = []
     dismissedOcrFileIds.value = []
     includeSubsidy.value = false
@@ -1052,6 +1133,7 @@ export const useExpenseStore = defineStore('expense', () => {
   return {
     manualProjectText,
     trip,
+    subsidyTrips,
     items,
     dismissedOcrFileIds,
     sortedItems,
@@ -1081,6 +1163,8 @@ export const useExpenseStore = defineStore('expense', () => {
     calculationsCurrent,
     excelDisabledReason,
     tripPayload,
+    tripPayloads,
+    syncSubsidyApprovals,
     loadCategories,
     upsertManualItem,
     upsertDraftOcrItem,

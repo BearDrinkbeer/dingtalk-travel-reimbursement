@@ -84,7 +84,6 @@ export interface OaTemplateCatalogInspection {
   configuredConfigVersion: number | null
   reimbursement: OaReimbursementTemplateInspection
   travelProfiles: OaTravelTemplateInspection[]
-  relatedApprovalSmokeTestConfirmed: boolean
 }
 
 export interface OaReimbursementTemplateCatalog {
@@ -113,7 +112,6 @@ export interface OaTemplateCatalog {
   reimbursement: OaReimbursementTemplateCatalog
   travelProfiles: OaTravelTemplateCatalog[]
   allowedTravelProcessCodes: string[]
-  relatedApprovalSmokeTestConfirmed: boolean
   lastCheckedAt: string
   confirmedAt: string
   updatedAt: string
@@ -156,5 +154,4 @@ export interface ConfirmOaTemplateCatalogInput {
   expectedConfigVersion: number | null
   reimbursement: ConfirmOaReimbursementTemplateInput
   travelProfiles: ConfirmOaTravelTemplateInput[]
-  relatedApprovalSmokeTestConfirmed: boolean
 }

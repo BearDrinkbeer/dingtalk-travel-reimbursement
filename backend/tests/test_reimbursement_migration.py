@@ -173,9 +173,7 @@ RELATED_APPROVAL_COLUMNS = {
 _PUBLISHED_0010_FIXTURE = (
     Path(__file__).parent / "fixtures" / "published_20260904_0010.sqlite3.gz.b64"
 )
-_PUBLISHED_0010_DATABASE_SHA256 = (
-    "7b55e6e60154bdfd5725d4016dffa3ebeb520cb0a5d84775c04d85575f30b138"
-)
+_PUBLISHED_0010_DATABASE_SHA256 = "7b55e6e60154bdfd5725d4016dffa3ebeb520cb0a5d84775c04d85575f30b138"
 _SUBMITTED_CHECK_SQL = (
     "status != 'SUBMITTED' OR "
     "(submitted_at IS NOT NULL AND business_id IS NOT NULL AND approval_url IS NOT NULL)"
@@ -584,7 +582,7 @@ def test_reimbursement_migration_upgrade_downgrade_and_reupgrade(
         command.upgrade(config, "head")
         with sqlite3.connect(database_path) as connection:
             assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
-                "20260907_0016",
+                "20260909_0017",
             )
             assert set(EXPECTED_COLUMNS).issubset(table_names(connection))
     finally:
@@ -688,9 +686,19 @@ def test_related_approval_catalog_migration_upgrade_downgrade_and_reupgrade(
         command.upgrade(config, "head")
         with sqlite3.connect(database_path) as connection:
             assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
-                "20260907_0016",
+                "20260909_0017",
             )
             assert "reimbursement_draft_related_approvals" in table_names(connection)
+            profile_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(oa_template_profiles)").fetchall()
+            }
+            assert "related_approval_smoke_test_confirmed" not in profile_columns
+            assert connection.execute(
+                "SELECT process_code, config_version FROM oa_template_profiles "
+                "WHERE profile_key = ?",
+                ("reimbursement",),
+            ).fetchone() == ("PROC-REIMBURSEMENT", 1)
     finally:
         get_settings.cache_clear()
 

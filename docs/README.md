@@ -7,14 +7,12 @@
 
 ## 调研与已完成实验
 
-`research/` 只保存调研结论和复现实验说明，不属于当前默认运行链路：
+`research/` 只保留仍会影响维护、权限或依赖决策的依据，不属于当前运行链路：
 
+- [`research/DINGTALK_APPROVAL_ATTACHMENT_STORAGE_LIFECYCLE.md`](research/DINGTALK_APPROVAL_ATTACHMENT_STORAGE_LIFECYCLE.md)：审批附件归属、引用和清理边界。
+- [`research/DINGTALK_APPROVAL_MUTATION_AND_DRAFT_RESEARCH.md`](research/DINGTALK_APPROVAL_MUTATION_AND_DRAFT_RESEARCH.md)：审批提交后修改能力与本系统草稿方案。
+- [`research/DINGTALK_PERMISSION_CODES.md`](research/DINGTALK_PERMISSION_CODES.md)：生产所需钉钉权限编码。
+- [`research/DINGTALK_RELATED_APPROVAL_RESEARCH.md`](research/DINGTALK_RELATED_APPROVAL_RESEARCH.md)：查询并关联出差审批的接口依据。
 - [`research/FREE_LOCAL_OCR_RESEARCH.md`](research/FREE_LOCAL_OCR_RESEARCH.md)：免费本地 OCR 方案。
-- [`research/MULTIMODAL_SMALL_MODEL_OCR_RESEARCH.md`](research/MULTIMODAL_SMALL_MODEL_OCR_RESEARCH.md)：多模态小模型选型。
-- [`research/PADDLEOCR_VL_RECEIPT_RESEARCH.md`](research/PADDLEOCR_VL_RECEIPT_RESEARCH.md)：PaddleOCR-VL Receipt/0.9B 调研。
-- [`research/PADDLEOCR_VL_16_LOCAL_POC.md`](research/PADDLEOCR_VL_16_LOCAL_POC.md)：PaddleOCR-VL 1.6 本机 PoC 结果。
-- [`research/LOCAL_VLM_RECEIPT_POC.md`](research/LOCAL_VLM_RECEIPT_POC.md)：通用 VLM 对照结果。
-- [`research/PURE_TEXT_RECEIPT_CLASSIFIER_MODEL_RESEARCH.md`](research/PURE_TEXT_RECEIPT_CLASSIFIER_MODEL_RESEARCH.md)：纯文本分类模型调研。
-- [`research/RECEIPT_TEST_DATA_SOURCES.md`](research/RECEIPT_TEST_DATA_SOURCES.md)：非生产测试票据来源与本地目录约定。
-
-对应的一次性评测工具位于 `scripts/research/`。大模型、虚拟环境和下载缓存不属于仓库内容，需要时按调研文档重新准备。
+- [`research/OPENCV5_UPGRADE_ASSESSMENT.md`](research/OPENCV5_UPGRADE_ASSESSMENT.md)：保持 PaddleOCR 所需 OpenCV 版本约束的依据。
+- [`research/PASSENGER_INVOICE_FIELDS_AND_MULTI_TRIP_RESEARCH.md`](research/PASSENGER_INVOICE_FIELDS_AND_MULTI_TRIP_RESEARCH.md)：旅客运输字段与多行程材料判断依据。

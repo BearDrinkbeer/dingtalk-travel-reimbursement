@@ -12,7 +12,6 @@ from app.domain.categories import ExpenseCategory
 from app.domain.expenses import calculate_expense_totals
 from app.domain.material_classification import material_classification
 from app.domain.reimbursement_proofs import payment_proof_required
-from app.domain.subsidy import calculate_subsidy
 from app.integrations.dingtalk.workflow import DingTalkWorkflowClient, FormOption
 from app.models.reimbursement import (
     ReimbursementDraft,
@@ -34,18 +33,21 @@ from app.schemas.reimbursements import (
     ReimbursementDraftInput,
     RelatedApprovalSelectionInput,
 )
-from app.services.application_settings import get_expense_settings
 from app.services.oa_template_profiles import (
     OaTemplateCatalogContract,
     require_submission_ready_catalog,
 )
 from app.services.sessions import CurrentSession, require_selected_department
+from app.services.subsidy_calculation import (
+    calculate_trip_subsidies,
+    request_trips,
+    subsidy_purpose_for_travel_type,
+)
 from app.services.travel_approvals import (
     TravelApprovalQueryWindow,
     TravelApprovalSelection,
     VerifiedTravelSelection,
     reverify_travel_approval_selection,
-    travel_periods_are_contiguous,
 )
 
 _MUTABLE_STATUSES = (
@@ -582,17 +584,22 @@ def require_complete_draft_input(draft_input: ReimbursementDraftInput) -> None:
         raise _not_ready_error("请填写并确认海外票据对应的人民币报销金额")
     state = draft_input.editing_state
     if state is not None:
-        if not state.include_subsidy and draft_input.trip is not None:
+        calculated_trips = request_trips(trip=draft_input.trip, trips=draft_input.trips)
+        if not state.include_subsidy and calculated_trips:
             raise _not_ready_error("出差补助选择已变化，请重新确认")
         if state.include_subsidy:
-            raw = state.trip.model_dump(mode="json", by_alias=True)
-            if not raw.get("confirmedEffectiveDays"):
-                raw.pop("confirmedEffectiveDays", None)
             try:
-                if TripInput.model_validate(raw) != draft_input.trip:
+                editing_trips = state.trips or [state.trip]
+                normalized_editing_trips: list[TripInput] = []
+                for item in editing_trips:
+                    raw = item.model_dump(mode="json", by_alias=True)
+                    if not raw.get("confirmedEffectiveDays"):
+                        raw.pop("confirmedEffectiveDays", None)
+                    normalized_editing_trips.append(TripInput.model_validate(raw))
+                if normalized_editing_trips != calculated_trips:
                     raise ValueError("editing trip differs")
             except ValueError:
-                raise _not_ready_error("请补齐并确认出差补助的日期和时间") from None
+                raise _not_ready_error("请逐项补齐并确认出差补助的日期和时段") from None
 
 
 def validate_draft_file_references(
@@ -825,23 +832,15 @@ def _calculate_input(
     *,
     allow_partial: bool = True,
 ) -> DraftCalculation:
-    subsidy = None
-    if draft_input.trip is not None:
-        settings = get_expense_settings(database)
-        trip_type = draft_input.trip.subsidy_trip_type()
-        try:
-            subsidy = calculate_subsidy(
-                trip_type=trip_type,
-                period=draft_input.trip.as_period(),
-                configured_daily_rate=settings.daily_rate_for(trip_type),
-                policy_confirmed=draft_input.trip.policy_confirmed,
-                confirmed_effective_days=draft_input.trip.confirmed_effective_days,
-                no_subsidy_exception=draft_input.trip.no_subsidy_exception,
-                manual_subsidy_amount=draft_input.trip.manual_subsidy_amount,
-            )
-        except (ApiError, ValueError):
-            if not allow_partial:
-                raise
+    subsidies = []
+    try:
+        subsidies = calculate_trip_subsidies(
+            database,
+            request_trips(trip=draft_input.trip, trips=draft_input.trips),
+        )
+    except (ApiError, ValueError):
+        if not allow_partial:
+            raise
     complete = []
     for item in draft_input.items:
         try:
@@ -851,8 +850,9 @@ def _calculate_input(
         except ValueError:
             if not allow_partial:
                 raise
-    totals = calculate_expense_totals(complete, subsidy).as_api_dict()
-    totals["subsidy"] = subsidy.as_api_dict() if subsidy is not None else None
+    totals = calculate_expense_totals(complete, subsidies).as_api_dict()
+    totals["subsidy"] = subsidies[0].as_api_dict() if len(subsidies) == 1 else None
+    totals["subsidies"] = [item.as_api_dict() for item in subsidies]
     input_data = _canonical_input_data(draft_input)
     return DraftCalculation(
         canonical_json=json.dumps(
@@ -921,6 +921,9 @@ def _locked_draft_calculation(
         if snapshot.subsidy is not None
         else None
     )
+    totals["subsidies"] = [
+        item.model_dump(mode="json", by_alias=True) for item in snapshot.subsidies
+    ]
     return DraftCalculation(
         canonical_json=draft.input_json,
         input_data=_canonical_input_data(stored_input),
@@ -1058,6 +1061,20 @@ def _canonical_input_data(draft_input: ReimbursementDraftInput) -> dict[str, obj
         "items": items,
         "dismissedOcrFileIds": list(draft_input.dismissed_ocr_file_ids),
     }
+    if draft_input.trips:
+        trips = [
+            item.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+                exclude_defaults=True,
+            )
+            for item in draft_input.trips
+        ]
+        for item, value in zip(draft_input.trips, trips, strict=True):
+            value["startTime"] = item.start_time.strftime("%H:%M")
+            value["endTime"] = item.end_time.strftime("%H:%M")
+        result["trips"] = trips
     if draft_input.editing_state is not None:
         result["editingState"] = draft_input.editing_state.model_dump(mode="json", by_alias=True)
     return result
@@ -1265,7 +1282,8 @@ def _validate_related_snapshot(
         raise _corrupted_error()
 
     profiles = {profile.profile_key: profile for profile in catalog.travel_profiles}
-    travel_type_values: set[str] = set()
+    travel_type_options: dict[str, FormOption] = {}
+    travel_type_identities: set[tuple[str, str]] = set()
     for item in related:
         profile = profiles.get(item.travel_profile_key)
         if (
@@ -1276,28 +1294,61 @@ def _validate_related_snapshot(
         ):
             raise _template_changed_error()
         if getattr(profile, "travel_type_mappings", None) is not None:
-            option = profile.travel_type_mappings.get(item.source_travel_type_value)
+            source_type = item.source_travel_type_value
+            option = (
+                profile.travel_type_mappings.get(source_type) if source_type is not None else None
+            )
             if option is None:
                 raise _template_changed_error()
+            travel_type_identities.add(("source", source_type))
         else:
             option = profile.travel_type_option
-        travel_type_values.add(option.value)
-    if len(travel_type_values) != 1:
+            travel_type_identities.add(("target", option.value))
+        travel_type_options[option.value] = option
+    if len(travel_type_options) != 1 or len(travel_type_identities) != 1:
         raise _template_changed_error()
 
     periods = [(item.travel_start_date, item.travel_end_date) for item in related]
-    if not travel_periods_are_contiguous(periods):
-        raise ApiError(
-            "TRAVEL_APPROVAL_DATE_GAP",
-            "所选出差审批日期不连续，只能关联日期相邻或重叠的审批",
-            409,
-        )
     approval_start = min(start for start, _end in periods)
     approval_end = max(end for _start, end in periods)
 
-    if draft_input.trip is not None:
-        reimbursement_start = draft_input.trip.start_date
-        reimbursement_end = draft_input.trip.end_date
+    subsidy_trips = draft_input.trips or (
+        [draft_input.trip] if draft_input.trip is not None else []
+    )
+    selected_travel_type = next(iter(travel_type_options.values()))
+    expected_purpose = subsidy_purpose_for_travel_type(selected_travel_type.label)
+    if subsidy_trips and (
+        expected_purpose is None
+        or any(item.trip_type is not expected_purpose for item in subsidy_trips)
+    ):
+        raise ApiError(
+            "REIMBURSEMENT_SUBSIDY_TRAVEL_TYPE_MISMATCH",
+            "出差补助类别与所选出差审批类别不一致，请刷新后重新确认",
+            409,
+        )
+    if draft_input.trips:
+        related_by_id = {item.process_instance_id: item for item in related}
+        if len(draft_input.trips) != len(related_by_id):
+            raise ApiError(
+                "REIMBURSEMENT_SUBSIDY_APPROVAL_MISMATCH",
+                "每张已关联的出差审批必须对应一个补助项",
+                409,
+            )
+        for trip in draft_input.trips:
+            related_item = related_by_id.get(trip.related_approval_id or "")
+            if (
+                related_item is None
+                or trip.start_date != related_item.travel_start_date
+                or trip.end_date != related_item.travel_end_date
+            ):
+                raise ApiError(
+                    "REIMBURSEMENT_SUBSIDY_APPROVAL_MISMATCH",
+                    "补助项与关联出差审批不一致，请刷新后重新确认",
+                    409,
+                )
+    if subsidy_trips:
+        reimbursement_start = min(item.start_date for item in subsidy_trips)
+        reimbursement_end = max(item.end_date for item in subsidy_trips)
         if approval_start > reimbursement_start or approval_end < reimbursement_end:
             raise ApiError(
                 "REIMBURSEMENT_TRAVEL_DATE_MISMATCH",
@@ -1310,7 +1361,7 @@ def _validate_related_snapshot(
     else:
         return
 
-    if draft_input.trip is None and (
+    if not subsidy_trips and (
         approval_end < reimbursement_start or approval_start > reimbursement_end
     ):
         raise ApiError(

@@ -19,6 +19,7 @@ RUN apt-get update \
         libgl1 \
         libglib2.0-0t64 \
         libgomp1 \
+        fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml uv.lock ./
 ARG INSTALL_OCR=true

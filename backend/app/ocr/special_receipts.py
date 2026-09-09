@@ -221,10 +221,7 @@ class PhysicalTaxiReceiptParser:
                     if (
                         index > 0
                         and re.search(r"[元圆¥￥]", texts[index - 1])
-                        and not (
-                            index > 1
-                            and _TAXI_OTHER_CHARGES.search(texts[index - 2])
-                        )
+                        and not (index > 1 and _TAXI_OTHER_CHARGES.search(texts[index - 2]))
                     ):
                         values.append(texts[index - 1])
                 for value in values:

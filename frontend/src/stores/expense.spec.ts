@@ -108,25 +108,15 @@ vi.mock('@/api/expenses', () => ({
 }))
 
 describe('expense store', () => {
-  it('uses server-calculated overseas subsidy from the configured daily rate', () => {
+  it('does not create a subsidy payload for overseas travel', () => {
     setActivePinia(createPinia())
     const store = useExpenseStore()
     store.setSubsidyIncluded(true)
     store.setTripType('overseas')
     store.trip.startDate = '2026-09-01'
     store.trip.endDate = '2026-09-03'
-    expect(store.tripPayload()).toEqual({
-      tripType: 'overseas', startDate: '2026-09-01', startTime: '09:00',
-      endDate: '2026-09-03', endTime: '18:00',
-    })
-    expect(store.policyInputError).toBe('')
-    store.totals = {
-      expenseTotal: '0.00', subsidyTotal: '360.00', totalAmount: '360.00',
-      receiptCount: 0, uppercaseAmount: '叁佰陆拾元整',
-      subsidy: { tripType: 'overseas', calendarDays: 3, effectiveDays: '3.0', dailyRate: '120.00', total: '360.00' },
-    }
-    expect(store.displaySubsidyTotal).toBe('360.00')
-    expect(store.displayTotal).toBe('360.00')
+    expect(store.tripPayload()).toBeNull()
+    expect(store.policyInputError).toContain('境外出差不申请')
     store.setSubsidyIncluded(false)
     expect(store.tripPayload()).toBeNull()
     expect(store.displaySubsidyTotal).toBe('0.00')
@@ -140,7 +130,7 @@ describe('expense store', () => {
     draft.input.trip = trip
     store.hydrateFromDraft(draft, [])
     expect(store.trip.tripType).toBe('overseas')
-    expect(store.tripPayload()).not.toHaveProperty('manualSubsidyAmount')
+    expect(store.tripPayload()).toBeNull()
     draft.input.trip = null
     draft.input.editingState = { includeSubsidy: false, trip }
     store.hydrateFromDraft(draft, [])
@@ -647,7 +637,7 @@ describe('expense store', () => {
     ])
   })
 
-  it('requires explicit values for special trips but not automatic trips', () => {
+  it('automatically calculates normal trips and only requires same-city confirmation', () => {
     const store = useExpenseStore()
     store.categories = MANUAL_CATEGORIES
     store.setSubsidyIncluded(true)
@@ -686,22 +676,16 @@ describe('expense store', () => {
     expect(store.requiresPolicyConfirmation).toBe(false)
 
     store.setTripType('internal')
-    Object.assign(store.trip, {
-      confirmedEffectiveDays: '366.5',
-      policyConfirmed: true,
-    })
-    expect(store.tripPayload()).toBeNull()
-    expect(store.policyInputError).toContain('0 到 366')
-    Object.assign(store.trip, {
-      confirmedEffectiveDays: '1.5',
-      policyConfirmed: true,
-      noSubsidyException: true,
-    })
     expect(store.tripPayload()).toMatchObject({
       tripType: 'internal',
-      confirmedEffectiveDays: '1.5',
-      noSubsidyException: true,
     })
+
+    store.setTripType('same_city_project')
+    expect(store.tripPayload()).toMatchObject({ tripType: 'same_city_project', policyConfirmed: false })
+    expect(store.policyInputError).toContain('勾选')
+    store.trip.policyConfirmed = true
+    expect(store.tripPayload()).toMatchObject({ tripType: 'same_city_project', policyConfirmed: true })
+    expect(store.policyInputError).toBe('')
   })
 
   it.each([
@@ -855,6 +839,62 @@ describe('expense store', () => {
     store.trip.endDate = '2026-07-08'
     expect(store.calculationsCurrent).toBe(false)
     expect(store.buildExcelPayload()).toBeNull()
+  })
+
+  it('keeps a completed subsidy calculation when unchanged approvals are synchronized again', async () => {
+    vi.mocked(calculateTotals).mockResolvedValue({
+      expenseTotal: '44.89',
+      subsidyTotal: '800.00',
+      totalAmount: '844.89',
+      receiptCount: 1,
+      uppercaseAmount: '捌佰肆拾肆元捌角玖分',
+      subsidy: null,
+      subsidies: [
+        {
+          relatedApprovalId: 'approval-1',
+          tripType: 'business',
+          calendarDays: 4,
+          effectiveDays: '4.0',
+          dailyRate: '100.00',
+          total: '400.00',
+        },
+        {
+          relatedApprovalId: 'approval-2',
+          tripType: 'business',
+          calendarDays: 4,
+          effectiveDays: '4.0',
+          dailyRate: '100.00',
+          total: '400.00',
+        },
+      ],
+    })
+    const approvals = [
+      { processInstanceId: 'approval-1', startDate: '2026-06-30', endDate: '2026-07-03' },
+      { processInstanceId: 'approval-2', startDate: '2026-07-04', endDate: '2026-07-07' },
+    ]
+    const store = useExpenseStore()
+    store.categories = MANUAL_CATEGORIES
+    store.manualProjectText = 'P-007 测试项目'
+    store.syncSubsidyApprovals(approvals)
+    store.setSubsidyIncluded(true)
+    store.upsertManualItem({
+      category: 'local_transport',
+      date: '2026-07-01',
+      displayDate: '2026-07-01',
+      description: '市内交通',
+      amount: '44.89',
+      receiptCount: 1,
+    })
+    await store.refreshCalculations()
+
+    expect(store.calculationsCurrent).toBe(true)
+    expect(store.buildExcelPayload()).not.toBeNull()
+
+    store.syncSubsidyApprovals(approvals.map((approval) => ({ ...approval })))
+
+    expect(store.calculationsCurrent).toBe(true)
+    expect(store.displaySubsidyTotal).toBe('800.00')
+    expect(store.buildExcelPayload()).not.toBeNull()
   })
 
   it('does not require a trip when subsidy is not selected', async () => {

@@ -33,6 +33,9 @@ class TripInput(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     trip_type: TripPurpose = Field(alias="tripType")
+    related_approval_id: str | None = Field(
+        default=None, alias="relatedApprovalId", min_length=1, max_length=128
+    )
     start_date: StrictCalendarDate = Field(alias="startDate")
     start_time: MinuteTime = Field(alias="startTime")
     end_date: StrictCalendarDate = Field(alias="endDate")
@@ -46,7 +49,10 @@ class TripInput(BaseModel):
     )
     no_subsidy_exception: bool = Field(default=False, alias="noSubsidyException")
     manual_subsidy_amount: DecimalString | None = Field(
-        default=None, alias="manualSubsidyAmount", ge=0, le=MAX_REIMBURSEMENT_AMOUNT,
+        default=None,
+        alias="manualSubsidyAmount",
+        ge=0,
+        le=MAX_REIMBURSEMENT_AMOUNT,
         exclude_if=lambda value: value is None,
     )
 
@@ -136,7 +142,19 @@ class TotalsRequest(BaseModel):
 
     # A missing trip means this reimbursement does not claim travel subsidy.
     trip: TripInput | None = None
+    trips: list[TripInput] = Field(default_factory=list, max_length=20)
     items: list[ExpenseItem] = Field(max_length=MAX_EXPENSE_ITEMS_HARD_LIMIT)
+
+    @model_validator(mode="after")
+    def reject_mixed_trip_shapes(self) -> TotalsRequest:
+        if self.trip is not None and self.trips:
+            raise ValueError("use either trip or trips")
+        ids = [item.related_approval_id for item in self.trips]
+        if any(value is None for value in ids) or len(ids) != len(set(ids)):
+            raise ValueError("trips require unique relatedApprovalId values")
+        if any(item.trip_type is TripPurpose.OVERSEAS for item in self.trips):
+            raise ValueError("overseas approvals do not create subsidy trips")
+        return self
 
     @field_validator("items")
     @classmethod

@@ -182,6 +182,7 @@ def test_options_returns_only_confirmed_exact_catalog_options(monkeypatch) -> No
                     "label": "市外项目出差（短期）",
                     "key": "travel-domestic",
                 },
+                "subsidyTripType": "project",
             }
         ],
     }
@@ -226,6 +227,7 @@ def test_travel_list_ignores_claimed_identity_and_process_code(monkeypatch) -> N
                 "label": "市外项目出差（短期）",
                 "key": "travel-domestic",
             },
+            "subsidyTripType": "project",
             "title": "本人 TARGET 境内出差申请",
             "businessId": "TARGET-2026-001",
             "startDate": "2026-08-10",

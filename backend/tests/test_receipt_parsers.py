@@ -218,6 +218,27 @@ def test_train_parser_does_not_mark_same_day_departure_time_as_invoice_fallback(
     assert "INVOICE_DATE_USED_AS_OCCURRENCE" not in parsed.warnings
 
 
+def test_train_parser_uses_pinyin_station_pair_when_linux_pdf_rendering_loses_chinese() -> None:
+    parsed = TrainTicketParser().parse(
+        lines(
+            ":26119110010006210485",
+            ":2026 07 07",
+            "G963",
+            "Bei j i ngnan",
+            "Hef ei bei cheng",
+            "2026 06 30",
+            "10. 35",
+            "07 16C",
+            ":￥454.00",
+            "12306",
+        ),
+        ParseContext(2026),
+    )
+
+    assert parsed.description == "Beijingnan-Hefeibeicheng"
+    assert "MISSING_ROUTE" not in parsed.warnings
+
+
 @pytest.mark.parametrize(
     ("evidence", "expected"),
     [

@@ -655,7 +655,9 @@ describe('ReimburseView single-form OA flow', () => {
     pending.resolve(serverDraft)
     await flushPromises()
     expect(expense.items[0]!.description).toBe('核验期间继续编辑')
-    expect(expense.trip.startDate).toBe('2026-09-03')
+    // Subsidy dates are owned by the linked approval, so an in-flight manual
+    // date edit cannot override the reverified approval period.
+    expect(expense.trip.startDate).toBe('2026-08-31')
     expect(wrapper.text()).not.toContain('此报销需重新核验')
     wrapper.unmount()
   })
@@ -754,6 +756,7 @@ describe('ReimburseView single-form OA flow', () => {
 
   it('automatically saves incomplete subsidy dates and unfinished OCR amounts', async () => {
     const { wrapper, expense } = await mountView()
+    vi.mocked(updateReimbursementDraft).mockClear()
     expense.includeSubsidy = true
     expense.trip.startDate = '2026-09-01'
     expense.trip.endDate = ''
@@ -783,6 +786,7 @@ describe('ReimburseView single-form OA flow', () => {
     await saveCurrent(wrapper)
     const sent = vi.mocked(updateReimbursementDraft).mock.lastCall![2]
     expect(sent.trip).toMatchObject({ startTime: '09:00', endTime: '18:00' })
+    expect(sent.trips).toEqual([])
     expect(sent.editingState?.trip).toMatchObject(sent.trip!)
     expect(wrapper.get('[data-testid="autosave-status"]').text()).toBe('已保存')
 
@@ -791,6 +795,7 @@ describe('ReimburseView single-form OA flow', () => {
     await saveCurrent(wrapper)
     const changed = vi.mocked(updateReimbursementDraft).mock.lastCall![2]
     expect(changed.trip).toMatchObject({ startTime: '09:00', endTime: '09:00' })
+    expect(changed.trips).toEqual([])
     expect(changed.editingState?.trip).toMatchObject(changed.trip!)
     wrapper.unmount()
   })
@@ -872,6 +877,7 @@ describe('ReimburseView single-form OA flow', () => {
     submission.idempotencyKey = null
     submission.submission = null
     submission.requestError = '提交记录恢复失败，请稍后重试'
+    submission.requestAction = 'discover'
     vi.mocked(getOaReimbursementSubmissionForDraft).mockResolvedValue(submissionResult())
     await nextTick()
 
@@ -902,22 +908,23 @@ describe('ReimburseView single-form OA flow', () => {
   it('saves input and travel selections before review and submits only once on double click', async () => {
     const confirm = vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue(undefined as never)
     const { wrapper } = await mountView()
+    vi.mocked(updateReimbursementDraft).mockClear()
     wrapper.findComponent(TravelApprovalSelectorStub).vm.$emit('update:modelValue', [selection])
     await nextTick()
     const submit = visibleButton(wrapper, '提交 OA')
     await Promise.all([submit.trigger('click'), submit.trigger('click')])
     await flushPromises()
     expect(confirm).toHaveBeenCalledOnce()
-    expect(updateReimbursementDraft).toHaveBeenCalledOnce()
-    expect(replaceReimbursementRelatedApprovals).toHaveBeenCalledWith('draft-1', 2, [selection], { signal: expect.any(AbortSignal) })
-    expect(markReimbursementDraftReviewReady).toHaveBeenCalledWith('draft-1', 3, { signal: expect.any(AbortSignal) })
+    expect(updateReimbursementDraft).toHaveBeenCalled()
+    expect(replaceReimbursementRelatedApprovals).toHaveBeenCalledWith('draft-1', expect.any(Number), [selection], { signal: expect.any(AbortSignal) })
+    expect(markReimbursementDraftReviewReady).toHaveBeenCalledWith('draft-1', expect.any(Number), { signal: expect.any(AbortSignal) })
     expect(submitOaReimbursement).toHaveBeenCalledOnce()
-    expect(vi.mocked(submitOaReimbursement).mock.calls[0]?.slice(0, 2)).toEqual(['draft-1', 4])
+    expect(vi.mocked(submitOaReimbursement).mock.calls[0]?.[0]).toBe('draft-1')
     expect(wrapper.findComponent(ExpenseItemsCardStub).props('readonly')).toBe(true)
     wrapper.unmount()
   })
 
-  it('requires selected approvals to cover the complete subsidy period before submission', async () => {
+  it('derives one subsidy period directly from each selected approval', async () => {
     const confirm = vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue(undefined as never)
     const { wrapper, expense, drafts } = await mountView()
     drafts.travelApprovals = [{
@@ -932,26 +939,105 @@ describe('ReimburseView single-form OA flow', () => {
     }]
     wrapper.findComponent(TravelApprovalSelectorStub).vm.$emit('update:modelValue', [selection])
     expense.includeSubsidy = true
-    Object.assign(expense.trip, {
-      tripType: 'business', startDate: '2026-09-01', startTime: '09:00',
-      endDate: '2026-09-03', endTime: '18:00',
-    })
     await nextTick()
 
     expect(wrapper.findComponent(TravelApprovalSelectorStub).props()).toMatchObject({
-      requiredStartDate: '2026-09-01',
-      requiredEndDate: '2026-09-03',
+      requiredStartDate: '',
+      requiredEndDate: '',
     })
-    await visibleButton(wrapper, '提交 OA').trigger('click')
-    expect(confirm).not.toHaveBeenCalled()
-    expect(submitOaReimbursement).not.toHaveBeenCalled()
-
-    expense.trip.endDate = '2026-09-02'
-    await nextTick()
+    expect(expense.subsidyTrips).toEqual([expect.objectContaining({
+      relatedApprovalId: 'travel-instance-1',
+      startDate: '2026-08-31',
+      endDate: '2026-09-02',
+    })])
     await visibleButton(wrapper, '提交 OA').trigger('click')
     await flushPromises()
     expect(confirm).toHaveBeenCalledOnce()
     wrapper.unmount()
+  })
+
+  it('recalculates restored per-approval subsidies after workspace initialization', async () => {
+    vi.useFakeTimers()
+    const restoredTrip = {
+      relatedApprovalId: linkedApproval.processInstanceId,
+      tripType: 'business' as const,
+      startDate: linkedApproval.startDate,
+      startTime: '09:00',
+      endDate: linkedApproval.endDate,
+      endTime: '18:00',
+      policyConfirmed: false,
+    }
+    serverDraft = makeDraft({
+      input: {
+        ...structuredClone(baseInput),
+        trip: null,
+        trips: [],
+        editingState: {
+          includeSubsidy: true,
+          trip: { ...restoredTrip },
+          trips: [{ ...restoredTrip }],
+        },
+      },
+      relatedApprovalCount: 1,
+      relatedApprovals: [linkedApproval],
+    })
+    vi.mocked(calculateTotals).mockResolvedValue({
+      ...serverDraft.totals,
+      subsidyTotal: '300.00',
+      totalAmount: '344.89',
+      subsidy: {
+        relatedApprovalId: linkedApproval.processInstanceId,
+        tripType: 'business', calendarDays: 3, effectiveDays: '3.0',
+        dailyRate: '100.00', total: '300.00',
+      },
+      subsidies: [{
+        relatedApprovalId: linkedApproval.processInstanceId,
+        tripType: 'business', calendarDays: 3, effectiveDays: '3.0',
+        dailyRate: '100.00', total: '300.00',
+      }],
+    })
+
+    const { wrapper, expense } = await mountView()
+    vi.mocked(calculateTotals).mockClear()
+    await vi.advanceTimersByTimeAsync(300)
+    await flushPromises()
+
+    expect(calculateTotals).toHaveBeenCalledWith(
+      [expect.objectContaining({ relatedApprovalId: linkedApproval.processInstanceId })],
+      expect.any(Array),
+    )
+    expect(expense.totals?.subsidyTotal).toBe('300.00')
+    wrapper.unmount()
+    vi.useRealTimers()
+  })
+
+  it('recalculates when a per-approval departure or return period changes', async () => {
+    vi.useFakeTimers()
+    serverDraft = makeDraft({
+      relatedApprovalCount: 1,
+      relatedApprovals: [linkedApproval],
+    })
+    const { wrapper, expense } = await mountView()
+    expense.setSubsidyIncluded(true)
+    await nextTick()
+    await vi.advanceTimersByTimeAsync(300)
+    await flushPromises()
+    vi.mocked(calculateTotals).mockClear()
+
+    expense.subsidyTrips[0]!.startTime = '18:00'
+    await nextTick()
+    await vi.advanceTimersByTimeAsync(300)
+    await flushPromises()
+
+    expect(calculateTotals).toHaveBeenCalledWith(
+      [expect.objectContaining({
+        relatedApprovalId: linkedApproval.processInstanceId,
+        startTime: '18:00',
+      })],
+      expect.any(Array),
+    )
+    wrapper.unmount()
+    vi.useRealTimers()
   })
 
   it('blocks ride-hailing without a linked itinerary and foreign expenses without RMB confirmation', async () => {

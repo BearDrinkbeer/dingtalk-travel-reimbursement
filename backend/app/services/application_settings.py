@@ -30,7 +30,6 @@ RATE_KEYS: dict[TripType, str] = {
     TripType.LONG_TERM_PROJECT: "subsidy_long_term_project_per_day",
     TripType.SAME_CITY_PROJECT: "subsidy_same_city_project_per_day",
     TripType.INTERNAL: "subsidy_internal_per_day",
-    TripType.OVERSEAS: "subsidy_overseas_per_day",
 }
 DEFAULT_RATES: dict[TripType, Decimal] = {
     TripType.BUSINESS: Decimal("100.00"),
@@ -38,7 +37,6 @@ DEFAULT_RATES: dict[TripType, Decimal] = {
     TripType.LONG_TERM_PROJECT: Decimal("150.00"),
     TripType.SAME_CITY_PROJECT: Decimal("50.00"),
     TripType.INTERNAL: Decimal("100.00"),
-    TripType.OVERSEAS: Decimal("0.00"),
 }
 
 
@@ -141,12 +139,7 @@ def _validated_rate(row: Setting, key: str, *, allow_zero: bool = False) -> Deci
 
 def get_expense_settings(database: Session) -> ExpenseSettings:
     rows = ensure_expense_setting_rows(database)
-    rates = {
-        trip_type: _validated_rate(
-            rows[key], key, allow_zero=trip_type is TripType.OVERSEAS
-        )
-        for trip_type, key in RATE_KEYS.items()
-    }
+    rates = {trip_type: _validated_rate(rows[key], key) for trip_type, key in RATE_KEYS.items()}
     mode = rows[CALCULATION_MODE_KEY]
     if mode.value != DEFAULT_CALCULATION_MODE:
         raise _configuration_error(CALCULATION_MODE_KEY)
@@ -174,10 +167,7 @@ def get_additional_admin_ids(database: Session) -> frozenset[str]:
             raise ValueError
         normalized = tuple(str(value).strip() for value in values)
         if any(
-            not value
-            or len(value) > 128
-            or "," in value
-            or any(ord(char) < 33 for char in value)
+            not value or len(value) > 128 or "," in value or any(ord(char) < 33 for char in value)
             for value in normalized
         ):
             raise ValueError

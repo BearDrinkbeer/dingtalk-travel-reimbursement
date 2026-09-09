@@ -26,6 +26,9 @@ class ReimbursementEditingTripInput(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     trip_type: TripPurpose = Field(alias="tripType")
+    related_approval_id: str | None = Field(
+        default=None, alias="relatedApprovalId", min_length=1, max_length=128
+    )
     start_date: str = Field(default="", alias="startDate", max_length=10)
     start_time: str = Field(default="", alias="startTime", max_length=5)
     end_date: str = Field(default="", alias="endDate", max_length=10)
@@ -46,6 +49,7 @@ class ReimbursementEditingStateInput(BaseModel):
 
     include_subsidy: bool = Field(alias="includeSubsidy")
     trip: ReimbursementEditingTripInput
+    trips: list[ReimbursementEditingTripInput] = Field(default_factory=list, max_length=20)
 
 
 class ReimbursementDraftExpenseItemInput(BaseModel):

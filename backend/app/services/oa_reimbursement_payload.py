@@ -78,9 +78,12 @@ from app.services.reimbursement_staging import (
     ReimbursementStaging,
     ReimbursementStagingError,
 )
-from app.services.travel_approvals import travel_periods_are_contiguous
+from app.services.subsidy_calculation import (
+    merge_overlapping_subsidy_trips,
+    subsidy_purpose_for_travel_type,
+)
 
-SNAPSHOT_VERSION = 5
+SNAPSHOT_VERSION = 6
 _MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
 _SIGNED_INT64_MAX = 9_223_372_036_854_775_807
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -185,6 +188,7 @@ class SnapshotProject(_SnapshotModel):
 
 class SnapshotTrip(_SnapshotModel):
     trip_type: TripPurpose
+    related_approval_id: ShortText | None = None
     start_date: StrictCalendarDate
     start_time: MinuteTime
     end_date: StrictCalendarDate
@@ -234,6 +238,7 @@ class SnapshotInput(_SnapshotModel):
     budget_code_value: LongText
     project: SnapshotProject
     trip: SnapshotTrip | None
+    trips: tuple[SnapshotTrip, ...] = ()
     items: tuple[SnapshotExpenseItem, ...]
     dismissed_ocr_file_ids: tuple[
         Annotated[str, StringConstraints(min_length=1, max_length=36)], ...
@@ -258,6 +263,7 @@ class SnapshotSubsidy(_SnapshotModel):
     effective_days: DecimalString
     daily_rate: DecimalString
     total: DecimalString
+    related_approval_id: ShortText | None = None
 
 
 class SnapshotTotals(_SnapshotModel):
@@ -329,7 +335,7 @@ class SnapshotFormValue(_SnapshotModel):
 
 
 class ReimbursementSnapshot(_SnapshotModel):
-    snapshot_version: Literal[1, 2, 3, 4, 5] = SNAPSHOT_VERSION
+    snapshot_version: Literal[1, 2, 3, 4, 5, 6] = SNAPSHOT_VERSION
     draft_id: Annotated[str, StringConstraints(min_length=1, max_length=36)]
     draft_revision: PositiveInt
     identity: SnapshotIdentity
@@ -337,6 +343,7 @@ class ReimbursementSnapshot(_SnapshotModel):
     selections: SnapshotSelections
     input: SnapshotInput
     subsidy: SnapshotSubsidy | None
+    subsidies: tuple[SnapshotSubsidy, ...] = ()
     totals: SnapshotTotals
     travel_period: SnapshotTravelPeriod
     related_approvals: tuple[SnapshotRelatedApproval, ...]
@@ -404,8 +411,10 @@ class ExcelGenerationInput:
     department_name: str
     project: ResolvedProject
     trip: TripInput | None
+    trips: tuple[TripInput, ...]
     items: tuple[ExcelExpenseItemInput, ...]
     subsidy: SubsidyCalculation | None
+    subsidies: tuple[SubsidyCalculation, ...]
     totals: ExpenseTotals
 
 
@@ -588,6 +597,9 @@ def build_snapshot(source: SnapshotSource) -> ReimbursementSnapshot:
         travel_type = _travel_type_option(source.catalog, source.related_approvals)
         start_date = min(item.start_date for item in source.related_approvals)
         end_date = max(item.end_date for item in source.related_approvals)
+        # DingTalk exposes one reimbursement date range.  It therefore records
+        # the complete earliest-to-latest span, while subsidy calculation keeps
+        # using the separately persisted real approval periods and excludes gaps.
         duration_days = (end_date - start_date).days + 1
         template = _snapshot_template(source.catalog)
         project = SnapshotProject(
@@ -596,9 +608,13 @@ def build_snapshot(source: SnapshotSource) -> ReimbursementSnapshot:
             display_text=budget.label,
             filename_component=sanitize_filename_component(budget.label),
         )
-        trip = _snapshot_trip(source.draft_input)
+        trip = _snapshot_trip(source.draft_input.trip)
+        trips = tuple(_snapshot_trip(item) for item in source.draft_input.trips)
         items = tuple(_snapshot_expense_item(item) for item in source.draft_input.items)
         subsidy = _snapshot_subsidy(source.totals_data.get("subsidy"))
+        subsidies = tuple(
+            _snapshot_subsidy(item) for item in source.totals_data.get("subsidies", [])
+        )
         totals = _snapshot_totals(source.totals_data)
         related = tuple(_snapshot_related(item) for item in source.related_approvals)
         originals = tuple(_snapshot_original(item) for item in source.original_files)
@@ -618,6 +634,7 @@ def build_snapshot(source: SnapshotSource) -> ReimbursementSnapshot:
             duration_days=duration_days,
             items=items,
             subsidy=subsidy,
+            subsidies=subsidies,
             totals=totals,
             related=related,
         )
@@ -637,10 +654,12 @@ def build_snapshot(source: SnapshotSource) -> ReimbursementSnapshot:
                 budget_code_value=source.draft_input.budget_code_value,
                 project=project,
                 trip=trip,
+                trips=trips,
                 items=items,
                 dismissed_ocr_file_ids=tuple(source.draft_input.dismissed_ocr_file_ids),
             ),
             subsidy=subsidy,
+            subsidies=subsidies,
             totals=totals,
             travel_period=SnapshotTravelPeriod(
                 start_date=start_date,
@@ -665,6 +684,13 @@ def serialize_snapshot(snapshot: ReimbursementSnapshot) -> str:
             profile.pop("travelTypeMappings", None)
         for related in value["relatedApprovals"]:
             related.pop("sourceTravelTypeValue", None)
+    if snapshot.snapshot_version < 6:
+        value["input"].pop("trips", None)
+        value.pop("subsidies", None)
+        if value["input"].get("trip"):
+            value["input"]["trip"].pop("relatedApprovalId", None)
+        if value.get("subsidy"):
+            value["subsidy"].pop("relatedApprovalId", None)
     if snapshot.snapshot_version < 4:
         for item in value["input"]["items"]:
             item.pop("hotelBillFileIds", None)
@@ -750,7 +776,11 @@ def snapshot_excel_input(snapshot: ReimbursementSnapshot) -> ExcelGenerationInpu
     snapshot = _require_snapshot(snapshot)
     request = draft_input_from_snapshot(snapshot)
     subsidy = _subsidy_from_snapshot(snapshot.subsidy)
+    subsidies = tuple(_subsidy_from_snapshot(item) for item in snapshot.subsidies)
     totals = _totals_from_snapshot(snapshot.totals)
+    output_trips = merge_overlapping_subsidy_trips(
+        request.trips or ([request.trip] if request.trip is not None else [])
+    )
     return ExcelGenerationInput(
         employee_name=snapshot.identity.name,
         department_name=snapshot.identity.department_name,
@@ -758,9 +788,11 @@ def snapshot_excel_input(snapshot: ReimbursementSnapshot) -> ExcelGenerationInpu
             display_text=snapshot.input.project.display_text,
             filename_component=snapshot.input.project.filename_component,
         ),
-        trip=request.trip,
+        trip=output_trips[0] if request.trip is not None and output_trips else None,
+        trips=tuple(output_trips) if request.trips else (),
         items=tuple(complete_expense_items(request)),
         subsidy=subsidy,
+        subsidies=tuple(item for item in subsidies if item is not None),
         totals=totals,
     )
 
@@ -965,7 +997,8 @@ def _validate_related_sources(
     if stored_ids != ids or len(ids) != len(set(ids)):
         raise _snapshot_error("关联审批数据损坏，请重新选择")
     profiles = {item.profile_key: item for item in catalog.travel_profiles}
-    travel_types: set[str] = set()
+    travel_type_options: dict[str, FormOption] = {}
+    travel_type_identities: set[tuple[str, str]] = set()
     for item in related:
         profile = profiles.get(item.profile_key)
         if (
@@ -977,21 +1010,44 @@ def _validate_related_sources(
             or item.listed_to_ms < item.listed_from_ms
         ):
             raise _snapshot_error("关联审批或模板已经变化，请重新选择")
-        travel_types.add(_profile_selected_type(profile, item.source_travel_type_value).value)
-    if len(travel_types) != 1:
+        option = _profile_selected_type(profile, item.source_travel_type_value)
+        travel_type_options[option.value] = option
+        if profile.travel_type_mappings is not None:
+            if item.source_travel_type_value is None:
+                raise _snapshot_error("关联审批的来源出差类别缺失，请重新选择")
+            travel_type_identities.add(("source", item.source_travel_type_value))
+        else:
+            travel_type_identities.add(("target", option.value))
+    if len(travel_type_options) != 1 or len(travel_type_identities) != 1:
         raise _snapshot_error("关联的出差审批类别不一致，请重新选择")
     periods = [(item.start_date, item.end_date) for item in related]
-    if not travel_periods_are_contiguous(periods):
-        raise ApiError(
-            "TRAVEL_APPROVAL_DATE_GAP",
-            "所选出差审批日期不连续，只能关联日期相邻或重叠的审批",
-            409,
-        )
     approval_start = min(start for start, _end in periods)
     approval_end = max(end for _start, end in periods)
-    if draft_input.trip is not None:
-        reimbursement_start = draft_input.trip.start_date
-        reimbursement_end = draft_input.trip.end_date
+    subsidy_trips = draft_input.trips or (
+        [draft_input.trip] if draft_input.trip is not None else []
+    )
+    selected_travel_type = next(iter(travel_type_options.values()))
+    expected_purpose = subsidy_purpose_for_travel_type(selected_travel_type.label)
+    if subsidy_trips and (
+        expected_purpose is None
+        or any(item.trip_type is not expected_purpose for item in subsidy_trips)
+    ):
+        raise _snapshot_error("出差补助类别与所选出差审批类别不一致，请重新确认")
+    if draft_input.trips:
+        related_by_id = {item.process_instance_id: item for item in related}
+        if len(draft_input.trips) != len(related_by_id):
+            raise _snapshot_error("每张已关联的出差审批必须对应一个补助项")
+        for trip in draft_input.trips:
+            related_item = related_by_id.get(trip.related_approval_id or "")
+            if (
+                related_item is None
+                or trip.start_date != related_item.start_date
+                or trip.end_date != related_item.end_date
+            ):
+                raise _snapshot_error("补助项与关联出差审批不一致，请重新确认")
+    if subsidy_trips:
+        reimbursement_start = min(item.start_date for item in subsidy_trips)
+        reimbursement_end = max(item.end_date for item in subsidy_trips)
         if approval_start > reimbursement_start or approval_end < reimbursement_end:
             raise ApiError(
                 "REIMBURSEMENT_TRAVEL_DATE_MISMATCH",
@@ -1003,7 +1059,7 @@ def _validate_related_sources(
         reimbursement_end = max(item.date for item in draft_input.items)
     else:
         return
-    if draft_input.trip is None and (
+    if not subsidy_trips and (
         approval_end < reimbursement_start or approval_start > reimbursement_end
     ):
         raise ApiError(
@@ -1067,12 +1123,12 @@ def _snapshot_template(catalog: OaTemplateCatalogContract) -> SnapshotTemplate:
     )
 
 
-def _snapshot_trip(draft_input: ReimbursementDraftInput) -> SnapshotTrip | None:
-    trip = draft_input.trip
+def _snapshot_trip(trip: TripInput | None) -> SnapshotTrip | None:
     if trip is None:
         return None
     return SnapshotTrip(
         trip_type=trip.trip_type,
+        related_approval_id=trip.related_approval_id,
         start_date=trip.start_date,
         start_time=trip.start_time,
         end_date=trip.end_date,
@@ -1118,7 +1174,7 @@ def _snapshot_subsidy(value: object) -> SnapshotSubsidy | None:
 
 def _snapshot_totals(value: dict[str, object]) -> SnapshotTotals:
     return SnapshotTotals.model_validate(
-        {key: item for key, item in value.items() if key != "subsidy"}
+        {key: item for key, item in value.items() if key not in {"subsidy", "subsidies"}}
     )
 
 
@@ -1226,6 +1282,7 @@ def _snapshot_form_values(
     duration_days: int,
     items: tuple[SnapshotExpenseItem, ...],
     subsidy: SnapshotSubsidy | None,
+    subsidies: tuple[SnapshotSubsidy, ...] = (),
     totals: SnapshotTotals,
     related: tuple[SnapshotRelatedApproval, ...],
 ) -> tuple[SnapshotFormValue, ...]:
@@ -1237,7 +1294,7 @@ def _snapshot_form_values(
         start_date.isoformat(),
         end_date.isoformat(),
         str(duration_days),
-        _description_v1(items, subsidy, totals),
+        _description_v1(items, subsidy, totals, subsidies),
         money_string(totals.total_amount),
         related_value,
     )
@@ -1251,16 +1308,18 @@ def _description_v1(
     items: tuple[SnapshotExpenseItem, ...],
     subsidy: SnapshotSubsidy | None,
     totals: SnapshotTotals,
+    subsidies: tuple[SnapshotSubsidy, ...] = (),
 ) -> str:
     lines = [
         f"{item.date.isoformat()} {CATEGORY_BY_ID[item.category].name} "
         f"{item.description}：{money_string(item.amount)}"
         for item in items
     ]
-    if subsidy is not None:
+    calculated = subsidies or ((subsidy,) if subsidy is not None else ())
+    for item in calculated:
         lines.append(
-            f"出差补助：{format(subsidy.effective_days, '.1f')}天 × "
-            f"{money_string(subsidy.daily_rate)} = {money_string(subsidy.total)}"
+            f"出差补助：{format(item.effective_days, '.1f')}天 × "
+            f"{money_string(item.daily_rate)} = {money_string(item.total)}"
         )
     lines.append(f"合计：{money_string(totals.total_amount)}")
     return "\n".join(lines)
@@ -1492,8 +1551,17 @@ def _validate_business_snapshot(snapshot: ReimbursementSnapshot) -> None:
         ):
             raise ValueError("workbook project must match the budget label")
     subsidy = _subsidy_from_snapshot(snapshot.subsidy)
+    subsidies = tuple(
+        item
+        for item in (_subsidy_from_snapshot(value) for value in snapshot.subsidies)
+        if item is not None
+    )
+    calculated_subsidies = subsidies or ((subsidy,) if subsidy is not None else ())
     totals = _totals_from_snapshot(snapshot.totals)
-    expected_totals = calculate_expense_totals(complete_expense_items(request), subsidy)
+    expected_totals = calculate_expense_totals(
+        complete_expense_items(request),
+        calculated_subsidies,
+    )
     if (
         money_string(expected_totals.expense_total) != money_string(totals.expense_total)
         or money_string(expected_totals.subsidy_total) != money_string(totals.subsidy_total)
@@ -1502,20 +1570,19 @@ def _validate_business_snapshot(snapshot: ReimbursementSnapshot) -> None:
         or expected_totals.uppercase_amount != totals.uppercase_amount
     ):
         raise ValueError("snapshot totals mismatch")
-    if subsidy is not None:
-        if request.trip is None:
-            raise ValueError("subsidy requires trip input")
+    subsidy_trips = request.trips or ([request.trip] if request.trip is not None else [])
+    output_trips = merge_overlapping_subsidy_trips(subsidy_trips)
+    if len(calculated_subsidies) != len(output_trips):
+        raise ValueError("trip input requires one subsidy calculation per merged period")
+    for trip_item, subsidy_item in zip(output_trips, calculated_subsidies, strict=True):
         if (
-            subsidy.trip_type != request.trip.subsidy_trip_type()
-            or subsidy.calendar_days != (request.trip.end_date - request.trip.start_date).days + 1
+            subsidy_item.trip_type != trip_item.subsidy_trip_type()
+            or subsidy_item.calendar_days != (trip_item.end_date - trip_item.start_date).days + 1
+            or subsidy_item.related_approval_id != trip_item.related_approval_id
+            or money_string(subsidy_item.effective_days * subsidy_item.daily_rate)
+            != money_string(subsidy_item.total)
         ):
             raise ValueError("snapshot subsidy mismatch")
-        if money_string(subsidy.effective_days * subsidy.daily_rate) != money_string(
-            subsidy.total
-        ):
-            raise ValueError("snapshot subsidy mismatch")
-    elif request.trip is not None:
-        raise ValueError("trip input requires a subsidy calculation")
     start_date = min(item.start_date for item in snapshot.related_approvals)
     end_date = max(item.end_date for item in snapshot.related_approvals)
     if snapshot.travel_period != SnapshotTravelPeriod(
@@ -1524,19 +1591,16 @@ def _validate_business_snapshot(snapshot: ReimbursementSnapshot) -> None:
         duration_days=(end_date - start_date).days + 1,
     ):
         raise ValueError("travel period mismatch")
-    if request.trip is not None:
-        reimbursement_start = request.trip.start_date
-        reimbursement_end = request.trip.end_date
+    if subsidy_trips:
+        reimbursement_start = min(item.start_date for item in subsidy_trips)
+        reimbursement_end = max(item.end_date for item in subsidy_trips)
     elif request.items:
         reimbursement_start = min(item.date for item in request.items)
         reimbursement_end = max(item.date for item in request.items)
     else:
         reimbursement_start = start_date
         reimbursement_end = end_date
-    if any(
-        item.end_date < reimbursement_start or item.start_date > reimbursement_end
-        for item in snapshot.related_approvals
-    ):
+    if end_date < reimbursement_start or start_date > reimbursement_end:
         raise ValueError("related approval date mismatch")
     profiles = {item.profile_key: item for item in snapshot.template.travel_profiles}
     options = []
@@ -1563,6 +1627,7 @@ def _validate_business_snapshot(snapshot: ReimbursementSnapshot) -> None:
         duration_days=snapshot.travel_period.duration_days,
         items=snapshot.input.items,
         subsidy=snapshot.subsidy,
+        subsidies=snapshot.subsidies,
         totals=snapshot.totals,
         related=snapshot.related_approvals,
     )
@@ -1597,6 +1662,14 @@ def draft_input_from_snapshot(snapshot: ReimbursementSnapshot) -> ReimbursementD
         if trip is not None
         else None
     )
+    trips_value = [
+        {
+            **item.model_dump(mode="json", by_alias=True),
+            "startTime": item.start_time.strftime("%H:%M"),
+            "endTime": item.end_time.strftime("%H:%M"),
+        }
+        for item in snapshot.input.trips
+    ]
     return ReimbursementDraftInput.model_validate(
         {
             "ocrDispositionVersion": snapshot.input.ocr_disposition_version,
@@ -1604,6 +1677,7 @@ def draft_input_from_snapshot(snapshot: ReimbursementSnapshot) -> ReimbursementD
             "budgetCodeValue": snapshot.input.budget_code_value,
             "project": project_value,
             "trip": trip_value,
+            "trips": trips_value,
             "items": [
                 item.model_dump(mode="json", by_alias=True, exclude_none=True)
                 for item in snapshot.input.items
@@ -1622,6 +1696,7 @@ def _subsidy_from_snapshot(value: SnapshotSubsidy | None) -> SubsidyCalculation 
         effective_days=value.effective_days,
         daily_rate=value.daily_rate,
         total=value.total,
+        related_approval_id=value.related_approval_id,
     )
 
 

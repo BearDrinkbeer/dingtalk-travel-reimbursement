@@ -99,4 +99,16 @@ describe('ExpenseSummaryCard', () => {
     expect(wrapper.text()).toContain('表单有未保存修改')
     wrapper.unmount()
   })
+
+  it('leaves subsidy calculation errors in the subsidy card instead of repeating them here', () => {
+    const expense = useExpenseStore()
+    expense.includeSubsidy = true
+    expense.calculationError = '出差补助金额计算失败，请重试'
+    const wrapper = mount(ExpenseSummaryCard, {
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.text()).not.toContain('出差补助金额计算失败，请重试')
+    wrapper.unmount()
+  })
 })

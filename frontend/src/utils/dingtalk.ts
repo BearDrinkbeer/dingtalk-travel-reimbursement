@@ -17,6 +17,8 @@ interface DingTalkBridge {
   ) => Promise<AuthCodeResult> | AuthCodeResult | void
 }
 
+const AUTH_CODE_TIMEOUT_MS = 8_000
+
 function readableError(error: unknown): Error {
   if (error instanceof Error) return error
   return new Error('无法从钉钉获取免登授权码')
@@ -32,12 +34,14 @@ export async function requestDingTalkAuthCode(corpId: string, clientId: string):
     const succeed = (result: AuthCodeResult) => {
       if (!settled && result?.code) {
         settled = true
+        clearTimeout(timeout)
         resolve(result.code)
       }
     }
     const fail = (error: unknown) => {
       if (!settled) {
         settled = true
+        clearTimeout(timeout)
         reject(readableError(error))
       }
     }
@@ -59,6 +63,10 @@ export async function requestDingTalkAuthCode(corpId: string, clientId: string):
       }
     }
 
+    const timeout = setTimeout(
+      () => fail(new Error('钉钉免登响应超时，请从公司钉钉工作台重新打开本应用')),
+      AUTH_CODE_TIMEOUT_MS,
+    )
     bridge.error?.(fail)
     if (typeof bridge.ready === 'function') bridge.ready(invoke)
     else invoke()

@@ -65,44 +65,25 @@ def test_date_range_rejects_reverse_time_and_date() -> None:
         )
 
 
-@pytest.mark.parametrize(
-    ("trip_type", "trip_period", "configured_rate"),
-    [
-        (
-            TripType.SAME_CITY_PROJECT,
-            period(date(2026, 6, 30), time(9), date(2026, 7, 1), time(18)),
-            Decimal("50.00"),
-        ),
-        (
-            TripType.INTERNAL,
-            period(date(2026, 6, 30), time(9), date(2026, 7, 1), time(18)),
-            Decimal("100.00"),
-        ),
-    ],
-)
-def test_special_trip_requires_explicit_confirmation(
-    trip_type: TripType,
-    trip_period: TripPeriod,
-    configured_rate: Decimal,
-) -> None:
+def test_same_city_requires_confirmation_but_uses_automatic_days() -> None:
+    trip_period = period(date(2026, 6, 30), time(9), date(2026, 7, 1), time(18))
     with pytest.raises(ApiError) as error:
         calculate_subsidy(
-            trip_type=trip_type,
+            trip_type=TripType.SAME_CITY_PROJECT,
             period=trip_period,
-            configured_daily_rate=configured_rate,
+            configured_daily_rate=Decimal("50.00"),
         )
     assert error.value.code == "POLICY_CONFIRMATION_REQUIRED"
 
     result = calculate_subsidy(
-        trip_type=trip_type,
+        trip_type=TripType.SAME_CITY_PROJECT,
         period=trip_period,
-        configured_daily_rate=configured_rate,
+        configured_daily_rate=Decimal("50.00"),
         policy_confirmed=True,
-        confirmed_effective_days=Decimal("1.5"),
     )
-    assert result.effective_days == Decimal("1.5")
-    assert result.daily_rate == configured_rate
-    assert result.total == Decimal("1.5") * configured_rate
+    assert result.effective_days == Decimal("2.0")
+    assert result.daily_rate == Decimal("50.00")
+    assert result.total == Decimal("100.00")
 
 
 def test_long_term_project_uses_automatic_half_day_calculation() -> None:
@@ -373,7 +354,7 @@ def test_special_trip_confirmation_bounds_return_422(
     assert response.json()["error"]["code"] != "INTERNAL_ERROR"
 
 
-def test_special_trip_rejects_effective_days_beyond_trip(client_factory) -> None:
+def test_same_city_rejects_manual_effective_days(client_factory) -> None:
     client = client_factory(auth_mock_enabled=True)
     csrf = mock_login(client)["csrfToken"]
     body = valid_trip() | {
@@ -391,7 +372,7 @@ def test_special_trip_rejects_effective_days_beyond_trip(client_factory) -> None
     )
 
     assert response.status_code == 422, response.text
-    assert response.json()["error"]["code"] == "INVALID_EFFECTIVE_DAYS"
+    assert response.json()["error"]["code"] == "UNEXPECTED_POLICY_OVERRIDE"
 
 
 def test_project_duration_is_classified_as_long_term_by_the_server(client_factory) -> None:
@@ -455,7 +436,7 @@ def test_employee_cannot_choose_project_duration_classification(
     assert response.json()["error"]["code"] == "VALIDATION_ERROR"
 
 
-def test_internal_no_subsidy_exception_is_explicit_and_server_owned(client_factory) -> None:
+def test_internal_rejects_employee_policy_overrides(client_factory) -> None:
     client = client_factory(auth_mock_enabled=True)
     csrf = mock_login(client)["csrfToken"]
     body = valid_trip() | {
@@ -469,18 +450,175 @@ def test_internal_no_subsidy_exception_is_explicit_and_server_owned(client_facto
         json=body,
         headers={"X-CSRF-Token": csrf},
     )
-    assert response.status_code == 200, response.text
-    assert response.json()["data"]["dailyRate"] == "0.00"
-    assert response.json()["data"]["total"] == "0.00"
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "UNEXPECTED_POLICY_OVERRIDE"
 
-    body["tripType"] = "same_city_project"
-    rejected = client.post(
+
+def test_same_city_uses_automatic_days_after_policy_confirmation(client_factory) -> None:
+    client = client_factory(auth_mock_enabled=True)
+    csrf = mock_login(client)["csrfToken"]
+    response = client.post(
         "/api/calculate/subsidy",
-        json=body,
+        json=valid_trip()
+        | {
+            "tripType": "same_city_project",
+            "policyConfirmed": True,
+        },
         headers={"X-CSRF-Token": csrf},
     )
-    assert rejected.status_code == 422
-    assert rejected.json()["error"]["code"] == "INVALID_SUBSIDY_EXCEPTION"
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["effectiveDays"] == "8.0"
+
+
+def test_internal_trip_is_automatic_and_over_thirty_days_has_no_subsidy(client_factory) -> None:
+    client = client_factory(auth_mock_enabled=True)
+    csrf = mock_login(client)["csrfToken"]
+    short = client.post(
+        "/api/calculate/subsidy",
+        json=valid_trip()
+        | {
+            "tripType": "internal",
+            "startDate": "2026-01-01",
+            "endDate": "2026-01-30",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    long = client.post(
+        "/api/calculate/subsidy",
+        json=valid_trip()
+        | {
+            "tripType": "internal",
+            "startDate": "2026-01-01",
+            "endDate": "2026-01-31",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert short.status_code == 200, short.text
+    assert short.json()["data"]["total"] == "3000.00"
+    assert long.status_code == 200, long.text
+    assert long.json()["data"] == {
+        "tripType": "internal",
+        "calendarDays": 31,
+        "effectiveDays": "0.0",
+        "dailyRate": "0.00",
+        "total": "0.00",
+    }
+
+
+def test_totals_support_one_subsidy_item_per_related_trip(client_factory) -> None:
+    client = client_factory(auth_mock_enabled=True)
+    csrf = mock_login(client)["csrfToken"]
+    response = client.post(
+        "/api/calculate/totals",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "trips": [
+                valid_trip()
+                | {
+                    "relatedApprovalId": "approval-1",
+                    "startDate": "2026-06-30",
+                    "endDate": "2026-07-01",
+                },
+                valid_trip()
+                | {
+                    "relatedApprovalId": "approval-2",
+                    "startDate": "2026-07-02",
+                    "endDate": "2026-07-03",
+                },
+            ],
+            "items": [],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["subsidyTotal"] == "400.00"
+    assert [item["relatedApprovalId"] for item in data["subsidies"]] == [
+        "approval-1",
+        "approval-2",
+    ]
+
+
+def test_totals_keep_discontinuous_trips_separate(client_factory) -> None:
+    client = client_factory(auth_mock_enabled=True)
+    csrf = mock_login(client)["csrfToken"]
+    response = client.post(
+        "/api/calculate/totals",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "trips": [
+                valid_trip()
+                | {
+                    "relatedApprovalId": "approval-1",
+                    "startDate": "2026-08-01",
+                    "endDate": "2026-08-02",
+                },
+                valid_trip()
+                | {
+                    "relatedApprovalId": "approval-2",
+                    "startDate": "2026-08-05",
+                    "endDate": "2026-08-06",
+                },
+            ],
+            "items": [],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["subsidyTotal"] == "400.00"
+    assert [item["relatedApprovalId"] for item in data["subsidies"]] == [
+        "approval-1",
+        "approval-2",
+    ]
+
+
+def test_totals_merge_overlapping_and_transitively_overlapping_trips(client_factory) -> None:
+    client = client_factory(auth_mock_enabled=True)
+    csrf = mock_login(client)["csrfToken"]
+    response = client.post(
+        "/api/calculate/totals",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "trips": [
+                valid_trip()
+                | {
+                    "relatedApprovalId": "approval-1",
+                    "startDate": "2026-08-01",
+                    "endDate": "2026-08-03",
+                },
+                valid_trip()
+                | {
+                    "relatedApprovalId": "approval-2",
+                    "startDate": "2026-08-03",
+                    "endDate": "2026-08-05",
+                },
+                valid_trip()
+                | {
+                    "relatedApprovalId": "approval-3",
+                    "startDate": "2026-08-05",
+                    "endDate": "2026-08-07",
+                },
+            ],
+            "items": [],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["subsidyTotal"] == "700.00"
+    assert data["subsidies"] == [
+        {
+            "tripType": "business",
+            "calendarDays": 7,
+            "effectiveDays": "7.0",
+            "dailyRate": "100.00",
+            "total": "700.00",
+            "relatedApprovalId": "approval-1",
+        }
+    ]
 
 
 def test_employee_cannot_submit_a_daily_rate(client_factory) -> None:
@@ -562,6 +700,15 @@ def test_categories_and_totals_api(client_factory) -> None:
             "dailyRate": "100.00",
             "total": "800.00",
         },
+        "subsidies": [
+            {
+                "tripType": "business",
+                "calendarDays": 8,
+                "effectiveDays": "8.0",
+                "dailyRate": "100.00",
+                "total": "800.00",
+            }
+        ],
     }
 
 
@@ -595,6 +742,7 @@ def test_totals_without_trip_do_not_add_subsidy(client_factory) -> None:
         "receiptCount": 1,
         "uppercaseAmount": "壹拾陆元玖角",
         "subsidy": None,
+        "subsidies": [],
     }
 
 

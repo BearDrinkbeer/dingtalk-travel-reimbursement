@@ -7,6 +7,7 @@ import type {
   ReimbursementRelatedApproval,
   ReimbursementRelatedApprovalSelection,
 } from '@/types/reimbursements'
+import { mappedTravelTypeOption } from '@/utils/travelTypes'
 
 const props = withDefaults(defineProps<{
   modelValue: ReimbursementRelatedApprovalSelection[]
@@ -28,11 +29,11 @@ const emit = defineEmits<{
 interface ApprovalRow {
   processInstanceId: string
   profileKey: string
-  profileDisplayName: string
   title: string
   businessId: string
   startDate: string
   endDate: string
+  travelTypeLabel: string
   linkedOnly: boolean
 }
 
@@ -46,21 +47,15 @@ const candidateCache = new Map<string, OaTravelApproval>()
 const selectedIds = computed(() => new Set(
   props.modelValue.map((selection) => selection.processInstanceId),
 ))
-const profileLabels = computed<Record<string, string>>(() => Object.fromEntries(
-  (drafts.reimbursementOptions?.travelProfiles ?? []).map((profile) => [
-    profile.profileKey,
-    profile.displayName,
-  ]),
-))
 const rows = computed<ApprovalRow[]>(() => {
   const result: ApprovalRow[] = drafts.travelApprovals.map((approval) => ({
     processInstanceId: approval.processInstanceId,
     profileKey: approval.profileKey,
-    profileDisplayName: approval.profileDisplayName,
     title: approval.title,
     businessId: approval.businessId,
     startDate: approval.startDate,
     endDate: approval.endDate,
+    travelTypeLabel: approval.travelTypeOption.label,
     linkedOnly: false,
   }))
   const present = new Set(result.map((row) => row.processInstanceId))
@@ -69,11 +64,11 @@ const rows = computed<ApprovalRow[]>(() => {
     result.push({
       processInstanceId: approval.processInstanceId,
       profileKey: approval.profileKey,
-      profileDisplayName: profileLabels.value[approval.profileKey] ?? approval.profileKey,
       title: approval.title,
       businessId: approval.businessId,
       startDate: approval.startDate,
       endDate: approval.endDate,
+      travelTypeLabel: linkedTravelTypeLabel(approval),
       linkedOnly: true,
     })
     present.add(approval.processInstanceId)
@@ -85,16 +80,24 @@ const rows = computed<ApprovalRow[]>(() => {
     result.push({
       processInstanceId: approval.processInstanceId,
       profileKey: approval.profileKey,
-      profileDisplayName: approval.profileDisplayName,
       title: approval.title,
       businessId: approval.businessId,
       startDate: approval.startDate,
       endDate: approval.endDate,
+      travelTypeLabel: approval.travelTypeOption.label,
       linkedOnly: false,
     })
   }
   return result
 })
+
+function linkedTravelTypeLabel(approval: ReimbursementRelatedApproval): string {
+  const profile = drafts.reimbursementOptions?.travelProfiles.find(
+    (item) => item.profileKey === approval.profileKey,
+  )
+  return mappedTravelTypeOption(profile, approval.sourceTravelTypeValue)?.label
+    ?? '出差类别待重新核验'
+}
 
 watch(
   () => drafts.travelApprovals,
@@ -150,16 +153,6 @@ function toggle(row: ApprovalRow, checked: boolean): void {
   if (props.readonly) return
   localError.value = ''
   if (!checked) {
-    const remainingIds = new Set(props.modelValue
-      .filter((selection) => selection.processInstanceId !== row.processInstanceId)
-      .map((selection) => selection.processInstanceId))
-    const remainingPeriods = rows.value
-      .filter((candidate) => remainingIds.has(candidate.processInstanceId))
-      .map((candidate) => [candidate.startDate, candidate.endDate] as const)
-    if (remainingPeriods.length === remainingIds.size && !periodsAreContiguous(remainingPeriods)) {
-      localError.value = '移除后审批日期会中断，请先移除日期位于首尾的审批'
-      return
-    }
     emit(
       'update:modelValue',
       props.modelValue.filter(
@@ -202,35 +195,17 @@ function unavailableReason(row: ApprovalRow): string {
     ? (restoredSource ? profile.travelTypeMappings[restoredSource]?.value : undefined)
     : profile?.travelTypeOption.value
   const travelType = baseline?.travelTypeOption.value ?? restoredType
+  const sourceTravelType = baseline?.sourceTravelTypeValue ?? restoredSource
   if (!baseline && profile?.travelTypeMappings && !restoredType) return '已选审批的出差类别来源失效，请重新选择'
   if (!company || !budget || !travelType) return '请等待已选审批核验完成，或重新查询该审批'
   if (candidate.companyOption.value !== company) return '所属公司与已选审批不同'
   if (candidate.budgetCodeOption.value !== budget) return '预算代码与已选审批不同'
   if (candidate.travelTypeOption.value !== travelType) return '出差类别与已选审批不同'
-  const selectedPeriods = rows.value
-    .filter((candidateRow) => selectedIds.value.has(candidateRow.processInstanceId))
-    .map((candidateRow) => [candidateRow.startDate, candidateRow.endDate] as const)
-  if (selectedPeriods.length === props.modelValue.length
-    && !periodsAreContiguous([...selectedPeriods, [row.startDate, row.endDate]])) {
-    return '审批日期与已选审批不连续'
+  if ((sourceTravelType || candidate.sourceTravelTypeValue)
+    && candidate.sourceTravelTypeValue !== sourceTravelType) {
+    return '出差类别与已选审批不同'
   }
   return ''
-}
-
-function periodsAreContiguous(periods: ReadonlyArray<readonly [string, string]>): boolean {
-  const ordered = [...periods].sort(([left], [right]) => left.localeCompare(right))
-  if (ordered.length < 2) return true
-  let coveredEnd = ordered[0]![1]
-  for (const [start, end] of ordered.slice(1)) {
-    if (calendarDay(start) > calendarDay(coveredEnd) + 1) return false
-    if (end > coveredEnd) coveredEnd = end
-  }
-  return true
-}
-
-function calendarDay(value: string): number {
-  const [year, month, day] = value.split('-').map(Number)
-  return Math.floor(Date.UTC(year!, month! - 1, day!) / 86_400_000)
 }
 
 function accountingLabel(row: ApprovalRow): string {
@@ -250,7 +225,7 @@ function accountingLabel(row: ApprovalRow): string {
         <h2 id="travel-approval-heading">
           关联已通过的出差审批
         </h2>
-        <p>先选本人已通过的审批；可继续关联相同公司、预算和出差类别且日期连续的多张审批。</p>
+        <p>先选本人已通过的审批；可继续关联相同公司、预算和出差类别的多张审批，日期不连续也可以。</p>
       </div>
       <el-tag
         :type="modelValue.length ? 'success' : 'warning'"
@@ -373,7 +348,7 @@ function accountingLabel(row: ApprovalRow): string {
               已关联
             </el-tag>
           </span>
-          <span>{{ row.startDate }} 至 {{ row.endDate }} · {{ row.profileDisplayName }}</span>
+          <span>{{ row.startDate }} 至 {{ row.endDate }} · 出差类别：{{ row.travelTypeLabel }}</span>
           <small>审批编号：{{ row.businessId }}</small>
           <small v-if="accountingLabel(row)">{{ accountingLabel(row) }}</small>
           <small

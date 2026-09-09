@@ -61,6 +61,7 @@ from app.services.oa_template_profiles import (
 )
 from app.services.reimbursement_drafts import DraftActor, validate_and_calculate_input
 from app.services.reimbursement_staging import StagingArea
+from app.services.subsidy_calculation import merge_overlapping_subsidy_trips
 
 
 def _component(
@@ -386,6 +387,10 @@ def test_snapshot_parser_rejects_noncanonical_unknown_version_and_wrong_hash() -
 def test_v1_snapshot_canonical_bytes_and_legacy_attachments_remain_readable() -> None:
     value = json.loads(serialize_snapshot(build_snapshot(_source())))
     value["snapshotVersion"] = 1
+    value["input"].pop("trips", None)
+    value.pop("subsidies", None)
+    value["input"]["trip"].pop("relatedApprovalId", None)
+    value["subsidy"].pop("relatedApprovalId", None)
     for profile in value["template"]["travelProfiles"]:
         profile.pop("companyComponentId", None)
         profile.pop("budgetCodeComponentId", None)
@@ -457,6 +462,10 @@ def test_old_large_receipt_snapshots_remain_readable_without_new_proof_fields(le
     current = build_snapshot(source)
     value = json.loads(serialize_snapshot(current))
     value["snapshotVersion"] = legacy_version
+    value["input"].pop("trips", None)
+    value.pop("subsidies", None)
+    value["input"]["trip"].pop("relatedApprovalId", None)
+    value["subsidy"].pop("relatedApprovalId", None)
     for profile in value["template"]["travelProfiles"]:
         profile.pop("companyComponentId", None)
         profile.pop("budgetCodeComponentId", None)
@@ -673,6 +682,123 @@ def test_builds_all_ten_oa_fields_and_round_trips_exact_request() -> None:
         )
         == command
     )
+
+
+def test_snapshot_counts_discontinuous_days_and_merges_overlapping_subsidies() -> None:
+    base = _source()
+    raw_input = _draft_input(trip=False).model_dump(mode="json", by_alias=True)
+    raw_input["trips"] = [
+        {
+            "tripType": "project",
+            "relatedApprovalId": "travel-instance-1",
+            "startDate": "2026-09-01",
+            "startTime": "09:00",
+            "endDate": "2026-09-03",
+            "endTime": "18:00",
+        },
+        {
+            "tripType": "project",
+            "relatedApprovalId": "travel-instance-2",
+            "startDate": "2026-09-03",
+            "startTime": "09:00",
+            "endDate": "2026-09-05",
+            "endTime": "18:00",
+        },
+        {
+            "tripType": "project",
+            "relatedApprovalId": "travel-instance-3",
+            "startDate": "2026-09-09",
+            "startTime": "09:00",
+            "endDate": "2026-09-10",
+            "endTime": "18:00",
+        },
+    ]
+    draft_input = ReimbursementDraftInput.model_validate(raw_input)
+    output_trips = merge_overlapping_subsidy_trips(draft_input.trips)
+    subsidies = tuple(
+        calculate_subsidy(
+            trip_type=trip.subsidy_trip_type(),
+            period=trip.as_period(),
+            configured_daily_rate=Decimal("180.00"),
+            related_approval_id=trip.related_approval_id,
+        )
+        for trip in output_trips
+    )
+    totals = calculate_expense_totals(draft_input.items, subsidies)
+    totals_data = totals.as_api_dict()
+    totals_data["subsidy"] = None
+    totals_data["subsidies"] = [item.as_api_dict() for item in subsidies]
+    first_related = base.related_approvals[0]
+    related = (
+        first_related,
+        replace(
+            first_related,
+            sort_order=1,
+            process_instance_id="travel-instance-2",
+            start_date=date(2026, 9, 3),
+            end_date=date(2026, 9, 5),
+        ),
+        replace(
+            first_related,
+            sort_order=2,
+            process_instance_id="travel-instance-3",
+            start_date=date(2026, 9, 9),
+            end_date=date(2026, 9, 10),
+        ),
+    )
+    snapshot = build_snapshot(
+        replace(
+            base,
+            draft_input=draft_input,
+            totals_data=totals_data,
+            related_approvals=related,
+        )
+    )
+
+    assert snapshot.travel_period.start_date == date(2026, 9, 1)
+    assert snapshot.travel_period.end_date == date(2026, 9, 10)
+    # OA has one date-range field, so it records the full calendar span.  The
+    # two subsidy rows below still omit the uncovered 6th-8th gap.
+    assert snapshot.travel_period.duration_days == 10
+    assert len(snapshot.subsidies) == 2
+    assert len(snapshot_excel_input(snapshot).trips) == 2
+    values = {item.logical_key: item.value for item in snapshot.form_values}
+    assert values["durationDays"] == "10"
+
+
+def test_snapshot_allows_expenses_in_one_of_several_discontinuous_approval_periods() -> None:
+    base = _source()
+    draft_input = _draft_input(trip=False)
+    totals = calculate_expense_totals(draft_input.items, None)
+    totals_data = totals.as_api_dict()
+    totals_data["subsidy"] = None
+    totals_data["subsidies"] = []
+    first_related = replace(
+        base.related_approvals[0],
+        start_date=date(2026, 8, 25),
+        end_date=date(2026, 8, 25),
+    )
+    second_related = replace(
+        base.related_approvals[0],
+        sort_order=1,
+        process_instance_id="travel-instance-2",
+        start_date=date(2026, 9, 1),
+        end_date=date(2026, 9, 3),
+    )
+
+    snapshot = build_snapshot(
+        replace(
+            base,
+            draft_input=draft_input,
+            totals_data=totals_data,
+            related_approvals=(first_related, second_related),
+        )
+    )
+
+    assert snapshot.travel_period.start_date == date(2026, 8, 25)
+    assert snapshot.travel_period.end_date == date(2026, 9, 3)
+    assert snapshot.travel_period.duration_days == 10
+    assert snapshot.totals.subsidy_total == Decimal("0.00")
 
 
 def test_create_command_parser_rejects_noncanonical_and_tampered_request() -> None:

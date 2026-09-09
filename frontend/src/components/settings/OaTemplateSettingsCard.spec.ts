@@ -171,7 +171,6 @@ function catalog(version = 3): OaTemplateCatalog {
       schemaFingerprint: travel.schemaFingerprint,
     }],
     allowedTravelProcessCodes: [travel.processCode],
-    relatedApprovalSmokeTestConfirmed: true,
     lastCheckedAt: '2026-09-04T01:00:00Z',
     confirmedAt: '2026-09-04T01:00:00Z',
     updatedAt: '2026-09-04T01:00:00Z',
@@ -194,7 +193,6 @@ function inspection(
       confirmedSchemaFingerprint: stored.confirmedSchemaFingerprint,
     },
     travelProfiles: stored.travelProfiles,
-    relatedApprovalSmokeTestConfirmed: true,
   }
 }
 
@@ -275,7 +273,6 @@ describe('OaTemplateSettingsCard', () => {
         mappings: travelMappings,
         travelTypeOption: businessOption,
       }],
-      relatedApprovalSmokeTestConfirmed: true,
     })
     expect(wrapper.text()).toContain('目录版本 4')
     confirm.mockRestore()
@@ -301,6 +298,66 @@ describe('OaTemplateSettingsCard', () => {
     await flushPromises()
     expect(vi.mocked(confirmOaTemplateCatalog).mock.calls[0]![0].travelProfiles[0]).toMatchObject({ mappings: { travelType: 'source-type' }, travelTypeMappings: profile.travelTypeMappings })
     confirm.mockRestore()
+    wrapper.unmount()
+  })
+
+  it('uses refreshed category mappings when a changed template invalidates stored option identities', async () => {
+    const saved = catalog()
+    const savedProfile = saved.travelProfiles[0]!
+    savedProfile.logicalFields = [
+      ...savedProfile.logicalFields,
+      { key: 'travelType', label: '出差类别', supportedComponentTypes: ['DDSelectField'] },
+    ]
+    savedProfile.schema.components.push(component(
+      'source-type',
+      'DDSelectField',
+      '出差类别',
+      'travelType',
+      [businessOption],
+    ))
+    savedProfile.mappings.travelType = 'source-type'
+    savedProfile.travelTypeMappings = { BUSINESS: businessOption }
+
+    const refreshedTarget = { ...businessOption, key: 'option_1_refreshed' }
+    const refreshed = inspection('DRIFTED')
+    refreshed.reimbursement.schema = reimbursementSchema('c'.repeat(64))
+    refreshed.reimbursement.schema.components = refreshed.reimbursement.schema.components.map(
+      (item) => item.componentId === 'travelType-id'
+        ? { ...item, options: [refreshedTarget, internalOption] }
+        : item,
+    )
+    const refreshedProfile = {
+      ...savedProfile,
+      schema: travelSchema('d'.repeat(64)),
+      confirmedSchemaFingerprint: savedProfile.schemaFingerprint,
+      travelTypeMappings: { BUSINESS: refreshedTarget },
+    }
+    refreshedProfile.schema.components.push(component(
+      'source-type',
+      'DDSelectField',
+      '出差类别',
+      'travelType',
+      [businessOption],
+    ))
+    refreshed.travelProfiles = [refreshedProfile]
+
+    vi.mocked(getOaTemplateCatalog).mockResolvedValue({
+      configured: true,
+      configVersion: 3,
+      compatibilityStatus: 'COMPATIBLE',
+      isSubmissionReady: true,
+      requiresConfirmation: false,
+      catalog: saved,
+    })
+    vi.mocked(inspectOaTemplateCatalog).mockResolvedValue(refreshed)
+    const wrapper = mount(OaTemplateSettingsCard, { global: { plugins: [ElementPlus] } })
+    await flushPromises()
+
+    await findButton(wrapper, '读取并检查模板')!.trigger('click')
+    await flushPromises()
+
+    expect((findButton(wrapper, '保存整个目录')!.element as HTMLButtonElement).disabled)
+      .toBe(false)
     wrapper.unmount()
   })
 
@@ -354,7 +411,7 @@ describe('OaTemplateSettingsCard', () => {
         internalOption.key,
       ]),
     },
-  ])('invalidates the smoke proof after changing $name', async ({ selectIndex, value }) => {
+  ])('requires a fresh inspection after changing $name', async ({ selectIndex, value }) => {
     const confirm = vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue({} as never)
     const wrapper = mount(OaTemplateSettingsCard, {
       global: { plugins: [ElementPlus] },
@@ -363,20 +420,14 @@ describe('OaTemplateSettingsCard', () => {
     await findButton(wrapper, '读取并检查模板')!.trigger('click')
     await flushPromises()
 
-    const checkbox = wrapper.find('.oa-template-confirmation input[type="checkbox"]')
-    expect((checkbox.element as HTMLInputElement).checked).toBe(true)
     await changeSelect(wrapper, selectIndex, value)
 
-    expect((checkbox.element as HTMLInputElement).checked).toBe(false)
-    expect((checkbox.element as HTMLInputElement).disabled).toBe(true)
     expect((findButton(wrapper, '保存整个目录')!.element as HTMLButtonElement).disabled)
       .toBe(true)
     expect(confirmOaTemplateCatalog).not.toHaveBeenCalled()
 
     await findButton(wrapper, '读取并检查模板')!.trigger('click')
     await flushPromises()
-    expect((checkbox.element as HTMLInputElement).checked).toBe(false)
-    expect((checkbox.element as HTMLInputElement).disabled).toBe(false)
     expect((findButton(wrapper, '保存整个目录')!.element as HTMLButtonElement).disabled)
       .toBe(false)
 
@@ -384,7 +435,6 @@ describe('OaTemplateSettingsCard', () => {
     await flushPromises()
     expect(confirmOaTemplateCatalog).toHaveBeenCalledOnce()
     const payload = vi.mocked(confirmOaTemplateCatalog).mock.calls[0]![0]
-    expect(payload.relatedApprovalSmokeTestConfirmed).toBe(false)
     if (selectIndex === 8) {
       expect(payload.reimbursement.mappings.relatedApprovals).toBe(value)
     } else if (selectIndex === 10) {
@@ -425,7 +475,6 @@ describe('OaTemplateSettingsCard', () => {
       .setValue('PROC-TRAVEL')
     await findButton(wrapper, '读取并检查模板')!.trigger('click')
     await flushPromises()
-    await wrapper.find('.oa-template-confirmation input[type="checkbox"]').setValue(true)
     await findButton(wrapper, '保存整个目录')!.trigger('click')
     await flushPromises()
 

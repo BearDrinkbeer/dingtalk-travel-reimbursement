@@ -23,10 +23,7 @@ class TripType(StrEnum):
 
     @property
     def requires_confirmation(self) -> bool:
-        return self in {
-            TripType.SAME_CITY_PROJECT,
-            TripType.INTERNAL,
-        }
+        return self is TripType.SAME_CITY_PROJECT
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,15 +41,19 @@ class SubsidyCalculation:
     effective_days: Decimal
     daily_rate: Decimal
     total: Decimal
+    related_approval_id: str | None = None
 
     def as_api_dict(self) -> dict[str, object]:
-        return {
+        data: dict[str, object] = {
             "tripType": self.trip_type.value,
             "calendarDays": self.calendar_days,
             "effectiveDays": format(self.effective_days, ".1f"),
             "dailyRate": money_string(self.daily_rate),
             "total": money_string(self.total),
         }
+        if self.related_approval_id is not None:
+            data["relatedApprovalId"] = self.related_approval_id
+        return data
 
 
 def automatic_effective_days(period: TripPeriod) -> Decimal:
@@ -81,6 +82,7 @@ def calculate_subsidy(
     confirmed_effective_days: Decimal | None = None,
     no_subsidy_exception: bool = False,
     manual_subsidy_amount: Decimal | None = None,
+    related_approval_id: str | None = None,
 ) -> SubsidyCalculation:
     calculated_days = automatic_effective_days(period)
     calendar_days = (period.end_date - period.start_date).days + 1
@@ -101,35 +103,24 @@ def calculate_subsidy(
             422,
         )
 
+    if trip_type is TripType.OVERSEAS:
+        raise ApiError("SUBSIDY_NOT_SUPPORTED", "境外出差不在当前补助范围内", 422)
+
     if trip_type.requires_confirmation:
         if not policy_confirmed:
             raise ApiError(
                 "POLICY_CONFIRMATION_REQUIRED",
-                "该出差类型需要确认有效天数；公司内部出差还需确认是否适用不补助例外",
+                "境内同市项目需要勾选已按公司制度确认",
                 422,
             )
-        if confirmed_effective_days is None:
-            raise ApiError("POLICY_CONFIRMATION_REQUIRED", "请填写并确认有效天数", 422)
-        if confirmed_effective_days < 0 or confirmed_effective_days > Decimal("366"):
-            raise ApiError("INVALID_EFFECTIVE_DAYS", "有效天数必须在 0 到 366 天之间", 422)
-        if confirmed_effective_days % HALF_DAY:
-            raise ApiError("INVALID_EFFECTIVE_DAYS", "有效天数必须以 0.5 天为单位", 422)
-        if confirmed_effective_days > calculated_days:
+        if confirmed_effective_days is not None or no_subsidy_exception:
             raise ApiError(
-                "INVALID_EFFECTIVE_DAYS",
-                "有效天数不能超过本次行程按半天规则计算的天数",
+                "UNEXPECTED_POLICY_OVERRIDE",
+                "有效天数由系统按出发和返回时段自动计算",
                 422,
             )
-        if no_subsidy_exception and trip_type is not TripType.INTERNAL:
-            raise ApiError(
-                "INVALID_SUBSIDY_EXCEPTION",
-                "只有公司内部出差可以选择不补助例外",
-                422,
-            )
-        effective_days = confirmed_effective_days
-        daily_rate = (
-            Decimal("0.00") if no_subsidy_exception else quantize_money(configured_daily_rate)
-        )
+        effective_days = calculated_days
+        daily_rate = quantize_money(configured_daily_rate)
     else:
         if policy_confirmed or confirmed_effective_days is not None or no_subsidy_exception:
             raise ApiError(
@@ -140,6 +131,10 @@ def calculate_subsidy(
         effective_days = calculated_days
         daily_rate = quantize_money(configured_daily_rate)
 
+    if trip_type is TripType.INTERNAL and calendar_days > 30:
+        effective_days = Decimal("0.0")
+        daily_rate = Decimal("0.00")
+
     total = quantize_money(effective_days * daily_rate)
     return SubsidyCalculation(
         trip_type=trip_type,
@@ -147,4 +142,5 @@ def calculate_subsidy(
         effective_days=effective_days,
         daily_rate=daily_rate,
         total=total,
+        related_approval_id=related_approval_id,
     )

@@ -15,6 +15,11 @@ const props = withDefaults(defineProps<{
 
 const expense = useExpenseStore()
 const drafts = useReimbursementDraftStore()
+const summaryCalculationError = computed(() => {
+  if (!expense.calculationError) return ''
+  if (expense.includeSubsidy && !expense.itemReadinessError) return ''
+  return expense.calculationError
+})
 
 const disabledReason = computed(() => {
   if (!drafts.currentDraft) return '正在准备报销表单'
@@ -56,8 +61,8 @@ async function downloadExcel(): Promise<void> {
       </div>
     </div>
     <el-alert
-      v-if="expense.calculationError"
-      :title="expense.calculationError"
+      v-if="summaryCalculationError"
+      :title="summaryCalculationError"
       type="error"
       :closable="false"
     />

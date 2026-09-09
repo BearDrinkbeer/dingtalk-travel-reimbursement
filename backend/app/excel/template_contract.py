@@ -90,6 +90,7 @@ def output_layout_for_line_count(line_count: int) -> ExcelSheetLayout:
         print_end_row=EXCEL_TEMPLATE.print_end_row + extra_rows,
     )
 
+
 MAX_TEMPLATE_BYTES = 10 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200
 MAX_ARCHIVE_MEMBER_BYTES = 20 * 1024 * 1024
@@ -402,8 +403,7 @@ def validate_template_sheet(
     if actual_merges != _required_merges(layout):
         raise template_invalid()
     if any(
-        worksheet[cell].value != expected
-        for cell, expected in _required_labels(layout).items()
+        worksheet[cell].value != expected for cell, expected in _required_labels(layout).items()
     ):
         raise template_invalid()
     if worksheet.print_area != EXCEL_TEMPLATE.print_area_for(layout.print_end_row):
@@ -422,8 +422,7 @@ def validate_template_sheet(
         raise template_invalid()
     validation = validations[0]
     if (
-        str(validation.sqref)
-        != f"B{EXCEL_TEMPLATE.detail_start_row}:B{layout.detail_end_row}"
+        str(validation.sqref) != f"B{EXCEL_TEMPLATE.detail_start_row}:B{layout.detail_end_row}"
         or validation.type != "list"
         or validation.formula1 != EXPECTED_CATEGORY_VALIDATION_FORMULA
         or validation.formula2 not in {None, ""}

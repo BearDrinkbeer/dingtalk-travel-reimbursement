@@ -51,7 +51,6 @@ const loadError = ref('')
 const inspectError = ref('')
 const catalogWarning = ref('')
 const inspected = ref(false)
-const smokeProofInvalidated = ref(false)
 const expectedConfigVersion = ref<number | null>(null)
 const compatibilityStatus = ref<OaTemplateCompatibilityStatus>('UNCONFIGURED')
 const submissionReady = ref(false)
@@ -65,7 +64,6 @@ const reimbursement = reactive({
   confirmedSchemaFingerprint: null as string | null,
 })
 const travelProfiles = ref<EditableTravelProfile[]>([])
-const relatedApprovalSmokeTestConfirmed = ref(false)
 
 const statusView = computed(() => {
   const values: Record<OaTemplateCompatibilityStatus, {
@@ -180,8 +178,6 @@ function resetForm(): void {
     confirmedSchemaFingerprint: null,
   })
   travelProfiles.value = [blankTravelProfile()]
-  relatedApprovalSmokeTestConfirmed.value = false
-  smokeProofInvalidated.value = false
 }
 
 async function load(): Promise<void> {
@@ -225,8 +221,6 @@ function applyCatalog(catalog: OaTemplateCatalog): void {
     confirmedSchemaFingerprint: catalog.confirmedSchemaFingerprint,
   })
   travelProfiles.value = catalog.travelProfiles.map(profileFromCatalog)
-  relatedApprovalSmokeTestConfirmed.value = catalog.relatedApprovalSmokeTestConfirmed
-  smokeProofInvalidated.value = false
   compatibilityStatus.value = catalog.compatibilityStatus
   submissionReady.value = catalog.isSubmissionReady
   currentCatalogVersion.value = catalog.configVersion
@@ -277,8 +271,6 @@ function invalidateInspection(): void {
 
 function invalidateContractProof(): void {
   invalidateInspection()
-  relatedApprovalSmokeTestConfirmed.value = false
-  smokeProofInvalidated.value = true
 }
 
 function reimbursementProcessCodeChanged(): void {
@@ -313,10 +305,6 @@ function reimbursementMappingChanged(logicalKey: string): void {
 
 function travelContractChanged(): void {
   invalidateContractProof()
-}
-
-function smokeConfirmationChanged(confirmed: boolean): void {
-  if (confirmed && inspected.value) smokeProofInvalidated.value = false
 }
 
 function validateHeaders(): string | null {
@@ -409,11 +397,6 @@ function applyInspection(result: OaTemplateCatalogInspection): void {
         : ''
     return profileFromInspection(item, existing, selectedOption)
   })
-  const proofRemainsValid = !smokeProofInvalidated.value
-    && result.compatibilityStatus === 'COMPATIBLE'
-    && result.relatedApprovalSmokeTestConfirmed
-  relatedApprovalSmokeTestConfirmed.value = proofRemainsValid
-  if (!proofRemainsValid) smokeProofInvalidated.value = true
   expectedConfigVersion.value = result.configuredConfigVersion
   currentCatalogVersion.value = result.configuredConfigVersion
   compatibilityStatus.value = result.compatibilityStatus
@@ -426,6 +409,27 @@ function profileFromInspection(
   existing: EditableTravelProfile,
   selectedOption: string,
 ): EditableTravelProfile {
+  const mappings = usableMappings(
+    item.schema,
+    item.logicalFields,
+    existing.mappings,
+    item.mappings,
+  )
+  const inspectedTypeMappings = Object.fromEntries(
+    Object.entries(item.travelTypeMappings ?? {}).map(([key, option]) => [key, optionIdentity(option)]),
+  )
+  const sourceOptions = item.schema.components.find(
+    (component) => component.componentId === mappings.travelType,
+  )?.options ?? []
+  const travelTypeMappings = Object.fromEntries(sourceOptions.map((source) => {
+    const existingIdentity = existing.travelTypeMappings[source.value] ?? ''
+    return [
+      source.value,
+      resolveTravelTypeOption(existingIdentity) === null
+        ? inspectedTypeMappings[source.value] ?? ''
+        : existingIdentity,
+    ]
+  }))
   return {
     localId: existing.localId,
     profileKey: item.profileKey,
@@ -433,15 +437,10 @@ function profileFromInspection(
     processCode: item.processCode,
     schema: item.schema,
     logicalFields: item.logicalFields,
-    mappings: usableMappings(
-      item.schema,
-      item.logicalFields,
-      existing.mappings,
-      item.mappings,
-    ),
+    mappings,
     travelTypeOptionIdentity: selectedOption,
     dynamicTravelType: existing.dynamicTravelType || Boolean(Object.keys(item.travelTypeMappings ?? {}).length),
-    travelTypeMappings: Object.fromEntries(Object.entries(item.travelTypeMappings ?? {}).map(([key, option]) => [key, optionIdentity(option)]).concat(Object.entries(existing.travelTypeMappings))),
+    travelTypeMappings,
     confirmedSchemaFingerprint: item.confirmedSchemaFingerprint,
   }
 }
@@ -563,7 +562,6 @@ async function saveCatalog(): Promise<void> {
       mappings: { ...reimbursement.mappings },
     },
     travelProfiles: profiles as ConfirmOaTemplateCatalogInput['travelProfiles'],
-    relatedApprovalSmokeTestConfirmed: relatedApprovalSmokeTestConfirmed.value,
   }
 
   try {
@@ -618,7 +616,6 @@ function inspectionFromCatalog(catalog: OaTemplateCatalog): OaTemplateCatalogIns
       confirmedSchemaFingerprint: catalog.confirmedSchemaFingerprint,
     },
     travelProfiles: catalog.travelProfiles,
-    relatedApprovalSmokeTestConfirmed: catalog.relatedApprovalSmokeTestConfirmed,
   }
 }
 </script>
@@ -939,18 +936,12 @@ function inspectionFromCatalog(catalog: OaTemplateCatalog): OaTemplateCatalogIns
           </article>
         </section>
 
-        <section class="oa-template-section oa-template-confirmation">
-          <el-checkbox
-            v-model="relatedApprovalSmokeTestConfirmed"
-            :disabled="!inspected"
-            @change="smokeConfirmationChanged"
-          >
-            已在当前企业完成“出差审批关联到报销审批”的实际测试
-          </el-checkbox>
-          <p>选填，仅记录是否实际测试过；未测试也可保存配置并手动提交验证。保存不会创建审批。</p>
-        </section>
-
         <div class="oa-template-actions">
+          <span
+            v-if="saveDisabledReason"
+            class="field-help oa-template-save-reason"
+            role="status"
+          >{{ saveDisabledReason }}</span>
           <el-button
             :loading="inspecting"
             :disabled="loading || saving || inspecting"
@@ -994,8 +985,7 @@ function inspectionFromCatalog(catalog: OaTemplateCatalog): OaTemplateCatalogIns
 }
 
 .oa-template-heading p,
-.oa-template-section-heading p,
-.oa-template-confirmation p {
+.oa-template-section-heading p {
   margin: 6px 0 0;
   color: var(--el-text-color-secondary);
   line-height: 1.6;
@@ -1077,20 +1067,15 @@ function inspectionFromCatalog(catalog: OaTemplateCatalog): OaTemplateCatalogIns
   color: var(--el-text-color-secondary);
 }
 
-.oa-template-confirmation :deep(.el-checkbox) {
-  height: auto;
-  align-items: flex-start;
-  white-space: normal;
-}
-
-.oa-template-confirmation p {
-  padding-left: 24px;
-  font-size: 13px;
-}
-
 .oa-template-actions {
   justify-content: flex-end;
   margin-top: 24px;
+}
+
+.oa-template-save-reason {
+  align-self: center;
+  margin-right: auto;
+  color: var(--el-color-warning-dark-2);
 }
 
 @media (max-width: 720px) {

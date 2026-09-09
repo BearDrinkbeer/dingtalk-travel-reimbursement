@@ -552,7 +552,6 @@ def _persist_ready_draft(
                         travel_type_option=travel_type,
                     )
                 ],
-                related_approval_smoke_test_confirmed=True,
                 administrator_user_id="mock-user",
             )
         )

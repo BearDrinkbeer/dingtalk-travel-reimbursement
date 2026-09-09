@@ -107,9 +107,7 @@ def test_new_draft_cannot_reference_payment_file_from_an_existing_draft(
     assert created.json()["error"]["code"] == "REIMBURSEMENT_DRAFT_FILE_REFERENCE_INVALID"
 
 
-def test_locked_snapshot_receipt_count_is_preserved_in_get_and_preview(
-    client_factory, monkeypatch
-):
+def test_locked_snapshot_receipt_count_is_preserved_in_get_and_preview(client_factory, monkeypatch):
     client = client_factory(auth_mock_enabled=True)
     headers = {"X-CSRF-Token": mock_login(client)["csrfToken"]}
     draft_id, _ = _insert_locked_snapshot_draft(client, first_receipt_count=3)
@@ -512,7 +510,7 @@ def test_review_submit_and_snapshot_order_enforce_new_payment_rule(
     assert accepted.status_code == 202, accepted.text
     with client.app.state.database_session_factory() as database:
         snapshot = json.loads(database.scalar(select(ReimbursementSubmission)).form_snapshot_json)
-        assert snapshot["snapshotVersion"] == 5
+        assert snapshot["snapshotVersion"] == 6
         assert [file["draftFileId"] for file in snapshot["originalFiles"]] == [
             sources[0],
             sources[1],

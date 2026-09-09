@@ -162,9 +162,7 @@ def test_template_matches_official_form_format() -> None:
     assert worksheet.row_dimensions[1].height == pytest.approx(28)
     assert worksheet.row_dimensions[2].height == pytest.approx(35)
     assert worksheet.row_dimensions[3].height == pytest.approx(28)
-    assert all(
-        worksheet.row_dimensions[row].height == pytest.approx(30) for row in range(4, 55)
-    )
+    assert all(worksheet.row_dimensions[row].height == pytest.approx(30) for row in range(4, 55))
     assert worksheet.row_dimensions[55].height == pytest.approx(28)
     assert worksheet["B1"].font.name == "微软雅黑"
     assert worksheet["B1"].font.sz == 14
@@ -317,6 +315,51 @@ def test_excel_exact_cells_order_totals_and_layout_are_preserved(client_factory)
     workbook.close()
     assert hashlib.sha256(TEMPLATE_PATH.read_bytes()).hexdigest() == before_hash
     assert not list(client.app.state.settings.temp_dir.rglob("*.xlsx"))
+
+
+def test_excel_merges_overlaps_but_keeps_discontinuous_subsidy_rows(client_factory) -> None:
+    client = client_factory(auth_mock_enabled=True)
+    csrf = mock_login(client)["csrfToken"]
+    body = {
+        "project": {"mode": "manual", "text": "P-001 示例项目"},
+        "trips": [
+            trip()
+            | {
+                "relatedApprovalId": "approval-1",
+                "startDate": "2026-08-01",
+                "endDate": "2026-08-03",
+            },
+            trip()
+            | {
+                "relatedApprovalId": "approval-2",
+                "startDate": "2026-08-03",
+                "endDate": "2026-08-05",
+            },
+            trip()
+            | {
+                "relatedApprovalId": "approval-3",
+                "startDate": "2026-08-09",
+                "endDate": "2026-08-10",
+            },
+        ],
+        "items": [],
+    }
+
+    workbook = xlsx_from_response(
+        client.post(
+            "/api/excel/generate",
+            json=body,
+            headers={"X-CSRF-Token": csrf},
+        )
+    )
+    worksheet = workbook[EXCEL_TEMPLATE.sheet_name]
+
+    assert [worksheet[f"B{row}"].value for row in (4, 5)] == ["出差补助", "出差补助"]
+    assert worksheet["D4"].value == "8/1—8/5，共5天出差补助"
+    assert worksheet["D5"].value == "8/9—8/10，共2天出差补助"
+    assert [str(worksheet[f"G{row}"].value) for row in (4, 5)] == ["500", "200"]
+    assert str(worksheet["G55"].value) == "700"
+    workbook.close()
 
 
 @pytest.mark.parametrize("prefix", ["=", "+", "-", "@"])

@@ -19,11 +19,11 @@ export async function calculateSubsidy(input: TripInput): Promise<SubsidyResult>
 }
 
 export async function calculateTotals(
-  trip: TripInput | null,
+  tripOrTrips: TripInput | readonly TripInput[] | null,
   items: readonly ExpenseItem[],
 ): Promise<ExpenseTotals> {
   const response = await http.post<ApiEnvelope<ExpenseTotals>>('/calculate/totals', {
-    trip,
+    ...(Array.isArray(tripOrTrips) ? { trips: tripOrTrips } : { trip: tripOrTrips }),
     items: items.map((item) => ({
       id: item.id,
       source: item.source,

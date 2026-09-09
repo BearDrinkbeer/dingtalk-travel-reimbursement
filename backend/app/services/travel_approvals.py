@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from typing import Protocol
@@ -15,6 +14,7 @@ from app.integrations.dingtalk.workflow import (
     FormSchema,
     WorkflowProcessInstance,
 )
+from app.services.subsidy_calculation import subsidy_purpose_for_travel_type
 
 _DINGTALK_TIME_ZONE = ZoneInfo("Asia/Shanghai")
 _PAGE_SIZE = 20
@@ -38,6 +38,7 @@ class TravelTemplateLike(Protocol):
     start_date_component_id: str
     end_date_component_id: str
     travel_type_option: FormOption
+    travel_type_mappings: dict[str, FormOption] | None
     company_component_id: str | None
     budget_code_component_id: str | None
 
@@ -121,12 +122,13 @@ class TravelApprovalCandidate:
     unavailable_reason: str | None = None
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "processInstanceId": self.instance.instance_id,
             "profileKey": self.listed.profile_key,
             "profileDisplayName": self.listed.profile_display_name,
             "sourceProcessCode": self.listed.source_process_code,
             "travelTypeOption": self.listed.travel_type_option.as_dict(),
+            "subsidyTripType": _subsidy_trip_type_value(self.listed.travel_type_option),
             "title": self.instance.title,
             "businessId": self.instance.business_id,
             "startDate": self.start_date.isoformat(),
@@ -139,6 +141,9 @@ class TravelApprovalCandidate:
             else None,
             "unavailableReason": self.unavailable_reason,
         }
+        if self.listed.source_travel_type_value is not None:
+            result["sourceTravelTypeValue"] = self.listed.source_travel_type_value
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,20 +161,6 @@ class VerifiedTravelSelection:
     end_date: date
     company_option: FormOption
     budget_code_option: FormOption
-
-
-def travel_periods_are_contiguous(periods: Sequence[tuple[date, date]]) -> bool:
-    """Return whether inclusive travel periods form one gap-free calendar range."""
-
-    ordered = sorted(periods)
-    if not ordered:
-        return True
-    covered_end = ordered[0][1]
-    for start_date, end_date in ordered[1:]:
-        if start_date > covered_end + timedelta(days=1):
-            return False
-        covered_end = max(covered_end, end_date)
-    return True
 
 
 def requested_query_window(
@@ -205,12 +196,17 @@ def runtime_options(catalog: OaTemplateCatalogLike) -> dict[str, object]:
                 "processCode": profile.process_code,
                 "schemaFingerprint": profile.schema.fingerprint,
                 "travelTypeOption": profile.travel_type_option.as_dict(),
+                "subsidyTripType": _subsidy_trip_type_value(profile.travel_type_option),
                 **(
                     {
                         "travelTypeMappings": {
                             key: value.as_dict()
                             for key, value in profile.travel_type_mappings.items()
-                        }
+                        },
+                        "subsidyTripTypeMappings": {
+                            key: _subsidy_trip_type_value(value)
+                            for key, value in profile.travel_type_mappings.items()
+                        },
                     }
                     if getattr(profile, "travel_type_mappings", None) is not None
                     else {}
@@ -219,6 +215,11 @@ def runtime_options(catalog: OaTemplateCatalogLike) -> dict[str, object]:
             for profile in catalog.travel_profiles
         ],
     }
+
+
+def _subsidy_trip_type_value(option: FormOption) -> str | None:
+    purpose = subsidy_purpose_for_travel_type(option.label)
+    return purpose.value if purpose is not None else None
 
 
 async def list_current_user_travel_approvals(
@@ -316,7 +317,16 @@ async def reverify_travel_approval_selection(
         )
     approvals = tuple(item for item in resolved if item is not None)
     travel_type_values = {item.listed.travel_type_option.value for item in approvals}
-    if len(travel_type_values) != 1:
+    source_travel_type_values = [
+        item.listed.source_travel_type_value
+        for item in approvals
+        if item.listed.source_travel_type_value is not None
+    ]
+    if (
+        len(travel_type_values) != 1
+        or (source_travel_type_values and len(source_travel_type_values) != len(approvals))
+        or len(set(source_travel_type_values)) > 1
+    ):
         raise ApiError(
             "TRAVEL_APPROVAL_TYPE_MISMATCH",
             "所选出差审批的出差类别不同，不能放在同一张报销单中",
@@ -337,14 +347,6 @@ async def reverify_travel_approval_selection(
         raise ApiError(
             "TRAVEL_APPROVAL_ACCOUNTING_MISMATCH",
             "所选出差审批的所属公司或预算代码不同，不能放在同一张报销单中",
-            422,
-        )
-    if not travel_periods_are_contiguous(
-        [(item.start_date, item.end_date) for item in approvals]
-    ):
-        raise ApiError(
-            "TRAVEL_APPROVAL_DATE_GAP",
-            "所选出差审批日期不连续，只能关联日期相邻或重叠的审批",
             422,
         )
     return VerifiedTravelSelection(

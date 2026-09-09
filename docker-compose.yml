@@ -119,8 +119,8 @@ services:
       backend:
         condition: service_healthy
     ports:
-      # Loopback is the safe default. Production HTTPS terminates at the
-      # organization's reverse proxy, which forwards to this private port.
+      # Loopback is the safe default. Change APP_BIND_ADDRESS when clients need
+      # to access this HTTP port directly or through an HTTP/HTTPS reverse proxy.
       - "${APP_BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-8080}:8080"
     volumes:
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro

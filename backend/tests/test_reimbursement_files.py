@@ -1196,13 +1196,13 @@ def test_locked_draft_uses_submission_snapshot_totals_after_rate_changes(
     client_factory,
     monkeypatch,
 ) -> None:
-    from app.services import reimbursement_drafts
+    from app.services import subsidy_calculation
 
     client = client_factory(auth_mock_enabled=True)
     mock_login(client)
     draft_id, expected_total = _insert_locked_snapshot_draft(client)
     monkeypatch.setattr(
-        reimbursement_drafts,
+        subsidy_calculation,
         "get_expense_settings",
         lambda _database: type(
             "ChangedRates",
@@ -1222,7 +1222,7 @@ def test_locked_draft_excel_preview_does_not_depend_on_current_catalog_or_rates(
     client_factory,
     monkeypatch,
 ) -> None:
-    from app.services import reimbursement_files
+    from app.services import reimbursement_files, subsidy_calculation
 
     client = client_factory(auth_mock_enabled=True)
     csrf = str(mock_login(client)["csrfToken"])
@@ -1237,7 +1237,7 @@ def test_locked_draft_excel_preview_does_not_depend_on_current_catalog_or_rates(
         fail_current_configuration,
     )
     monkeypatch.setattr(
-        reimbursement_files,
+        subsidy_calculation,
         "get_expense_settings",
         fail_current_configuration,
     )

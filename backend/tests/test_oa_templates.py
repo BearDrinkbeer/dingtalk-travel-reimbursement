@@ -280,7 +280,6 @@ def confirm(
     mappings=None,
     *,
     allowed_travel_process_codes=None,
-    smoke_test_confirmed: bool = True,
     expected_config_version: int | None = None,
     travel_schema_fingerprints: dict[str, str] | None = None,
     travel_mappings: dict[str, dict[str, str]] | None = None,
@@ -326,7 +325,6 @@ def confirm(
                     else TRAVEL_PROCESS_CODES
                 )
             ],
-            "relatedApprovalSmokeTestConfirmed": smoke_test_confirmed,
         },
         headers=headers,
     )
@@ -335,10 +333,12 @@ def confirm(
 def test_travel_accounting_mappings_survive_catalog_api_confirmation(client_factory) -> None:
     def travel_response(process_code: str, _request: httpx.Request) -> httpx.Response:
         payload = travel_schema_payload(process_code)
-        payload["result"]["schemaContent"]["items"].extend([
-            component("TextField", f"{process_code}-company", "所属公司"),
-            component("TextField", f"{process_code}-budget", "预算代码"),
-        ])
+        payload["result"]["schemaContent"]["items"].extend(
+            [
+                component("TextField", f"{process_code}-company", "所属公司"),
+                component("TextField", f"{process_code}-budget", "预算代码"),
+            ]
+        )
         return httpx.Response(200, json=payload)
 
     transport, _calls = transport_for_schema(
@@ -1015,16 +1015,15 @@ def test_unknown_business_suite_container_blocks_descendant_mapping(client_facto
 
 
 @pytest.mark.parametrize(
-    ("allowed_process_codes", "smoke_test_confirmed", "status_code", "message"),
+    ("allowed_process_codes", "status_code", "message"),
     [
-        (TRAVEL_PROCESS_CODES, False, 200, '"relatedApprovalSmokeTestConfirmed":false'),
-        ([TRAVEL_PROCESS_CODES[0], TRAVEL_PROCESS_CODES[0]], True, 400, "不能重复"),
-        ([PROCESS_CODE], True, 400, "不能同时作为"),
-        (["invalid process code"], True, 422, "请求参数不正确"),
+        ([TRAVEL_PROCESS_CODES[0], TRAVEL_PROCESS_CODES[0]], 400, "不能重复"),
+        ([PROCESS_CODE], 400, "不能同时作为"),
+        (["invalid process code"], 422, "请求参数不正确"),
     ],
 )
-def test_relationship_requires_explicit_smoke_test_and_valid_local_allowlist(
-    client_factory, allowed_process_codes, smoke_test_confirmed, status_code, message
+def test_relationship_requires_valid_local_allowlist(
+    client_factory, allowed_process_codes, status_code, message
 ) -> None:
     transport, _calls = transport_for_schema(
         lambda _number, _request: httpx.Response(200, json=schema_payload())
@@ -1039,7 +1038,6 @@ def test_relationship_requires_explicit_smoke_test_and_valid_local_allowlist(
         headers,
         fingerprint,
         allowed_travel_process_codes=allowed_process_codes,
-        smoke_test_confirmed=smoke_test_confirmed,
     )
 
     assert response.status_code == status_code
@@ -1082,7 +1080,7 @@ def test_relationship_requires_explicit_smoke_test_and_valid_local_allowlist(
         ],
     ],
 )
-def test_inspection_does_not_reuse_relationship_confirmation_for_a_changed_catalog(
+def test_inspection_reports_a_changed_catalog(
     client_factory,
     travel_profiles,
 ) -> None:
@@ -1111,10 +1109,9 @@ def test_inspection_does_not_reuse_relationship_confirmation_for_a_changed_catal
     )
 
     assert unchanged.status_code == 200
-    assert unchanged.json()["data"]["relatedApprovalSmokeTestConfirmed"] is True
+    assert unchanged.json()["data"]["compatibilityStatus"] == "COMPATIBLE"
     assert changed.status_code == 200
     assert changed.json()["data"]["compatibilityStatus"] == "CATALOG_CHANGED"
-    assert changed.json()["data"]["relatedApprovalSmokeTestConfirmed"] is False
 
 
 @pytest.mark.parametrize(
@@ -1307,32 +1304,6 @@ def test_declared_relationship_policy_restricts_the_local_allowlist(client_facto
     assert rejected.json()["error"]["code"] == "OA_TEMPLATE_RELATIONSHIP_INVALID"
     assert accepted.status_code == 200
     assert accepted.json()["data"]["isSubmissionReady"] is True
-
-
-def test_submission_readiness_does_not_require_previous_smoke_test(
-    client_factory,
-) -> None:
-    transport, _calls = transport_for_schema(
-        lambda _number, _request: httpx.Response(200, json=schema_payload())
-    )
-    client, headers = admin_client(client_factory, transport)
-    fingerprint = inspect(client, headers).json()["data"]["reimbursement"]["schema"][
-        "schemaFingerprint"
-    ]
-    assert confirm(client, headers, fingerprint).status_code == 200
-    with client.app.state.database_session_factory() as database:
-        profile = database.get(OaTemplateProfile, "reimbursement")
-        assert profile is not None
-        profile.related_approval_smoke_test_confirmed = False
-        database.commit()
-
-    current = client.get("/api/admin/oa/templates/catalog")
-
-    assert current.status_code == 200
-    assert current.json()["data"]["compatibilityStatus"] == "COMPATIBLE"
-    assert current.json()["data"]["isSubmissionReady"] is True
-    assert current.json()["data"]["catalog"]["isSubmissionReady"] is True
-    assert current.json()["data"]["catalog"]["relatedApprovalSmokeTestConfirmed"] is False
 
 
 def test_submission_readiness_is_false_when_travel_allowlist_is_empty(client_factory) -> None:
@@ -1701,7 +1672,6 @@ def test_confirmed_profile_is_persisted_and_returned_without_refetch(client_fact
     assert catalog["configVersion"] == 1
     assert catalog["reimbursement"]["mappings"] == MAPPINGS
     assert catalog["allowedTravelProcessCodes"] == TRAVEL_PROCESS_CODES
-    assert catalog["relatedApprovalSmokeTestConfirmed"] is True
     assert calls == {"token": 1, "schema": 2}
     with client.app.state.database_session_factory() as database:
         profile = database.get(OaTemplateProfile, "reimbursement")
@@ -1711,7 +1681,6 @@ def test_confirmed_profile_is_persisted_and_returned_without_refetch(client_fact
         assert profile.confirmed_schema_fingerprint == fingerprint
         assert profile.confirmed_by_user_id == "admin-1"
         assert json.loads(profile.allowed_travel_process_codes_json) == TRAVEL_PROCESS_CODES
-        assert profile.related_approval_smoke_test_confirmed is True
         assert "client-secret" not in profile.schema_json
 
 
@@ -1893,7 +1862,6 @@ def test_travel_schema_drift_marks_the_whole_catalog_not_ready(client_factory) -
     assert caught.value.code == "OA_TEMPLATE_CONFIRMATION_REQUIRED"
     assert drift.json()["data"]["compatibilityStatus"] == "DRIFTED"
     assert drift.json()["data"]["isSubmissionReady"] is False
-    assert drift.json()["data"]["relatedApprovalSmokeTestConfirmed"] is False
     assert current.json()["data"]["compatibilityStatus"] == "DRIFTED"
     assert current.json()["data"]["isSubmissionReady"] is False
     assert current.json()["data"]["catalog"]["configVersion"] == 1

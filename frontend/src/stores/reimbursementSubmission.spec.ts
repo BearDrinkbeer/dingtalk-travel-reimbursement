@@ -152,6 +152,36 @@ describe('reimbursement submission store', () => {
     store.abort()
   })
 
+  it('releases a rejected submission identity after a definite validation response', async () => {
+    vi.mocked(submitOaReimbursement).mockRejectedValueOnce({
+      isAxiosError: true,
+      response: {
+        status: 409,
+        data: {
+          error: {
+            code: 'REIMBURSEMENT_SNAPSHOT_INVALID',
+            message: '报销提交快照无法生成，请刷新后重试',
+          },
+        },
+      },
+    })
+    const store = useReimbursementSubmissionStore()
+
+    await expect(store.submit('draft-1', 7)).rejects.toBeDefined()
+
+    const rejectedKey = vi.mocked(submitOaReimbursement).mock.calls[0]![2]
+    expect(store.submission).toBeNull()
+    expect(store.idempotencyKey).toBeNull()
+    expect(store.requestAction).toBeNull()
+    expect(store.errorMessage).toContain('快照无法生成')
+
+    vi.mocked(submitOaReimbursement).mockResolvedValueOnce(task())
+    await store.submit('draft-1', 8)
+    expect(vi.mocked(submitOaReimbursement).mock.calls[1]?.[1]).toBe(8)
+    expect(vi.mocked(submitOaReimbursement).mock.calls[1]?.[2]).not.toBe(rejectedKey)
+    store.abort()
+  })
+
   it('polls using pollAfterMs and stops at a terminal status', async () => {
     vi.mocked(submitOaReimbursement).mockResolvedValue(task('QUEUED', 1, {
       pollAfterMs: 20,
@@ -211,6 +241,7 @@ describe('reimbursement submission store', () => {
     await expect(firstStore.submit('draft-1', 7)).rejects.toThrow('connection lost')
     const originalKey = firstStore.idempotencyKey
     expect(originalKey).toBeTruthy()
+    expect(firstStore.requestAction).toBe('retry')
 
     setActivePinia(createPinia())
     vi.mocked(submitOaReimbursement).mockResolvedValueOnce(task())

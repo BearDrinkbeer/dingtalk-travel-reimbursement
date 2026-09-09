@@ -310,13 +310,9 @@ def test_dingtalk_oa_worker_settings_are_wired_for_deployment() -> None:
         ) in content
 
     compose = (REPOSITORY_ROOT / "docker-compose.yml").read_text()
+    assert "DINGTALK_OA_WORKER_ENABLED: ${DINGTALK_OA_WORKER_ENABLED:-false}" in compose
     assert (
-        "DINGTALK_OA_WORKER_ENABLED: ${DINGTALK_OA_WORKER_ENABLED:-false}"
-        in compose
-    )
-    assert (
-        "Keep false until migrations, templates, permissions, and one acceptance run "
-        "are verified."
+        "Keep false until migrations, templates, permissions, and one acceptance run are verified."
     ) in compose
     for variable in (
         "DINGTALK_OA_WORKER_ENABLED",

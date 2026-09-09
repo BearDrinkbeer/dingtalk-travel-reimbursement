@@ -33,7 +33,8 @@ class ExpenseTotals:
 
 
 def calculate_expense_totals(
-    items: list[ExpenseLineBase], subsidy: SubsidyCalculation | None
+    items: list[ExpenseLineBase],
+    subsidy: SubsidyCalculation | list[SubsidyCalculation] | tuple[SubsidyCalculation, ...] | None,
 ) -> ExpenseTotals:
     expense_sum = sum((item.amount for item in items), Decimal("0.00"))
     if expense_sum > MAX_REIMBURSEMENT_AMOUNT:
@@ -43,7 +44,12 @@ def calculate_expense_totals(
             422,
         )
     expense_total = quantize_money(expense_sum)
-    subsidy_total = subsidy.total if subsidy is not None else Decimal("0.00")
+    subsidies = (
+        []
+        if subsidy is None
+        else ([subsidy] if isinstance(subsidy, SubsidyCalculation) else subsidy)
+    )
+    subsidy_total = quantize_money(sum((item.total for item in subsidies), Decimal("0.00")))
     combined_total = expense_total + subsidy_total
     if combined_total > MAX_REIMBURSEMENT_AMOUNT:
         raise ApiError(

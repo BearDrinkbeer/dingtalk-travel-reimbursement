@@ -89,6 +89,7 @@ describe('TravelApprovalSelector', () => {
     })
 
     expect(wrapper.text()).toContain('合肥出差申请')
+    expect(wrapper.text()).toContain('出差类别：出差类别待重新核验')
     expect(wrapper.text()).toContain('已关联')
     expect(wrapper.text()).toContain('当前报销已进入提交阶段')
     expect(wrapper.findComponent({ name: 'ElCheckbox' }).props('disabled')).toBe(true)
@@ -119,7 +120,7 @@ describe('TravelApprovalSelector', () => {
     wrapper.unmount()
   })
 
-  it('allows only continuous approvals that overlap the subsidy period', () => {
+  it('allows discontinuous approvals while preserving the optional date-overlap filter', () => {
     const drafts = useReimbursementDraftStore()
     drafts.travelApprovals = [
       candidate,
@@ -137,13 +138,13 @@ describe('TravelApprovalSelector', () => {
     })
 
     expect(wrapper.findAllComponents({ name: 'ElCheckbox' }).map((item) => item.props('disabled')))
-      .toEqual([false, false, true, true])
-    expect(wrapper.text()).toContain('审批日期与已选审批不连续')
+      .toEqual([false, false, false, true])
+    expect(wrapper.text()).not.toContain('审批日期与已选审批不连续')
     expect(wrapper.text()).toContain('审批日期与出差补助日期不重合')
     wrapper.unmount()
   })
 
-  it('does not allow removing a middle approval when that would create a date gap', async () => {
+  it('allows removing a middle approval even when that creates a date gap', async () => {
     const drafts = useReimbursementDraftStore()
     const middle = { ...candidate, processInstanceId: 'travel-2', startDate: '2026-09-04', endDate: '2026-09-05' }
     const last = { ...candidate, processInstanceId: 'travel-3', startDate: '2026-09-06', endDate: '2026-09-07' }
@@ -161,8 +162,8 @@ describe('TravelApprovalSelector', () => {
     wrapper.findAllComponents({ name: 'ElCheckbox' })[1]!.vm.$emit('change', false)
     await nextTick()
 
-    expect(wrapper.emitted('update:modelValue')).toBeUndefined()
-    expect(wrapper.text()).toContain('移除后审批日期会中断')
+    expect(wrapper.emitted('update:modelValue')?.[0]).toEqual([[selection, selections[2]]])
+    expect(wrapper.text()).not.toContain('移除后审批日期会中断')
     wrapper.unmount()
   })
 
@@ -198,7 +199,11 @@ describe('TravelApprovalSelector', () => {
 
   it.each([true, false])('restores dynamic source type without falling back to a fixed option (%s)', (hasSource) => {
     const drafts = useReimbursementDraftStore()
-    drafts.travelApprovals = [{ ...candidate, processInstanceId: 'new-travel' }]
+    drafts.travelApprovals = [{
+      ...candidate,
+      processInstanceId: 'new-travel',
+      sourceTravelTypeValue: 'source',
+    }]
     drafts.reimbursementOptions = {
       templateConfigVersion: 1, reimbursementProcessCode: 'PROC-R', companyOptions: [], budgetCodeOptions: [],
       travelProfiles: [{ profileKey: 'business', displayName: '境内', processCode: 'PROC-TRAVEL',
@@ -222,6 +227,27 @@ describe('TravelApprovalSelector', () => {
     expect(options[0]?.props('disabled')).toBe(!hasSource)
     if (!hasSource) expect(wrapper.text()).toContain('出差类别来源失效')
     else expect(wrapper.text()).not.toContain('出差类别与已选审批不同')
+    if (hasSource) expect(wrapper.text()).toContain('出差类别：境内出差')
+    wrapper.unmount()
+  })
+
+  it('rejects different source categories even when both map to the same reimbursement option', () => {
+    const drafts = useReimbursementDraftStore()
+    drafts.travelApprovals = [
+      { ...candidate, sourceTravelTypeValue: '公司内部出差（长期）' },
+      {
+        ...candidate,
+        processInstanceId: 'internal-short',
+        sourceTravelTypeValue: '公司内部出差（短期）',
+      },
+    ]
+    const wrapper = mount(TravelApprovalSelector, {
+      props: { modelValue: [selection] },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.findAllComponents({ name: 'ElCheckbox' })[1]?.props('disabled')).toBe(true)
+    expect(wrapper.text()).toContain('出差类别与已选审批不同')
     wrapper.unmount()
   })
 })

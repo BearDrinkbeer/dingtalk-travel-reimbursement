@@ -188,8 +188,9 @@ def test_concurrent_database_reservations_admit_only_one_writer(tmp_path: Path) 
     second_engine.dispose()
 
 
-@pytest.mark.parametrize("role", [ReimbursementUploadRole.GENERATED_EXCEL,
-                                 ReimbursementUploadRole.GENERATED_PDF])
+@pytest.mark.parametrize(
+    "role", [ReimbursementUploadRole.GENERATED_EXCEL, ReimbursementUploadRole.GENERATED_PDF]
+)
 def test_generated_reservation_is_owned_by_the_active_submission_lease(
     tmp_path: Path,
     role: ReimbursementUploadRole,
@@ -910,9 +911,12 @@ def test_reclaim_removes_every_local_file_state_and_related_rows_for_an_expired_
     assert not [path for path in staging.root.rglob("*") if path.is_file()]
     with Session(engine) as database:
         assert database.get(ReimbursementDraft, draft_id) is None
-        assert database.scalars(
-            select(ReimbursementDraftFile).where(ReimbursementDraftFile.draft_id == draft_id)
-        ).all() == []
+        assert (
+            database.scalars(
+                select(ReimbursementDraftFile).where(ReimbursementDraftFile.draft_id == draft_id)
+            ).all()
+            == []
+        )
         assert database.get(ReimbursementDraftRelatedApproval, related_id) is None
 
     engine.dispose()
@@ -1082,8 +1086,8 @@ def test_reclaim_hashes_large_deleting_file_without_holding_sqlite_write_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     content = b"large-deleting-file" * 128 * 1024
-    engine, staging, coordinator, _draft_id, reservation, _staged = (
-        _create_active_deleting_file(tmp_path, content)
+    engine, staging, coordinator, _draft_id, reservation, _staged = _create_active_deleting_file(
+        tmp_path, content
     )
     original_delete = staging.delete
     observed_write_lock = False
@@ -1120,8 +1124,8 @@ def test_reclaim_does_not_finalize_when_deleting_file_boundary_changes(
     changed_boundary: str,
 ) -> None:
     content = b"deleting-file"
-    engine, staging, coordinator, draft_id, reservation, _staged = (
-        _create_active_deleting_file(tmp_path, content)
+    engine, staging, coordinator, draft_id, reservation, _staged = _create_active_deleting_file(
+        tmp_path, content
     )
     original_delete = staging.delete
 
@@ -1164,8 +1168,8 @@ def test_concurrent_deleting_file_reclaims_are_idempotent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     content = b"concurrent-delete"
-    engine, staging, coordinator, _draft_id, reservation, _staged = (
-        _create_active_deleting_file(tmp_path, content)
+    engine, staging, coordinator, _draft_id, reservation, _staged = _create_active_deleting_file(
+        tmp_path, content
     )
     original_delete = staging.delete
     delete_barrier = Barrier(2)
@@ -1251,9 +1255,12 @@ def test_delete_owned_draft_cleans_active_and_unfinished_files_before_database_r
     assert not [path for path in staging.root.rglob("*") if path.is_file()]
     with Session(engine) as database:
         assert database.get(ReimbursementDraft, draft_id) is None
-        assert database.scalars(
-            select(ReimbursementDraftFile).where(ReimbursementDraftFile.draft_id == draft_id)
-        ).all() == []
+        assert (
+            database.scalars(
+                select(ReimbursementDraftFile).where(ReimbursementDraftFile.draft_id == draft_id)
+            ).all()
+            == []
+        )
 
     engine.dispose()
 
@@ -1335,8 +1342,9 @@ def test_delete_owned_draft_resumes_its_intent_after_storage_failure(
     engine.dispose()
 
 
-@pytest.mark.parametrize("role", [ReimbursementUploadRole.GENERATED_EXCEL,
-                                 ReimbursementUploadRole.GENERATED_PDF])
+@pytest.mark.parametrize(
+    "role", [ReimbursementUploadRole.GENERATED_EXCEL, ReimbursementUploadRole.GENERATED_PDF]
+)
 def test_expired_reclaim_skips_an_active_submission_then_frees_its_stale_reservation(
     tmp_path: Path,
     role: ReimbursementUploadRole,

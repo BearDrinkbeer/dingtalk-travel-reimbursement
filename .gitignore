@@ -11,9 +11,12 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.pyright/
 .venv/
-backend/.coverage
-backend/htmlcov/
+.coverage
+htmlcov/
+*.egg-info/
 backend/data/
 
 # Node / Vite
@@ -28,8 +31,8 @@ data/
 tmp/
 .tmp/
 outputs/
-config/*.private.json
-config/production-oa-*.json
+*.private.json
+production-oa-*.json
 backend/models/*
 !backend/models/README.md
 *.db

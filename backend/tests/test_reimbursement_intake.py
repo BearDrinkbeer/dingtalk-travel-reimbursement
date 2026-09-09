@@ -100,9 +100,7 @@ def test_budget_option_overrides_obsolete_project_and_full_label_reaches_excel(
             return replace(
                 instance,
                 form_values=tuple(
-                    replace(value, value=label)
-                    if value.component_id == "source-budget"
-                    else value
+                    replace(value, value=label) if value.component_id == "source-budget" else value
                     for value in instance.form_values
                 ),
             )

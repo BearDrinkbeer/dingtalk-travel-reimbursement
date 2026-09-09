@@ -67,7 +67,7 @@ def _catalog():
     )
 
 
-def _catalog_with_travel(*, travel_type: str = "市外项目出差（短期）"):
+def _catalog_with_travel(*, travel_type: str = "境内商务出差"):
     catalog = _catalog()
     catalog.travel_profiles = (
         SimpleNamespace(
@@ -370,6 +370,15 @@ def test_create_list_read_and_update_draft_are_persistent_and_canonical(
             "dailyRate": "100.00",
             "total": "200.00",
         },
+        "subsidies": [
+            {
+                "tripType": "business",
+                "calendarDays": 2,
+                "effectiveDays": "2.0",
+                "dailyRate": "100.00",
+                "total": "200.00",
+            }
+        ],
     }
     draft_id = draft["id"]
 
@@ -401,6 +410,36 @@ def test_create_list_read_and_update_draft_are_persistent_and_canonical(
             separators=(",", ":"),
             sort_keys=True,
         )
+
+
+def test_canonical_draft_input_preserves_multiple_subsidy_trips() -> None:
+    raw = _input()
+    raw["trip"] = None
+    raw["trips"] = [
+        {
+            "tripType": "business",
+            "relatedApprovalId": "approval-1",
+            "startDate": "2026-09-01",
+            "startTime": "09:00",
+            "endDate": "2026-09-03",
+            "endTime": "18:00",
+        },
+        {
+            "tripType": "business",
+            "relatedApprovalId": "approval-2",
+            "startDate": "2026-09-08",
+            "startTime": "18:00",
+            "endDate": "2026-09-10",
+            "endTime": "09:00",
+        },
+    ]
+
+    canonical = reimbursement_drafts._canonical_input_data(
+        ReimbursementDraftInput.model_validate(raw)
+    )
+
+    assert canonical["trip"] is None
+    assert canonical["trips"] == raw["trips"]
 
 
 def test_legacy_draft_save_binds_one_unique_exact_terminal_ocr_match(

@@ -14,11 +14,13 @@ from app.services.oa_template_profiles import (
     _serialize_travel_profiles,
     validate_travel_type_mappings,
 )
+from app.services.subsidy_calculation import subsidy_purpose_for_travel_type
 from app.services.travel_approvals import (
     TravelApprovalSelection,
     list_current_user_travel_approvals,
     reverify_travel_approval_selection,
     travel_accounting_options,
+    travel_instance_type_option,
 )
 
 
@@ -52,6 +54,57 @@ def _dynamic_source():
         catalog=replace(source.catalog, travel_profiles=(profile,)),
         related_approvals=(related,),
     )
+
+
+@pytest.mark.parametrize(
+    ("source_label", "target_label", "expected_policy"),
+    [
+        ("商务出差", "境内商务出差", "business"),
+        ("市外项目出差（长期）", "境内市外项目出差（长期）", "project"),
+        ("市外项目出差（短期）", "境内市外项目出差（短期）", "project"),
+        ("市内项目出差（长/短期）", "境内市内项目出差（长/短期）", "same_city_project"),
+        ("公司内部出差（长期）", "公司内部出差（长期）", "internal"),
+        ("公司内部出差（短期）", "公司内部出差（短期）", "internal"),
+        ("境外长期出差", "境外商务出差（长期）", "overseas"),
+        ("境外短期出差", "境外商务出差（短期）", "overseas"),
+    ],
+)
+def test_pre_change_travel_categories_map_to_current_reimbursement_categories(
+    source_label,
+    target_label,
+    expected_policy,
+):
+    source_option = FormOption(source_label, source_label, f"source-{expected_policy}")
+    target_option = FormOption(target_label, target_label, f"target-{expected_policy}")
+    source_schema = SimpleNamespace(
+        components=(SimpleNamespace(component_id="source-type", options=(source_option,)),)
+    )
+    instance = replace(
+        _instance("legacy-category"),
+        form_values=(
+            WorkflowFormValue(
+                "source-type",
+                "出差类别",
+                "DDSelectField",
+                source_label,
+                None,
+                None,
+            ),
+        ),
+    )
+
+    mapped, canonical_source, reason = travel_instance_type_option(
+        instance,
+        source_schema=source_schema,
+        component_id="source-type",
+        mappings={source_label: target_option},
+        fixed_option=target_option,
+    )
+
+    assert reason is None
+    assert mapped == target_option
+    assert canonical_source == source_label
+    assert subsidy_purpose_for_travel_type(target_label).value == expected_policy
 
 
 def test_dynamic_config_roundtrip_and_api_contract():
@@ -92,7 +145,7 @@ def test_dynamic_config_roundtrip_and_api_contract():
 
 def test_dynamic_snapshot_roundtrip_and_legacy_rejection():
     snapshot = build_snapshot(_dynamic_source())
-    assert snapshot.snapshot_version == 5
+    assert snapshot.snapshot_version == 6
     assert parse_snapshot(serialize_snapshot(snapshot)) == snapshot
     assert snapshot.related_approvals[0].source_travel_type_value == "商务出差"
     for version in (1, 2, 3, 4):
@@ -136,6 +189,7 @@ async def test_two_types_in_one_template_resolve_per_instance_and_missing_is_una
     )
     by_id = {item.instance.instance_id: item for item in candidates}
     assert by_id["a"].listed.travel_type_option == business
+    assert by_id["a"].as_dict()["sourceTravelTypeValue"] == "商务出差"
     assert by_id["b"].listed.travel_type_option == internal
     assert by_id["c"].unavailable_reason
     selections = tuple(TravelApprovalSelection("domestic", key, _window()) for key in ("a", "b"))
@@ -145,6 +199,18 @@ async def test_two_types_in_one_template_resolve_per_instance_and_missing_is_una
         )
     assert error.value.code == "TRAVEL_APPROVAL_TYPE_MISMATCH"
     profile.travel_type_mappings["公司内部出差（长期）"] = business
+    with pytest.raises(ApiError) as same_target_error:
+        await reverify_travel_approval_selection(
+            workflow, _catalog(profile), current_user_id="employee-1", selections=selections
+        )
+    assert same_target_error.value.code == "TRAVEL_APPROVAL_TYPE_MISMATCH"
+    details["b"] = replace(
+        details["b"],
+        form_values=tuple(
+            replace(value, value="source-b") if value.component_id == "source-type" else value
+            for value in details["b"].form_values
+        ),
+    )
     verified = await reverify_travel_approval_selection(
         workflow, _catalog(profile), current_user_id="employee-1", selections=selections
     )
