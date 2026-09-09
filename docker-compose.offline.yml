@@ -50,14 +50,11 @@ services:
         condition: service_healthy
     ports:
       - "${APP_BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-8080}:8080"
-    configs:
-      - source: nginx.conf
-        target: /tmp/nginx.conf
-    command:
-      - -c
-      - /tmp/nginx.conf
-      - -g
-      - daemon off;
+    # Older Docker Compose versions support file-backed configs only.
+    # These files already exist in the repository's nginx/ directory.
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/expense-proxy.conf:/etc/nginx/conf.d/expense-proxy.inc:ro
     user: "101:101"
     read_only: true
     mem_limit: ${WEB_MEMORY_LIMIT:-128m}
@@ -82,112 +79,6 @@ services:
         max-size: ${WEB_LOG_MAX_SIZE:-5m}
         max-file: ${WEB_LOG_MAX_FILES:-3}
     restart: unless-stopped
-
-configs:
-  nginx.conf:
-    content: |
-      pid /tmp/nginx.pid;
-      error_log /dev/stderr warn;
-      worker_processes auto;
-
-      events {
-          worker_connections 1024;
-      }
-
-      http {
-          include /etc/nginx/mime.types;
-          default_type application/octet-stream;
-          sendfile on;
-          server_tokens off;
-
-          client_body_temp_path /var/cache/nginx/client_temp 1 2;
-          proxy_temp_path /var/cache/nginx/proxy_temp 1 2;
-
-          map $$request_uri $$expense_cache_control {
-              default "no-store";
-              "~^/assets/.+-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+(?:\?.*)?$$" "public, max-age=31536000, immutable";
-          }
-
-          map $$http_x_forwarded_proto $$expense_forwarded_proto {
-              default $$scheme;
-              https https;
-          }
-
-          server {
-              listen 8080;
-              server_name _;
-
-              access_log off;
-              root /usr/share/nginx/html;
-              index index.html;
-              client_max_body_size 25m;
-
-              add_header Cache-Control $$expense_cache_control always;
-              add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://*.dingtalk.com; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self' https://*.dingtalk.com https://*.dingcloud.com" always;
-              add_header Referrer-Policy "no-referrer" always;
-              add_header X-Content-Type-Options "nosniff" always;
-              add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
-
-              location = /api/files/upload {
-                  proxy_request_buffering off;
-                  proxy_pass http://backend:8000;
-                  proxy_http_version 1.1;
-                  proxy_set_header Host $$host;
-                  proxy_set_header X-Real-IP $$remote_addr;
-                  proxy_set_header X-Forwarded-For $$remote_addr;
-                  proxy_set_header X-Forwarded-Proto $$expense_forwarded_proto;
-                  proxy_set_header X-Request-ID $$request_id;
-                  proxy_connect_timeout 5s;
-                  proxy_read_timeout 135s;
-                  proxy_send_timeout 135s;
-                  proxy_hide_header Cache-Control;
-                  proxy_max_temp_file_size 0;
-              }
-
-              location ~ ^/api/reimbursements/drafts/[^/]+/files$$ {
-                  proxy_request_buffering off;
-                  proxy_pass http://backend:8000;
-                  proxy_http_version 1.1;
-                  proxy_set_header Host $$host;
-                  proxy_set_header X-Real-IP $$remote_addr;
-                  proxy_set_header X-Forwarded-For $$remote_addr;
-                  proxy_set_header X-Forwarded-Proto $$expense_forwarded_proto;
-                  proxy_set_header X-Request-ID $$request_id;
-                  proxy_connect_timeout 5s;
-                  proxy_read_timeout 135s;
-                  proxy_send_timeout 135s;
-                  proxy_hide_header Cache-Control;
-                  proxy_max_temp_file_size 0;
-              }
-
-              location /api/ {
-                  proxy_pass http://backend:8000;
-                  proxy_http_version 1.1;
-                  proxy_set_header Host $$host;
-                  proxy_set_header X-Real-IP $$remote_addr;
-                  proxy_set_header X-Forwarded-For $$remote_addr;
-                  proxy_set_header X-Forwarded-Proto $$expense_forwarded_proto;
-                  proxy_set_header X-Request-ID $$request_id;
-                  proxy_connect_timeout 5s;
-                  proxy_read_timeout 135s;
-                  proxy_send_timeout 135s;
-                  proxy_hide_header Cache-Control;
-                  proxy_max_temp_file_size 0;
-              }
-
-              location ^~ /assets/ {
-                  try_files $$uri =404;
-              }
-
-              location = /index.html {
-                  try_files $$uri =404;
-              }
-
-              location / {
-                  try_files $$uri $$uri/ /index.html;
-              }
-          }
-      }
 
 volumes:
   sqlite_data:
