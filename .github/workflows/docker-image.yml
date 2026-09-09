@@ -17,6 +17,20 @@ permissions:
   contents: read
 
 jobs:
+  validate-compose:
+    name: Validate offline Compose
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Prepare example environment
+        run: cp .env.example .env
+
+      - name: Validate offline Compose configuration
+        run: docker compose -f docker-compose.offline.yml config --quiet
+
   build:
     name: Build ${{ matrix.image }} image
     runs-on: ubuntu-latest
